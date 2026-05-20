@@ -1,0 +1,43 @@
+{
+  "name": "visubly-desktop",
+  "version": "0.1.0",
+  "description": "Desktop UI shell for Visubly video download and Vietnamese subtitle workflows.",
+  "main": "src/main/main.js",
+  "private": true,
+  "author": "Visubly",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "check": "node scripts/check-app.js",
+    "package:win": "electron-builder --win nsis",
+    "package:mac": "electron-builder --mac dmg"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "app.visubly.studio",
+    "productName": "Visubly Studio",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false,
+      "verifyUpdateCodeSignature": false
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.video"
+    }
+  }
+}

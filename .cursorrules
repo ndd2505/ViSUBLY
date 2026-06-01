@@ -1,0 +1,8 @@
+# Language Rule
+LUÔN LUÔN giao tiếp, phản hồi và giải thích bằng Tiếng Việt.
+YOU MUST ALWAYS RESPOND IN VIETNAMESE.
+
+# Workflow Rules
+- Bắt buộc hỏi lại và chờ xác nhận: Nếu gặp lỗi về authorize, cấp quyền hoặc cần dùng fallback, AI không được tự quyết định mà phải hỏi lại để người dùng xác nhận hướng xử lý.
+- Tự động Build: Tự động chạy lệnh build (`npm run package:win`) sau mỗi lần sửa code liên quan đến app, để người dùng có thể test bản mới nhất tại `D:\Projects\ViSUBLY\dist\win-unpacked`.
+- Xin quyền tắt app: Trước khi chạy build, hãy xin quyền người dùng để tự động đóng (terminate) ứng dụng đang mở để tránh lỗi không ghi đè được file.

@@ -27,6 +27,8 @@ class AirplayServer extends EventEmitter {
         this.pairingToken = null;
         this.currentPairingPin = null;
         this.currentFolder = null;
+        this.stopping = false;
+        this.activeStreamRequests = 0;
         this.activeTranscodes = new Map();
         this.bonjour = new Bonjour.Bonjour();
         this.bonjourService = null;
@@ -50,6 +52,7 @@ class AirplayServer extends EventEmitter {
     async start() {
         if (this.server.listening) return this.getServerInfo();
 
+        this.stopping = false;
         this.pairingToken = randomUUID().substring(0, 8);
         
         return new Promise((resolve) => {
@@ -63,12 +66,14 @@ class AirplayServer extends EventEmitter {
                     port: this.port 
                 });
 
+                this.emitActivityChanged('AirPlay server started');
                 resolve(info);
             });
         });
     }
 
     stop() {
+        this.stopping = true;
         if (this.bonjourService) {
             this.bonjourService.stop();
             this.bonjourService = null;
@@ -82,6 +87,9 @@ class AirplayServer extends EventEmitter {
             if (t.command) t.command.kill('SIGKILL');
         }
         this.activeTranscodes.clear();
+        this.activeStreamRequests = 0;
+        this.emit('server_stopped');
+        this.emitActivityChanged('AirPlay server stopped');
     }
 
     setFolder(folderData) {
@@ -117,6 +125,40 @@ class AirplayServer extends EventEmitter {
                 client.send(payload);
             }
         });
+    }
+
+    getActivityState(reason = '') {
+        const websocketClients = [...this.wss.clients].filter(client => client.readyState === WebSocket.OPEN).length;
+        const runningTranscodes = [...this.activeTranscodes.values()].filter(item => item.status === 'running' && item.command).length;
+        return {
+            active: this.server.listening && !this.stopping && (this.activeStreamRequests > 0 || websocketClients > 0 || runningTranscodes > 0),
+            reason,
+            activeStreamRequests: this.activeStreamRequests,
+            websocketClients,
+            runningTranscodes,
+            serverListening: this.server.listening
+        };
+    }
+
+    emitActivityChanged(reason) {
+        this.emit('activity_changed', this.getActivityState(reason));
+    }
+
+    trackStreamResponse(res, reason) {
+        this.activeStreamRequests += 1;
+        this.emitActivityChanged(reason);
+
+        let released = false;
+        const release = () => {
+            if (released) return;
+            released = true;
+            this.activeStreamRequests = Math.max(0, this.activeStreamRequests - 1);
+            this.emitActivityChanged(`${reason} ended`);
+        };
+
+        res.once('close', release);
+        res.once('finish', release);
+        return release;
     }
 
     setupRoutes() {
@@ -227,6 +269,7 @@ class AirplayServer extends EventEmitter {
             const stat = fs.statSync(video.path);
             const fileSize = stat.size;
             const range = req.headers.range;
+            this.trackStreamResponse(res, 'Direct video stream active');
 
             if (range) {
                 const parts = range.replace(/bytes=/, "").split("-");
@@ -293,13 +336,27 @@ class AirplayServer extends EventEmitter {
                         `-hls_segment_filename ${path.join(hlsDir, 'segment_%03d.ts')}`
                     ])
                     .output(playlistPath)
-                    .on('end', () => console.log('HLS generation finished'))
-                    .on('error', (err) => console.error('FFmpeg Error:', err));
+                    .on('end', () => {
+                        console.log('HLS generation finished');
+                        const transcode = this.activeTranscodes.get(videoId);
+                        if (transcode) {
+                            transcode.command = null;
+                            transcode.status = 'ready';
+                        }
+                        this.emitActivityChanged('HLS generation finished');
+                    })
+                    .on('error', (err) => {
+                        console.error('FFmpeg Error:', err);
+                        this.activeTranscodes.delete(videoId);
+                        this.emitActivityChanged('HLS generation failed');
+                    });
                 
                 command.run();
-                this.activeTranscodes.set(videoId, { command, dir: hlsDir });
+                this.activeTranscodes.set(videoId, { command, dir: hlsDir, status: 'running' });
+                this.emitActivityChanged('HLS generation active');
             }
 
+            this.trackStreamResponse(res, 'HLS playlist request active');
             let attempts = 0;
             const checkInterval = setInterval(() => {
                 if (fs.existsSync(playlistPath)) {
@@ -323,6 +380,7 @@ class AirplayServer extends EventEmitter {
 
             if (fs.existsSync(segPath)) {
                 res.setHeader('Content-Type', 'video/MP2T');
+                this.trackStreamResponse(res, 'HLS segment stream active');
                 fs.createReadStream(segPath).pipe(res);
             } else {
                 res.status(404).end();
@@ -333,6 +391,7 @@ class AirplayServer extends EventEmitter {
     setupWebSockets() {
         this.wss.on('connection', (ws) => {
             ws.send(JSON.stringify({ type: 'connected' }));
+            this.emitActivityChanged('Remote client connected');
             
             ws.on('message', (message) => {
                 try {
@@ -340,6 +399,8 @@ class AirplayServer extends EventEmitter {
                     // Có thể xử lý các command từ remote gửi lên (ví dụ: play, pause) ở đây
                 } catch (e) { }
             });
+            ws.on('close', () => this.emitActivityChanged('Remote client disconnected'));
+            ws.on('error', () => this.emitActivityChanged('Remote client errored'));
         });
     }
 

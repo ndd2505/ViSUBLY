@@ -232,7 +232,9 @@ const state = {
     testUrl: null,
     loading: false,
     pairingPin: null,
-    pairingActive: false
+    pairingActive: false,
+    awake: false,
+    awakeReason: ""
   },
   playerMode: "vi"
 };
@@ -354,6 +356,7 @@ function renderRemoteModal() {
         <h2 class="h2" style="margin-bottom:10px">Visubly Remote</h2>
         <p style="margin-bottom:20px;color:var(--ink)">Lấy điện thoại quét mã QR này để điều khiển.</p>
         ${state.remote.loading ? '<div style="width:250px;height:250px;display:flex;align-items:center;justify-content:center;background:#eee;border-radius:8px">Đang bật...</div>' : `<img src="${state.remote.qrUrl}" alt="QR" width="250" height="250" style="border-radius:8px" />`}
+        <p class="muted mono" style="margin-top:14px">${state.remote.awake ? "Stream keep-awake is active; the display can still sleep." : "PC streaming stays awake while the display may turn off."}</p>
         <div style="margin-top:20px; display:flex; gap:10px; justify-content:center;">
           ${btn("Copy Link Test", "copy-remote-link", "primary")}
           ${btn("Đóng", "close-remote", "ghost")}
@@ -2880,6 +2883,15 @@ function initAirPlayPairingBridge() {
       state.remote.pairingPin = null;
       state.remote.pairingActive = false;
       render();
+    });
+  }
+  if (desktop.airplay?.onPowerState) {
+    desktop.airplay.onPowerState((payload) => {
+      const nextAwake = Boolean(payload?.active);
+      const changed = state.remote.awake !== nextAwake;
+      state.remote.awake = nextAwake;
+      state.remote.awakeReason = payload?.reason || "";
+      if (changed) render();
     });
   }
 }

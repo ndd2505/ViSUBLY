@@ -46,6 +46,11 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
       const listener = () => callback();
       ipcRenderer.on("airplay:pairing-success", listener);
       return () => ipcRenderer.removeListener("airplay:pairing-success", listener);
+    },
+    onPowerState: (callback) => {
+      const listener = (_event, payload) => callback(payload);
+      ipcRenderer.on("airplay:power-state", listener);
+      return () => ipcRenderer.removeListener("airplay:power-state", listener);
     }
   },
   download: downloadApi,

@@ -20,11 +20,18 @@ if (missing.length) {
 
 const html = fs.readFileSync(path.join(root, "src/renderer/index.html"), "utf8");
 const js = fs.readFileSync(path.join(root, "src/renderer/app.js"), "utf8");
+const main = fs.readFileSync(path.join(root, "src/main/main.js"), "utf8");
+const preload = fs.readFileSync(path.join(root, "src/main/preload.js"), "utf8");
 
 const checks = [
   ["renderer root", html.includes("app-root")],
   ["desktop bridge", js.includes("visublyDesktop")],
   ["download flow", js.includes("renderDownload")],
+  ["download queue bridge", preload.includes("downloadApi")],
+  ["download runner integration", main.includes("hls2mp4_runner.py")],
+  ["folder player screen", js.includes("renderFolderPlayer")],
+  ["folder scan bridge", preload.includes("selectVideoFolder") && main.includes("scanVideoFolder")],
+  ["AirPlay stay-awake blocker", main.includes("powerSaveBlocker") && preload.includes("onPowerState")],
   ["subtitle flow", js.includes("renderSubtitle")],
   ["approval flow", js.includes("renderApprove")],
   ["ChatGPT option", js.includes("chatgpt")]

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker } = require("electron");
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
@@ -7,6 +7,8 @@ const { pathToFileURL } = require("node:url");
 const airplayServer = require("./airplay-server");
 
 let mainWindow;
+let airplayPowerBlockerId = null;
+let airplayPowerBlockerStopTimer = null;
 
 const runtimeRoot = process.env.VISUBLY_RUNTIME_DIR || path.join("D:\\", "Projects", "ViSUBLY", ".runtime");
 const runtimePaths = {
@@ -46,6 +48,9 @@ const videoFolderExtensions = new Set([
 ]);
 const subtitleFolderExtensions = new Set([".srt", ".vtt"]);
 const maxFolderVideos = 1000;
+const airplayPowerBlockerGraceMs = Math.max(0, Number(process.env.VISUBLY_AIRPLAY_AWAKE_GRACE_MS || 120000));
+const airplayPowerBlockerMode =
+  process.env.VISUBLY_AIRPLAY_KEEP_DISPLAY_AWAKE === "1" ? "prevent-display-sleep" : "prevent-app-suspension";
 const downloadStatePath = path.join(runtimePaths.userData, "download-queue.json");
 const downloadQueue = {
   items: [],
@@ -104,6 +109,7 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  stopAirplayPowerBlocker("App is quitting.");
   for (const [itemId, child] of downloadQueue.processes.entries()) {
     const item = getDownloadItem(itemId);
     if (item && item.status !== "done") {
@@ -197,6 +203,7 @@ ipcMain.handle("airplay:start", async () => {
 
 ipcMain.handle("airplay:stop", async () => {
   airplayServer.stop();
+  stopAirplayPowerBlocker("AirPlay server stopped.");
   return { ok: true };
 });
 
@@ -215,7 +222,77 @@ airplayServer.on("pairing_success", () => {
     mainWindow.webContents.send("airplay:pairing-success");
   }
 });
+
+airplayServer.on("activity_changed", (activity) => {
+  if (activity.active) {
+    startAirplayPowerBlocker(activity.reason || "AirPlay session active.");
+  } else {
+    scheduleAirplayPowerBlockerStop(activity.reason || "AirPlay session idle.");
+  }
+});
+
+airplayServer.on("server_stopped", () => {
+  stopAirplayPowerBlocker("AirPlay server stopped.");
+});
 // -------------------
+
+function startAirplayPowerBlocker(reason) {
+  if (airplayPowerBlockerStopTimer) {
+    clearTimeout(airplayPowerBlockerStopTimer);
+    airplayPowerBlockerStopTimer = null;
+  }
+
+  if (airplayPowerBlockerId !== null && powerSaveBlocker.isStarted(airplayPowerBlockerId)) {
+    broadcastAirplayPowerState(reason);
+    return;
+  }
+
+  airplayPowerBlockerId = powerSaveBlocker.start(airplayPowerBlockerMode);
+  broadcastAirplayPowerState(reason);
+}
+
+function scheduleAirplayPowerBlockerStop(reason) {
+  if (airplayPowerBlockerId === null) {
+    broadcastAirplayPowerState(reason);
+    return;
+  }
+
+  if (airplayPowerBlockerStopTimer) clearTimeout(airplayPowerBlockerStopTimer);
+  airplayPowerBlockerStopTimer = setTimeout(() => {
+    stopAirplayPowerBlocker(reason);
+  }, airplayPowerBlockerGraceMs);
+
+  broadcastAirplayPowerState(`${reason} Keeping PC awake during grace period.`);
+}
+
+function stopAirplayPowerBlocker(reason) {
+  if (airplayPowerBlockerStopTimer) {
+    clearTimeout(airplayPowerBlockerStopTimer);
+    airplayPowerBlockerStopTimer = null;
+  }
+
+  if (airplayPowerBlockerId !== null) {
+    powerSaveBlocker.stop(airplayPowerBlockerId);
+    airplayPowerBlockerId = null;
+  }
+
+  broadcastAirplayPowerState(reason);
+}
+
+function airplayPowerSnapshot(reason) {
+  return {
+    active: airplayPowerBlockerId !== null && powerSaveBlocker.isStarted(airplayPowerBlockerId),
+    reason,
+    graceMs: airplayPowerBlockerGraceMs,
+    mode: airplayPowerBlockerMode,
+    displayMaySleep: airplayPowerBlockerMode === "prevent-app-suspension"
+  };
+}
+
+function broadcastAirplayPowerState(reason) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("airplay:power-state", airplayPowerSnapshot(reason));
+}
 
 ipcMain.handle("media:findMatchingSubtitle", async (_event, videoPath) => {
   if (!videoPath || typeof videoPath !== "string") return null;

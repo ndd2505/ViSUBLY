@@ -647,7 +647,7 @@ function renderDownload() {
       <header class="page-head is-row">
         <div class="page-titles">
           <h1 class="h1">Tải xuống</h1>
-          <p class="page-sub">${dir ? `Lưu vào ${escapeHtml(dir)} · ` : ""}tải tối đa ${parallel} video cùng lúc</p>
+          <p class="page-sub" title="${escapeAttr(dir)}">${dir ? `Lưu vào ${escapeHtml(dir)} · ` : ""}tải tối đa ${parallel} video cùng lúc</p>
         </div>
         <div class="head-actions">
           ${idleQueue ? `<button type="button" class="btn primary" data-action="start-queue">${icon("download")}<span>Tải hàng đợi</span></button>` : ""}
@@ -708,7 +708,7 @@ function renderDownloadRow(item) {
   }
 
   const metaParts = isDone
-    ? [item.output, qualityText(item), sizeText(item)]
+    ? [pathBaseName(item.output), qualityText(item), sizeText(item)]
     : [item.host, qualityText(item), sizeText(item)];
   const meta = isFailed
     ? `<span class="row-meta is-danger">${escapeHtml(failure.message)}</span>`

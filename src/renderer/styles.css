@@ -533,6 +533,24 @@ img {
   display: flex;
 }
 
+.page-head.is-row {
+  flex-wrap: nowrap;
+}
+
+.page-head.is-row .page-titles {
+  flex: 1 1 auto;
+}
+
+.page-head.is-row .page-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.page-head.is-row .head-actions {
+  flex: 0 0 auto;
+}
+
 .page-titles {
   display: flex;
   flex-direction: column;

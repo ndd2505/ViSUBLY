@@ -75,9 +75,12 @@ const defaultSettings = Object.freeze({
   notifyOnComplete: true,
   captureBridgeEnabled: true,
   captureBridgePort: 47653,
+  // Browser captures shorter than this (previews, ads) are hidden in the extension; 0 = off.
+  ignoreShortVideosSec: 120,
   theme: "dark"
 });
 const themeModes = new Set(["dark", "light", "system"]);
+const ignoreShortVideoChoices = new Set([0, 30, 60, 120, 300]);
 const themeBackgrounds = { dark: "#0E0C12", light: "#F2EFE8" };
 // Finished items stay listed until the user clears them; keep the newest ones only.
 const maxKeptDoneItems = 200;
@@ -918,7 +921,7 @@ ipcMain.handle("download:revealOutput", (_event, itemId) => {
   return { ok: true };
 });
 
-async function prepareDownloadItem(payload) {
+async function prepareDownloadItem(payload, { timeoutMs = runnerTimeoutMs } = {}) {
   const source = String(payload.source || payload.curl || payload.url || "").trim();
   if (!source && !payload.itemFile) throw new Error("Paste a URL or full curl command first.");
 
@@ -947,7 +950,7 @@ async function prepareDownloadItem(payload) {
   if (payload.noPreflight) args.push("--no-preflight");
   pushFfmpegArg(args);
 
-  const result = await runRunnerJson(args, source);
+  const result = await runRunnerJson(args, source, timeoutMs);
   const preparedEvent = [...result.events].reverse().find((event) => event.event === "prepared");
   if (!preparedEvent?.item) {
     const errorEvent = [...result.events].reverse().find((event) => event.event === "error");
@@ -966,7 +969,7 @@ async function prepareDownloadItem(payload) {
   return item;
 }
 
-function runRunnerJson(args, stdinText = "") {
+function runRunnerJson(args, stdinText = "", timeoutMs = runnerTimeoutMs) {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -989,8 +992,8 @@ function runRunnerJson(args, stdinText = "") {
     };
     const timer = setTimeout(() => {
       killProcessTree(child);
-      finish(new Error(`Download runner timed out after ${Math.round(runnerTimeoutMs / 1000)}s.`));
-    }, runnerTimeoutMs);
+      finish(new Error(`Download runner timed out after ${Math.round(timeoutMs / 1000)}s.`));
+    }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
       stdoutBuffer = parseJsonLines(stdoutBuffer + chunk.toString(), (event) => events.push(event));
@@ -1317,6 +1320,10 @@ function normalizeDownloadItem(raw = {}, overrides = {}) {
     variants: Array.isArray(raw.variants) ? raw.variants : [],
     segmentCount: Number(raw.segment_count || raw.segmentCount || 0),
     estimatedDuration: raw.estimated_duration ?? raw.estimatedDuration ?? null,
+    kind: String(raw.kind || overrides.kind || ""),
+    durationSec: Math.max(0, Number(raw.duration_sec ?? raw.durationSec) || 0),
+    isLive: Boolean(raw.is_live ?? raw.isLive),
+    renditions: Array.isArray(raw.renditions) ? raw.renditions.map(String) : [],
     pageUrl: String(raw.pageUrl || overrides.pageUrl || ""),
     fileSize: Number(raw.fileSize || 0) || 0,
     finishedAt: raw.finishedAt || "",
@@ -1743,6 +1750,7 @@ function sanitizeSettings(input = {}, base = defaultSettings) {
   if (typeof input.notifyOnComplete === "boolean") next.notifyOnComplete = input.notifyOnComplete;
   if (typeof input.captureBridgeEnabled === "boolean") next.captureBridgeEnabled = input.captureBridgeEnabled;
   next.captureBridgePort = clampInt(input.captureBridgePort, 1024, 65535, next.captureBridgePort);
+  if (ignoreShortVideoChoices.has(Number(input.ignoreShortVideosSec))) next.ignoreShortVideosSec = Number(input.ignoreShortVideosSec);
   if (themeModes.has(input.theme)) next.theme = input.theme;
   return next;
 }
@@ -1856,6 +1864,7 @@ function startCaptureBridge() {
         port: settings.captureBridgePort,
         dataDir: runtimePaths.userData,
         onCapture: handleCapturedMedia,
+        onProbe: probeMedia,
         logger: captureBridgeLogger
       });
       const started = await bridge.start();
@@ -1927,29 +1936,139 @@ function captureBridgeInfo() {
   };
 }
 
+const engineLinkTypes = { hls: "m3u8", dash: "dash", mp4: "mp4" };
+
+// prepare args for a stream the extension saw, replaying the browser's referer/origin/UA/cookie.
+function browserPrepareArgs({ url, type, headers, pageUrl = "", name }) {
+  const h = headers && typeof headers === "object" ? headers : {};
+  const extraHeaders = [];
+  if (h.origin) extraHeaders.push(`Origin: ${h.origin}`);
+  if (h.cookie) extraHeaders.push(`Cookie: ${h.cookie}`);
+  return {
+    source: url,
+    type,
+    name,
+    referer: h.referer || pageUrl || undefined,
+    ...(h.userAgent ? { userAgent: String(h.userAgent) } : {}),
+    headers: extraHeaders,
+    noPreflight: true
+  };
+}
+
+// --- Stream probing for the extension (quality list, duration, preview detection) ---
+const probeCacheTtlMs = 10 * 60 * 1000;
+const probeTimeoutMs = 30000;
+const maxConcurrentProbes = 2;
+const maxProbeCacheEntries = 300;
+const probeCache = new Map(); // url -> { at, result }
+const probeInflight = new Map(); // url -> Promise<result>
+const probeWaiters = [];
+let activeProbes = 0;
+
+async function probeMedia(payload = {}) {
+  const url = String(payload.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) return { ok: false, error: "Only http(s) media URLs can be probed." };
+  const type = engineLinkTypes[String(payload.type || "").toLowerCase()] || "m3u8";
+  const cached = probeCache.get(url);
+  let raw;
+  if (cached && Date.now() - cached.at < probeCacheTtlMs) {
+    raw = cached.result;
+  } else {
+    if (!probeInflight.has(url)) {
+      const job = runProbe({ url, type, headers: payload.headers }).finally(() => probeInflight.delete(url));
+      probeInflight.set(url, job);
+    }
+    raw = await probeInflight.get(url);
+  }
+  return withShortFlag(raw);
+}
+
+// isShort uses the current setting, so changing it applies to cached results too.
+function withShortFlag(raw) {
+  if (!raw.ok) return { ...raw };
+  const limit = Number(settings.ignoreShortVideosSec) || 0;
+  const isShort = !raw.isLive && limit > 0 && raw.durationSec > 0 && raw.durationSec < limit;
+  return { ...raw, isShort };
+}
+
+async function runProbe({ url, type, headers }) {
+  if (type === "mp4") {
+    // Nothing to read without downloading the file; the extension judges mp4 by its size.
+    return { ok: true, kind: "mp4", variants: [], durationSec: 0, isLive: false, renditions: [] };
+  }
+  await acquireProbeSlot();
+  let result;
+  try {
+    const item = await prepareDownloadItem(
+      {
+        ...browserPrepareArgs({ url, type, headers, name: "probe" }),
+        // Never touches the download folder: prepare only needs a syntactically valid output.
+        output: path.join(engineTempDir, "probe.mp4"),
+        overwrite: true
+      },
+      { timeoutMs: probeTimeoutMs }
+    );
+    const isLive = Boolean(item.isLive);
+    const durationSec = isLive ? 0 : Math.round((Number(item.durationSec) || 0) * 10) / 10;
+    const variants = (Array.isArray(item.variants) ? item.variants : [])
+      .filter((variant) => variant && variant.url)
+      .map((variant) => {
+        const bandwidth = Math.max(0, Number(variant.bandwidth) || 0);
+        const out = {
+          url: String(variant.url),
+          height: Math.max(0, Number(variant.height) || 0),
+          resolution: String(variant.resolution || ""),
+          bandwidth
+        };
+        if (bandwidth && durationSec) out.estBytes = Math.round((bandwidth * durationSec) / 8);
+        return out;
+      })
+      .sort((a, b) => b.height - a.height || b.bandwidth - a.bandwidth);
+    result = {
+      ok: true,
+      kind: item.kind || (variants.length ? "master" : type === "dash" ? "dash" : "media"),
+      variants,
+      durationSec,
+      isLive,
+      renditions: item.renditions || []
+    };
+    probeCache.set(url, { at: Date.now(), result });
+    if (probeCache.size > maxProbeCacheEntries) probeCache.delete(probeCache.keys().next().value);
+  } catch (error) {
+    // Failures are not cached: the next popup open may succeed (cookie refreshed, network back).
+    result = { ok: false, error: String(error?.message || error).slice(0, 300) };
+    logMain("warn", `Probe failed for ${hostFromUrl(url)}: ${result.error}`);
+  } finally {
+    releaseProbeSlot();
+  }
+  return result;
+}
+
+function acquireProbeSlot() {
+  if (activeProbes < maxConcurrentProbes) {
+    activeProbes += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => probeWaiters.push(resolve));
+}
+
+function releaseProbeSlot() {
+  const next = probeWaiters.shift();
+  if (next) next(); // hand the slot over directly
+  else activeProbes = Math.max(0, activeProbes - 1);
+}
+
 async function handleCapturedMedia(payload = {}) {
   const url = String(payload.url || "").trim();
   if (!/^https?:\/\//i.test(url)) return { ok: false, message: "Only http(s) media URLs can be captured." };
   prunePendingCaptures();
 
-  const type = { hls: "m3u8", dash: "dash", mp4: "mp4" }[String(payload.type || "").toLowerCase()] || "m3u8";
-  const headers = payload.headers && typeof payload.headers === "object" ? payload.headers : {};
+  const type = engineLinkTypes[String(payload.type || "").toLowerCase()] || "m3u8";
   const pageUrl = String(payload.pageUrl || "");
   const host = hostFromUrl(pageUrl) || hostFromUrl(url);
   const title = String(payload.pageTitle || "").trim();
   const name = safeOutputStem(title || host || "video");
-  const extraHeaders = [];
-  if (headers.origin) extraHeaders.push(`Origin: ${headers.origin}`);
-  if (headers.cookie) extraHeaders.push(`Cookie: ${headers.cookie}`);
-  const prepareArgs = {
-    source: url,
-    type,
-    name,
-    referer: headers.referer || pageUrl || undefined,
-    ...(headers.userAgent ? { userAgent: String(headers.userAgent) } : {}),
-    headers: extraHeaders,
-    noPreflight: true
-  };
+  const prepareArgs = browserPrepareArgs({ url, type, headers: payload.headers, pageUrl, name });
 
   const captureId = randomUUID();
   const capture = {
@@ -1965,6 +2084,8 @@ async function handleCapturedMedia(payload = {}) {
     prepareArgs,
     preparedItem: null,
     variants: [],
+    preferredVariantUrl: /^https?:\/\//i.test(String(payload.preferredVariantUrl || "")) ? String(payload.preferredVariantUrl) : "",
+    preferredHeight: clampInt(payload.preferredHeight, 0, 10000, 0),
     error: ""
   };
   try {
@@ -1994,6 +2115,10 @@ function capturePayload(capture) {
     detectedAt: capture.detectedAt,
     variants: capture.variants,
     preparedItem: capture.preparedItem,
+    durationSec: capture.preparedItem?.durationSec || 0,
+    isLive: Boolean(capture.preparedItem?.isLive),
+    preferredVariantUrl: capture.preferredVariantUrl || "",
+    preferredHeight: capture.preferredHeight || 0,
     downloadDir: settings.downloadDir,
     ...(capture.error ? { error: capture.error } : {})
   };

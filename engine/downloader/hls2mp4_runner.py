@@ -9,11 +9,13 @@ import contextlib
 import datetime as _dt
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +127,10 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
         "use_local_fallback": bool(item.get("use_local_fallback", False)),
         "segment_count": int(item.get("segment_count") or 0),
         "estimated_duration": item.get("estimated_duration"),
+        "kind": item.get("kind"),
+        "duration_sec": item.get("duration_sec"),
+        "is_live": item.get("is_live"),
+        "renditions": item.get("renditions", []),
     }
 
 
@@ -156,22 +162,45 @@ def parse_source_to_item(args: argparse.Namespace, emitter: EventEmitter) -> dic
     selected_url = args.selected_url or url
     selected_quality = args.selected_quality
     variants: list[dict[str, Any]] = []
+    renditions: list[str] = []
     quality_status = "provided" if args.selected_url else "not_checked"
+    kind = {"m3u8": "media", "mp4": "mp4", "dash": "dash"}.get(args.type, str(args.type))
+    duration_sec: float | None = None
+    is_live: bool | None = None
 
     if args.type == "m3u8" and not args.selected_url:
+        playlist_text = ""
         try:
             with capture_core_logs(emitter, "quality"):
-                variants = [dict(item) for item in core.get_hls_variants(url, header_lines)]
+                playlist_text = core.fetch_text(url, header_lines)
+                variants = [dict(item) for item in core.parse_hls_variants(url, playlist_text)]
         except Exception as exc:
             emitter.emit("warning", phase="quality", message=f"Could not check HLS variants: {exc}")
             variants = []
 
         if variants:
+            kind = "master"
+            renditions = parse_hls_rendition_urls(url, playlist_text)
             selected, quality_status = select_variant(variants, args.target_quality)
             selected_url = str(selected["url"])
             selected_quality = str(selected.get("resolution") or "")
+            # Duration/live state come from ONE media playlist (text only, never segments).
+            richest = max(variants, key=lambda item: int(item.get("bandwidth") or 0))
+            try:
+                with capture_core_logs(emitter, "quality"):
+                    duration_sec, is_live = hls_playlist_timing(core.fetch_text(str(richest["url"]), header_lines))
+            except Exception as exc:
+                emitter.emit("warning", phase="quality", message=f"Could not read the HLS media playlist: {exc}")
         else:
             quality_status = "no_variants"
+            if playlist_text:
+                duration_sec, is_live = hls_playlist_timing(playlist_text)
+    elif args.type == "dash":
+        try:
+            with capture_core_logs(emitter, "quality"):
+                duration_sec, is_live = dash_manifest_timing(core.fetch_text(url, header_lines))
+        except Exception as exc:
+            emitter.emit("warning", phase="quality", message=f"Could not read the DASH manifest: {exc}")
 
     output = Path(args.output) if args.output else core.output_path(selected_url, args.name)
     return {
@@ -191,7 +220,66 @@ def parse_source_to_item(args: argparse.Namespace, emitter: EventEmitter) -> dic
         "use_local_fallback": False,
         "segment_count": 0,
         "estimated_duration": None,
+        "kind": kind,
+        "duration_sec": seconds_or_none(duration_sec),
+        "is_live": is_live,
+        "renditions": renditions,
     }
+
+
+def hls_playlist_timing(playlist_text: str) -> tuple[float | None, bool | None]:
+    """(sum of #EXTINF, is_live) for a media playlist; (None, None) if it is not one."""
+    if "#EXTM3U" not in playlist_text[:1024] and "#EXTINF" not in playlist_text:
+        return None, None
+    total = 0.0
+    has_endlist = False
+    is_vod = False
+    for raw_line in playlist_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXTINF:"):
+            try:
+                total += float(line.split(":", 1)[1].split(",", 1)[0])
+            except ValueError:
+                pass
+        elif line.startswith("#EXT-X-ENDLIST"):
+            has_endlist = True
+        elif line.upper().startswith("#EXT-X-PLAYLIST-TYPE:VOD"):
+            is_vod = True
+    return (total or None), not (has_endlist or is_vod)
+
+
+def parse_hls_rendition_urls(master_url: str, playlist_text: str) -> list[str]:
+    """Absolute URIs of #EXT-X-MEDIA renditions (alternate audio/subtitle playlists)."""
+    urls: list[str] = []
+    for raw_line in playlist_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        uri = core.parse_stream_inf(line.split(":", 1)[1]).get("URI")
+        if uri:
+            urls.append(urllib.parse.urljoin(master_url, uri))
+    return urls
+
+
+def parse_iso8601_duration(value: str) -> float | None:
+    match = re.fullmatch(
+        r"P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?",
+        value.strip(),
+    )
+    if not match or not any(match.groups()):
+        return None
+    days, hours, minutes, seconds = (float(part or 0) for part in match.groups())
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def dash_manifest_timing(manifest_text: str) -> tuple[float | None, bool | None]:
+    head = manifest_text[:4096]
+    if "<MPD" not in head:
+        return None, None
+    is_live = bool(re.search(r'<MPD[^>]*\btype\s*=\s*"dynamic"', head, re.S))
+    match = re.search(r'mediaPresentationDuration\s*=\s*"([^"]+)"', head)
+    duration = parse_iso8601_duration(match.group(1)) if match else None
+    return duration, is_live
 
 
 def select_variant(variants: list[dict[str, Any]], target_quality: str | None) -> tuple[dict[str, Any], str]:

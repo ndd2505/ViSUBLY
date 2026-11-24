@@ -10,6 +10,7 @@ const PAIR_TTL_MS = 5 * 60 * 1000;
 const MAX_FAILS = 5;
 const FAIL_WINDOW_MS = 60 * 1000;
 const MAX_TOKENS = 20;
+const PROBES_PER_SEC = 3; // per paired client
 
 const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 const cap = (v, n) => (typeof v === 'string' ? v.slice(0, n) : '');
@@ -37,15 +38,24 @@ function normalizePayload(p) {
     pageUrl: isHttpUrl(p.pageUrl) ? p.pageUrl : '',
     pageTitle: cap(p.pageTitle, 300),
     detectedAt: Number.isFinite(Number(p.detectedAt)) ? Number(p.detectedAt) : Date.now(),
+    preferredVariantUrl: isHttpUrl(p.preferredVariantUrl) ? p.preferredVariantUrl : '',
+    preferredHeight: Number.isInteger(p.preferredHeight) && p.preferredHeight > 0 && p.preferredHeight <= 10000 ? p.preferredHeight : 0,
   };
 }
 
-function createCaptureBridge({ port = 47653, dataDir, onCapture, logger = console } = {}) {
+// The probe body is a subset of the capture body: the stream plus the headers needed to fetch it.
+function normalizeProbePayload(p) {
+  const n = normalizePayload(p);
+  return { url: n.url, type: n.type, headers: n.headers };
+}
+
+function createCaptureBridge({ port = 47653, dataDir, onCapture, onProbe, logger = console } = {}) {
   let server = null;
   let actualPort = null;
   let tokens = []; // [{hash, clientName, createdAt}]
   let pairing = null; // {code, expiresAt}
   let fails = [];
+  const probeHits = new Map(); // token hash -> recent probe timestamps
   const tokenFile = () => path.join(dataDir, 'capture-tokens.json');
 
   function loadTokens() {
@@ -155,6 +165,30 @@ function createCaptureBridge({ port = 47653, dataDir, onCapture, logger = consol
       } catch (e) {
         logger.error && logger.error('[capture-bridge] onCapture failed:', e && e.message);
         return send(res, 500, { ok: false, error: 'ViSUBLY không xử lý được yêu cầu' }, cors);
+      }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/probe' && typeof onProbe === 'function') {
+      if (!isPaired(token)) return send(res, 401, { ok: false, error: 'Chưa ghép nối' }, cors);
+      const now = Date.now();
+      const client = sha256(token);
+      const hits = (probeHits.get(client) || []).filter((t) => now - t < 1000);
+      if (hits.length >= PROBES_PER_SEC) {
+        probeHits.set(client, hits);
+        return send(res, 429, { ok: false, error: 'Quá nhiều yêu cầu, thử lại sau' }, cors);
+      }
+      hits.push(now);
+      probeHits.set(client, hits);
+      if (probeHits.size > MAX_TOKENS * 2) for (const [k, v] of probeHits) if (!v.some((t) => now - t < 1000)) probeHits.delete(k);
+      const body = await readBody(req);
+      let payload;
+      try { payload = normalizeProbePayload(body); } catch (e) { return send(res, 400, { ok: false, error: e.message }, cors); }
+      try {
+        const r = await onProbe(payload);
+        return send(res, 200, r && typeof r === 'object' ? r : { ok: false, error: 'Không đọc được video' }, cors);
+      } catch (e) {
+        logger.error && logger.error('[capture-bridge] onProbe failed:', e && e.message);
+        return send(res, 500, { ok: false, error: 'ViSUBLY không đọc được video này' }, cors);
       }
     }
 

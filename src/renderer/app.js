@@ -778,8 +778,13 @@ function renderCaptureDialog() {
   const fromChrome = capture.origin !== "manual";
   const failure = capture.error ? describeFailure(capture.error) : null;
   const dir = currentDownloadDir();
-  const sourceMeta = [capture.host, typeLabel(capture.type), variants.length ? `${variants.length} chất lượng` : ""].filter(Boolean).join(" · ");
-  const duration = Number(capture.preparedItem?.estimatedDuration) || 0;
+  const duration = captureDuration(capture);
+  const sourceMeta = [
+    capture.host,
+    typeLabel(capture.type),
+    capture.isLive ? "Trực tiếp" : duration ? formatClock(duration) : "",
+    variants.length ? `${variants.length} chất lượng` : ""
+  ].filter(Boolean).join(" · ");
   return `
     <div class="dialog-overlay">
       <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="capTitle" data-capture-dialog>
@@ -836,7 +841,8 @@ function renderQualityChip(variant, all, duration) {
   const bandwidth = Number(variant.bandwidth) || 0;
   const sameHeight = all.filter((other) => (Number(other.height) || 0) === height).length > 1;
   let sub = String(variant.resolution || "").replace("x", "×");
-  if (bandwidth && duration) sub = `~${formatBytes((bandwidth * duration) / 8)}`;
+  const estBytes = Number(variant.estBytes) || (bandwidth && duration ? (bandwidth * duration) / 8 : 0);
+  if (estBytes) sub = formatApproxBytes(estBytes);
   else if (sameHeight && bandwidth) sub = `${(bandwidth / 1e6).toFixed(1)} Mbps`;
   return `
     <button type="button" class="quality-chip ${selected ? "is-on" : ""}" data-action="pick-quality" data-value="${escapeAttr(key)}" aria-pressed="${selected}">
@@ -956,7 +962,25 @@ function renderChromeSettings() {
             </span>`
           : `<button type="button" class="btn danger-text" data-action="ask-revoke">Hủy mọi ghép nối</button>`}
       </div>
+      ${renderShortVideoSetting()}
     </section>
+  `;
+}
+
+function renderShortVideoSetting() {
+  const stored = Number(state.settings?.ignoreShortVideosSec);
+  const current = Number.isFinite(stored) ? stored : 120;
+  const choices = [[0, "Tắt"], [30, "30 giây"], [60, "1 phút"], [120, "2 phút"], [300, "5 phút"]];
+  return `
+    <div class="setting-stack is-divided">
+      <div class="setting-text">
+        <span class="setting-label" id="shortVideosLabel">Ẩn video ngắn hơn</span>
+        <span class="setting-hint">Bỏ qua video xem trước và quảng cáo ngắn khi bắt link từ Chrome.</span>
+      </div>
+      <div class="segmented is-wide is-five" role="group" aria-labelledby="shortVideosLabel">
+        ${choices.map(([value, label]) => segButton("set-short-videos", String(value), label, current === value)).join("")}
+      </div>
+    </div>
   `;
 }
 
@@ -1662,6 +1686,7 @@ document.addEventListener("click", async (event) => {
   // Settings
   if (action === "set-theme") return setThemeMode(actionEl.dataset.value);
   if (action === "set-parallel") return updateSettings({ maxParallelDownloads: Number(actionEl.dataset.value) });
+  if (action === "set-short-videos") return updateSettings({ ignoreShortVideosSec: Number(actionEl.dataset.value) });
   if (action === "toggle-notify") return updateSettings({ notifyOnComplete: !(state.settings?.notifyOnComplete !== false) });
   if (action === "new-pairing-code") return ensurePairingCode(true);
   if (action === "open-extension-folder") {
@@ -2324,12 +2349,23 @@ function sortedVariants(variants) {
     .sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0) || (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
 }
 
+// The extension may name the quality the user clicked in its popup (URL first, height as fallback
+// because signed variant URLs can change between the probe and the capture).
 function defaultVariantKey(capture) {
   const variants = sortedVariants(capture.variants);
   if (!variants.length) return "";
-  const selectedUrl = capture.preparedItem?.selectedUrl;
-  const selected = variants.find((variant) => variant.url && variant.url === selectedUrl);
+  const byUrl = (url) => (url ? variants.find((variant) => variant.url && variant.url === url) : null);
+  const preferredHeight = Number(capture.preferredHeight) || 0;
+  const selected =
+    byUrl(capture.preferredVariantUrl) ||
+    (preferredHeight ? variants.find((variant) => Number(variant.height) === preferredHeight) : null) ||
+    byUrl(capture.preparedItem?.selectedUrl);
   return variantKey(selected || variants[0]);
+}
+
+function captureDuration(capture) {
+  if (capture.isLive || capture.preparedItem?.isLive) return 0;
+  return Number(capture.durationSec || capture.preparedItem?.durationSec || capture.preparedItem?.estimatedDuration) || 0;
 }
 
 async function changeDownloadDir() {
@@ -3821,6 +3857,16 @@ function hasFolderVideoSubtitle(video = {}) {
 function hasSubbedVideoMarker(value) {
   const stem = pathBaseName(value).replace(/\.[^.]+$/, "");
   return /(?:^|[-_.\s])vs(?:$|[-_.\s])/i.test(stem);
+}
+
+// "~1.1 GB" / "~640 MB": an estimate, so fewer digits than formatBytes.
+function formatApproxBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const gb = value / 1024 ** 3;
+  if (gb >= 1) return `~${gb >= 10 ? Math.round(gb) : gb.toFixed(1)} GB`;
+  const mb = value / 1024 ** 2;
+  return `~${mb >= 10 ? Math.round(mb) : Math.max(0.1, mb).toFixed(1)} MB`;
 }
 
 function formatBytes(bytes) {

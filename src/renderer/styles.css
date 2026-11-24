@@ -1692,6 +1692,28 @@ img {
   border-radius: 12px;
 }
 
+.segmented.is-wide.is-five {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.segmented.is-five .seg-btn {
+  height: 36px;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+.setting-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.setting-stack.is-divided {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
 .seg-btn {
   height: 40px;
   padding: 0 10px;

@@ -4,6 +4,8 @@ const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 const { appBuilderPath } = require("app-builder-bin");
 
+// win.signAndEditExecutable is false (avoids the winCodeSign download/symlink issue and we do not sign),
+// so electron-builder skips rcedit; stamp the icon and version info on the app exe here instead.
 module.exports = async function afterPack(context) {
   if (context.electronPlatformName !== "win32") return;
 
@@ -21,6 +23,12 @@ module.exports = async function afterPack(context) {
     "--set-version-string",
     "InternalName",
     appInfo.productFilename,
+    "--set-version-string",
+    "CompanyName",
+    appInfo.companyName || "Visubly",
+    "--set-version-string",
+    "LegalCopyright",
+    appInfo.copyright,
     "--set-file-version",
     appInfo.getVersionInWeirdWindowsForm(),
     "--set-product-version",

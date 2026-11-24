@@ -2663,6 +2663,9 @@ function describeFailure(raw) {
   if (status === 404 || status === 410) {
     return { code: `Lỗi ${status}`, message: "Không tìm thấy video ở link này. Có thể video đã bị gỡ hoặc link bị thiếu, hãy lấy link mới." };
   }
+  if (/download folder is not available|cannot use download folder|EPERM|EACCES|EROFS|operation not permitted|permission denied/i.test(text)) {
+    return { code: "Lỗi thư mục lưu", message: "ViSUBLY không ghi được vào thư mục lưu video. Kiểm tra ổ đĩa còn kết nối và cho phép ghi, hoặc đổi thư mục trong Cài đặt." };
+  }
   if (/no space left|ENOSPC|disk (is )?full|not enough space/i.test(text)) {
     return { code: "Hết dung lượng", message: "Ổ đĩa lưu video đã đầy. Giải phóng bớt dung lượng hoặc đổi thư mục lưu trong Cài đặt rồi thử lại." };
   }

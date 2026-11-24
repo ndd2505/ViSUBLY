@@ -1612,10 +1612,21 @@ async function cleanupStaleEngineTemp() {
 }
 
 // --- Output paths ---
+// fs.mkdirSync(<drive root>, { recursive: true }) throws EPERM on Windows even
+// when the drive exists (e.g. "E:\"), so only create folders that are missing.
+function ensureDirectory(dir) {
+  try {
+    if (fs.statSync(dir).isDirectory()) return;
+  } catch {
+    // Missing: create it below.
+  }
+  fs.mkdirSync(dir, { recursive: true });
+}
+
 function ensureDownloadDir() {
   const dir = settings.downloadDir || defaultDownloadDir({});
   try {
-    fs.mkdirSync(dir, { recursive: true });
+    ensureDirectory(dir);
   } catch (error) {
     throw new Error(`Download folder is not available: ${dir} (${error.message})`);
   }
@@ -1630,7 +1641,7 @@ function resolveDownloadOutput({ name = "", source = "", output = "", unique = t
     target += ".mp4";
   }
   try {
-    fs.mkdirSync(path.dirname(target), { recursive: true });
+    ensureDirectory(path.dirname(target));
   } catch (error) {
     throw new Error(`Download folder is not available: ${path.dirname(target)} (${error.message})`);
   }
@@ -1775,7 +1786,7 @@ async function updateSettings(partial = {}) {
   const next = sanitizeSettings({ ...previous, ...changes }, previous);
   if (next.downloadDir !== previous.downloadDir) {
     try {
-      fs.mkdirSync(next.downloadDir, { recursive: true });
+      ensureDirectory(next.downloadDir);
     } catch (error) {
       throw new Error(`Cannot use download folder ${next.downloadDir}: ${error.message}`);
     }

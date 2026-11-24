@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker, shell, Notification, nativeImage } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker, shell, Notification, nativeImage, nativeTheme } = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
@@ -74,8 +74,13 @@ const defaultSettings = Object.freeze({
   segmentWorkers: 8,
   notifyOnComplete: true,
   captureBridgeEnabled: true,
-  captureBridgePort: 47653
+  captureBridgePort: 47653,
+  theme: "dark"
 });
+const themeModes = new Set(["dark", "light", "system"]);
+const themeBackgrounds = { dark: "#0E0C12", light: "#F2EFE8" };
+// Finished items stay listed until the user clears them; keep the newest ones only.
+const maxKeptDoneItems = 200;
 let settings = { ...defaultSettings };
 const downloadQueue = {
   items: [],
@@ -116,8 +121,33 @@ if (!gotSingleInstanceLock) {
   const legacy = migrateLegacyQueue();
   settings = loadSettings(legacy);
   applySettingsToQueue();
+  applyThemeSource();
   loadDownloadQueue();
 }
+
+// themeSource drives prefers-color-scheme in the renderer and native widgets (scrollbars, dialogs).
+function applyThemeSource() {
+  try {
+    nativeTheme.themeSource = themeModes.has(settings.theme) ? settings.theme : "dark";
+  } catch {
+    // Older platforms may reject a theme source; the renderer still applies data-theme.
+  }
+}
+
+function resolvedTheme() {
+  if (settings.theme === "light") return "light";
+  if (settings.theme === "system") return nativeTheme.shouldUseDarkColors ? "dark" : "light";
+  return "dark";
+}
+
+function syncWindowBackground() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setBackgroundColor(themeBackgrounds[resolvedTheme()]);
+}
+
+nativeTheme.on("updated", () => {
+  if (settings.theme === "system") syncWindowBackground();
+});
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -127,8 +157,9 @@ function createWindow() {
     minHeight: 720,
     frame: false,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
+    title: "ViSUBLY",
     icon: loadAppIcon(),
-    backgroundColor: "#f0eee9",
+    backgroundColor: themeBackgrounds[resolvedTheme()],
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -231,11 +262,16 @@ app.on("before-quit", () => {
 // --- Settings & app info API ---
 ipcMain.handle("settings:get", () => ({ ...settings }));
 
+// Read synchronously by the preload so the first paint already uses the right theme.
+ipcMain.on("app:bootInfoSync", (event) => {
+  event.returnValue = { theme: settings.theme, resolvedTheme: resolvedTheme(), version: app.getVersion() };
+});
+
 ipcMain.handle("settings:update", async (_event, partial = {}) => updateSettings(partial));
 
 ipcMain.handle("settings:selectDownloadDir", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose download folder",
+    title: "Chọn thư mục lưu video",
     defaultPath: settings.downloadDir || undefined,
     properties: ["openDirectory", "createDirectory"]
   });
@@ -266,6 +302,41 @@ ipcMain.handle("capture:createPairingCode", async () => {
 
 ipcMain.handle("capture:info", () => captureBridgeInfo());
 
+// A pasted URL/cURL goes through the same pending-capture path as a browser capture,
+// so the renderer can show one confirm dialog for both.
+ipcMain.handle("capture:prepareManual", async (_event, payload = {}) => {
+  const source = String(payload.source || "").trim();
+  if (!source) return { ok: false, error: "Paste a URL or full curl command first." };
+  prunePendingCaptures();
+  const type = guessSourceType(source);
+  const prepareArgs = { source, type, noPreflight: true };
+  let preparedItem;
+  try {
+    preparedItem = await prepareDownloadItem(prepareArgs);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  const captureId = randomUUID();
+  const host = preparedItem.host || hostFromUrl(preparedItem.url);
+  const capture = {
+    captureId,
+    name: preparedItem.name || safeOutputStem(host || "video"),
+    host,
+    pageUrl: "",
+    type,
+    url: preparedItem.url,
+    detectedAt: new Date().toISOString(),
+    receivedAt: Date.now(),
+    prepareArgs,
+    preparedItem,
+    variants: preparedItem.variants || [],
+    error: "",
+    origin: "manual"
+  };
+  pendingCaptures.set(captureId, capture);
+  return { ok: true, capture: capturePayload(capture) };
+});
+
 ipcMain.handle("capture:revokeAll", async () => {
   if (!captureBridge) return { ok: false, error: captureBridgeUnavailableMessage() };
   try {
@@ -294,11 +365,11 @@ ipcMain.handle("window:close", (event) => {
 
 ipcMain.handle("dialog:selectVideo", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose a video",
+    title: "Chọn video",
     properties: ["openFile"],
     filters: [
-      { name: "Video files", extensions: ["mp4", "mkv", "mov", "avi", "webm", "m4v"] },
-      { name: "All files", extensions: ["*"] }
+      { name: "Video", extensions: ["mp4", "mkv", "mov", "avi", "webm", "m4v"] },
+      { name: "Tất cả file", extensions: ["*"] }
     ]
   });
 
@@ -308,7 +379,7 @@ ipcMain.handle("dialog:selectVideo", async () => {
 
 ipcMain.handle("dialog:selectVideoFolder", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose a video folder",
+    title: "Chọn thư mục video",
     properties: ["openDirectory"]
   });
 
@@ -320,11 +391,11 @@ ipcMain.handle("dialog:selectVideoFolder", async () => {
 
 ipcMain.handle("dialog:selectSubtitle", async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "Choose a subtitle file",
+    title: "Chọn file phụ đề",
     properties: ["openFile"],
     filters: [
-      { name: "Subtitle files", extensions: ["srt", "vtt"] },
-      { name: "All files", extensions: ["*"] }
+      { name: "Phụ đề", extensions: ["srt", "vtt"] },
+      { name: "Tất cả file", extensions: ["*"] }
     ]
   });
 
@@ -335,6 +406,75 @@ ipcMain.handle("dialog:selectSubtitle", async () => {
 ipcMain.handle("file:readText", async (_event, filePath) => {
   if (!filePath || typeof filePath !== "string") return "";
   return fs.promises.readFile(filePath, "utf8");
+});
+
+ipcMain.handle("file:readSubtitleText", async (_event, filePath) => {
+  if (!filePath || typeof filePath !== "string") return "";
+  return decodeSubtitleBuffer(await fs.promises.readFile(filePath));
+});
+
+// Returns { [path]: boolean } so the renderer can hide recently played files that are gone.
+ipcMain.handle("file:exists", async (_event, paths = []) => {
+  const list = Array.isArray(paths) ? paths.filter((value) => typeof value === "string" && value).slice(0, 200) : [];
+  const entries = await Promise.all(
+    list.map(async (filePath) => {
+      try {
+        const stat = await fs.promises.stat(filePath);
+        return [filePath, stat.isFile()];
+      } catch {
+        return [filePath, false];
+      }
+    })
+  );
+  return Object.fromEntries(entries);
+});
+
+ipcMain.handle("media:openInSystemPlayer", async (_event, filePath) => {
+  if (!filePath || typeof filePath !== "string") return { ok: false, error: "No file to open." };
+  if (!fs.existsSync(filePath)) return { ok: false, error: `File not found: ${filePath}` };
+  const error = await shell.openPath(filePath);
+  return error ? { ok: false, error } : { ok: true };
+});
+
+ipcMain.handle("download:openDir", async () => {
+  try {
+    const dir = ensureDownloadDir();
+    const error = await shell.openPath(dir);
+    return error ? { ok: false, error } : { ok: true };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle("app:diskSpace", async () => {
+  let dir = settings.downloadDir || "";
+  if (!dir) return { ok: false, error: "No download folder." };
+  // Walk up to an existing folder: statfs needs a real path.
+  while (dir && !fs.existsSync(dir)) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  try {
+    const stats = await fs.promises.statfs(dir);
+    return {
+      ok: true,
+      root: path.parse(path.resolve(dir)).root,
+      free: Number(stats.bavail) * Number(stats.bsize),
+      total: Number(stats.blocks) * Number(stats.bsize)
+    };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle("app:openExtensionFolder", async () => {
+  const dir = app.isPackaged
+    ? path.join(process.resourcesPath, "browser-extension", "chrome")
+    : path.join(projectRoot, "browser-extension", "chrome");
+  if (!fs.existsSync(dir)) return { ok: false, error: `Extension folder not found: ${dir}`, path: dir };
+  const error = await shell.openPath(dir);
+  return error ? { ok: false, error, path: dir } : { ok: true, path: dir };
 });
 
 ipcMain.handle("media:toFileUrl", (_event, filePath) => {
@@ -957,13 +1097,9 @@ function startDownloadProcess(item) {
       appendDownloadLog(item, "Runner stopped after cancel.");
       removePartialOutput(item);
     } else if (code === 0 && !spawnError) {
-      item.status = "done";
-      item.phase = "done";
-      item.progress = 100;
-      item.outputClaimed = false;
+      markDownloadDone(item);
       appendDownloadLog(item, "Download completed.");
       notifyDownloadFinished(item, true);
-      removeDownloadItem(item.id);
     } else {
       item.status = "failed";
       item.phase = "failed";
@@ -1001,8 +1137,8 @@ function notifyDownloadFinished(item, ok) {
   try {
     if (!Notification.isSupported()) return;
     const notification = new Notification({
-      title: ok ? "Download complete" : "Download failed",
-      body: ok ? item.name : `${item.name}: ${item.error || "Unknown error"}`.slice(0, 240),
+      title: ok ? "Tải xong" : "Tải không thành công",
+      body: ok ? item.name : `${item.name}: ${item.error || "Lỗi không rõ"}`.slice(0, 240),
       icon: fs.existsSync(notificationIconPath) ? notificationIconPath : undefined
     });
     const output = item.output;
@@ -1061,10 +1197,8 @@ function applyRunnerEvent(itemId, event) {
     item.error = event.message || "Download runner error.";
     appendDownloadLog(item, item.error);
   } else if (event.event === "done") {
-    item.status = "done";
-    item.phase = "done";
-    item.progress = 100;
     item.output = event.output || item.output;
+    markDownloadDone(item);
   } else if (event.event === "failed") {
     item.status = "failed";
     item.phase = "failed";
@@ -1072,6 +1206,70 @@ function applyRunnerEvent(itemId, event) {
   }
 
   persistAndBroadcastDownloadState({ deferred: isNoisyDownloadEvent(event) });
+}
+
+function markDownloadDone(item) {
+  item.status = "done";
+  item.phase = "done";
+  item.progress = 100;
+  item.outputClaimed = false;
+  item.error = "";
+  item.speed = "";
+  item.eta = null;
+  if (!item.finishedAt) item.finishedAt = new Date().toISOString();
+  try {
+    if (item.output) item.fileSize = fs.statSync(item.output).size;
+  } catch {
+    // The size is informational only.
+  }
+}
+
+function trimDoneItems() {
+  const done = downloadQueue.items.filter((item) => item.status === "done");
+  if (done.length <= maxKeptDoneItems) return;
+  const keep = new Set(
+    done
+      .sort((a, b) => String(b.finishedAt || b.updatedAt).localeCompare(String(a.finishedAt || a.updatedAt)))
+      .slice(0, maxKeptDoneItems)
+      .map((item) => item.id)
+  );
+  downloadQueue.items = downloadQueue.items.filter((item) => item.status !== "done" || keep.has(item.id));
+}
+
+function guessSourceType(source) {
+  const match = String(source || "").match(/https?:\/\/[^\s'"\\]+/i);
+  if (!match) return "m3u8";
+  try {
+    const pathname = new URL(match[0]).pathname.toLowerCase();
+    if (/\.(mp4|m4v|mov|webm)$/.test(pathname)) return "mp4";
+    if (/\.mpd$/.test(pathname)) return "dash";
+  } catch {
+    // Fall through to HLS.
+  }
+  return "m3u8";
+}
+
+// Subtitle files come in many encodings; Vietnamese ones are often UTF-16 or Windows-1258.
+function decodeSubtitleBuffer(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || []);
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return new TextDecoder("utf-8").decode(bytes.subarray(3));
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes.subarray(2));
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes.subarray(2));
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    // Not valid UTF-8: try legacy Windows code pages.
+  }
+  for (const label of ["windows-1258", "windows-1252"]) {
+    try {
+      return new TextDecoder(label).decode(bytes);
+    } catch {
+      // Label not supported by this ICU build; try the next one.
+    }
+  }
+  return Buffer.from(bytes).toString("latin1");
 }
 
 function addDownloadItem(raw) {
@@ -1103,7 +1301,7 @@ function normalizeDownloadItem(raw = {}, overrides = {}) {
     selectedQuality,
     quality: String(raw.quality || overrides.quality || qualityFromResolution(selectedQuality) || "1080"),
     output,
-    host: hostFromUrl(url || selectedUrl),
+    host: String(raw.host || overrides.host || hostFromUrl(url || selectedUrl)),
     workers: Math.max(1, Number(raw.workers || overrides.workers || downloadQueue.localWorkers || 8)),
     overwrite: Boolean(raw.overwrite || overrides.overwrite),
     outputClaimed: Boolean(raw.outputClaimed),
@@ -1119,6 +1317,9 @@ function normalizeDownloadItem(raw = {}, overrides = {}) {
     variants: Array.isArray(raw.variants) ? raw.variants : [],
     segmentCount: Number(raw.segment_count || raw.segmentCount || 0),
     estimatedDuration: raw.estimated_duration ?? raw.estimatedDuration ?? null,
+    pageUrl: String(raw.pageUrl || overrides.pageUrl || ""),
+    fileSize: Number(raw.fileSize || 0) || 0,
+    finishedAt: raw.finishedAt || "",
     createdAt: raw.createdAt || now,
     updatedAt: raw.updatedAt || now
   };
@@ -1179,18 +1380,15 @@ function getDownloadItem(itemId) {
   return downloadQueue.items.find((item) => item.id === itemId);
 }
 
-function removeDownloadItem(itemId) {
-  downloadQueue.items = downloadQueue.items.filter((item) => item.id !== itemId);
-}
-
 function downloadOutputPath(itemId) {
   const item = getDownloadItem(itemId);
   return item?.output ? path.resolve(item.output) : "";
 }
 
 function downloadSnapshot() {
+  trimDoneItems();
   return {
-    items: downloadQueue.items.filter((item) => item.status !== "done").map((item) => {
+    items: downloadQueue.items.map((item) => {
       const copy = { ...item };
       delete copy.cancelRequested;
       return copy;
@@ -1246,7 +1444,7 @@ function loadDownloadQueue() {
           // An interrupted run leaves a partial file that this app created; drop it so the retry reuses the name.
           if (normalized.status !== "done") removePartialOutput(normalized);
           return normalized;
-        }).filter((item) => item.status !== "done")
+        })
       : [];
   } catch (error) {
     logMain("warn", `Could not load download queue: ${error.message}`);
@@ -1534,6 +1732,7 @@ function sanitizeSettings(input = {}, base = defaultSettings) {
   if (typeof input.notifyOnComplete === "boolean") next.notifyOnComplete = input.notifyOnComplete;
   if (typeof input.captureBridgeEnabled === "boolean") next.captureBridgeEnabled = input.captureBridgeEnabled;
   next.captureBridgePort = clampInt(input.captureBridgePort, 1024, 65535, next.captureBridgePort);
+  if (themeModes.has(input.theme)) next.theme = input.theme;
   return next;
 }
 
@@ -1584,6 +1783,10 @@ async function updateSettings(partial = {}) {
   settings = next;
   writeSettingsFile(next);
   applySettingsToQueue();
+  if (next.theme !== previous.theme) {
+    applyThemeSource();
+    syncWindowBackground();
+  }
   if (next.maxParallelDownloads > previous.maxParallelDownloads && downloadQueue.activeIds.size) pumpDownloadQueue();
   if (
     next.captureBridgeEnabled !== previous.captureBridgeEnabled ||
@@ -1741,6 +1944,7 @@ async function handleCapturedMedia(payload = {}) {
   const capture = {
     captureId,
     name,
+    pageTitle: title,
     host,
     pageUrl,
     type,
@@ -1759,21 +1963,29 @@ async function handleCapturedMedia(payload = {}) {
     capture.error = error.message;
     logMain("warn", `Capture prepare failed for ${host}: ${error.message}`);
   }
+  capture.origin = "browser";
   pendingCaptures.set(captureId, capture);
 
   focusMainWindow();
-  sendToRenderer("capture:incoming", {
-    captureId,
-    name,
-    host,
-    pageUrl,
-    type,
+  sendToRenderer("capture:incoming", capturePayload(capture));
+  return { ok: true };
+}
+
+function capturePayload(capture) {
+  return {
+    captureId: capture.captureId,
+    name: capture.name,
+    pageTitle: capture.pageTitle || "",
+    host: capture.host,
+    pageUrl: capture.pageUrl,
+    type: capture.type,
+    origin: capture.origin || "browser",
     detectedAt: capture.detectedAt,
     variants: capture.variants,
     preparedItem: capture.preparedItem,
+    downloadDir: settings.downloadDir,
     ...(capture.error ? { error: capture.error } : {})
-  });
-  return { ok: true };
+  };
 }
 
 async function confirmCapture(payload = {}) {
@@ -1814,10 +2026,16 @@ async function confirmCapture(payload = {}) {
   } catch (error) {
     return { ok: false, error: error.message };
   }
-  appendDownloadLog(item, `Captured from ${capture.pageUrl || capture.host}.`);
+  item.pageUrl = capture.pageUrl || "";
+  item.host = capture.host || item.host;
+  appendDownloadLog(
+    item,
+    capture.origin === "manual" ? "Added from a pasted link." : `Captured from ${capture.pageUrl || capture.host}.`
+  );
   const added = addDownloadItem(item);
   pendingCaptures.delete(captureId);
-  pumpDownloadQueue();
+  // "Thêm vào hàng đợi" passes start:false; the item then waits for the queue to run.
+  if (payload.start !== false) pumpDownloadQueue();
   persistAndBroadcastDownloadState({ immediate: true });
   return { ok: true, item: added, state: downloadSnapshot() };
 }

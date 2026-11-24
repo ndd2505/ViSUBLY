@@ -7,6 +7,14 @@ const subscribe = (channel) => (callback) => {
   return () => ipcRenderer.removeListener(channel, listener);
 };
 
+// Theme + version are needed before the first paint (no light/dark flash, intro gating).
+let bootInfo = { theme: "dark", resolvedTheme: "dark", version: "" };
+try {
+  bootInfo = { ...bootInfo, ...ipcRenderer.sendSync("app:bootInfoSync") };
+} catch {
+  // Defaults are fine; the renderer refreshes settings asynchronously.
+}
+
 const settingsApi = {
   get: () => ipcRenderer.invoke("settings:get"),
   update: (partial) => ipcRenderer.invoke("settings:update", partial),
@@ -18,6 +26,7 @@ const captureApi = {
   onIncoming: subscribe("capture:incoming"),
   confirm: (payload) => ipcRenderer.invoke("capture:confirm", payload),
   dismiss: (captureId) => ipcRenderer.invoke("capture:dismiss", captureId),
+  prepareManual: (source) => ipcRenderer.invoke("capture:prepareManual", { source }),
   createPairingCode: () => ipcRenderer.invoke("capture:createPairingCode"),
   info: () => ipcRenderer.invoke("capture:info"),
   revokeAll: () => ipcRenderer.invoke("capture:revokeAll")
@@ -34,20 +43,14 @@ const downloadApi = {
   clearCompleted: () => ipcRenderer.invoke("download:clearCompleted"),
   openOutput: (itemId) => ipcRenderer.invoke("download:openOutput", itemId),
   revealOutput: (itemId) => ipcRenderer.invoke("download:revealOutput", itemId),
-  onEvent: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("download:event", listener);
-    return () => ipcRenderer.removeListener("download:event", listener);
-  },
-  onState: (callback) => {
-    const listener = (_event, payload) => callback(payload);
-    ipcRenderer.on("download:state", listener);
-    return () => ipcRenderer.removeListener("download:state", listener);
-  }
+  openDownloadDir: () => ipcRenderer.invoke("download:openDir"),
+  onEvent: subscribe("download:event"),
+  onState: subscribe("download:state")
 };
 
 contextBridge.exposeInMainWorld("visublyDesktop", {
   platform: process.platform,
+  boot: bootInfo,
   minimize: () => ipcRenderer.invoke("window:minimize"),
   toggleMaximize: () => ipcRenderer.invoke("window:toggleMaximize"),
   close: () => ipcRenderer.invoke("window:close"),
@@ -55,6 +58,9 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
   selectVideoFolder: () => ipcRenderer.invoke("dialog:selectVideoFolder"),
   selectSubtitle: () => ipcRenderer.invoke("dialog:selectSubtitle"),
   readTextFile: (filePath) => ipcRenderer.invoke("file:readText", filePath),
+  readSubtitleText: (filePath) => ipcRenderer.invoke("file:readSubtitleText", filePath),
+  checkFiles: (paths) => ipcRenderer.invoke("file:exists", paths),
+  openInSystemPlayer: (filePath) => ipcRenderer.invoke("media:openInSystemPlayer", filePath),
   toFileUrl: (filePath) => ipcRenderer.invoke("media:toFileUrl", filePath),
   scanVideoFolder: (folderPath) => ipcRenderer.invoke("media:scanVideoFolder", folderPath),
   findMatchingSubtitle: (videoPath) => ipcRenderer.invoke("media:findMatchingSubtitle", videoPath),
@@ -62,34 +68,20 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
     start: () => ipcRenderer.invoke("airplay:start"),
     stop: () => ipcRenderer.invoke("airplay:stop"),
     info: () => ipcRenderer.invoke("airplay:info"),
-    onPairingRequested: (callback) => {
-      const listener = (_event, pin) => callback(pin);
-      ipcRenderer.on("airplay:pairing-requested", listener);
-      return () => ipcRenderer.removeListener("airplay:pairing-requested", listener);
-    },
+    onPairingRequested: subscribe("airplay:pairing-requested"),
     onPairingSuccess: (callback) => {
       const listener = () => callback();
       ipcRenderer.on("airplay:pairing-success", listener);
       return () => ipcRenderer.removeListener("airplay:pairing-success", listener);
     },
-    onPowerState: (callback) => {
-      const listener = (_event, payload) => callback(payload);
-      ipcRenderer.on("airplay:power-state", listener);
-      return () => ipcRenderer.removeListener("airplay:power-state", listener);
-    }
+    onPowerState: subscribe("airplay:power-state")
   },
   download: downloadApi,
   settings: settingsApi,
   app: {
-    getInfo: () => ipcRenderer.invoke("app:getInfo")
+    getInfo: () => ipcRenderer.invoke("app:getInfo"),
+    diskSpace: () => ipcRenderer.invoke("app:diskSpace"),
+    openExtensionFolder: () => ipcRenderer.invoke("app:openExtensionFolder")
   },
-  capture: captureApi,
-  integrations: {
-    startDownloadBatch: async (items) => {
-      const queued = await downloadApi.enqueueItems(items);
-      await downloadApi.startQueue();
-      return queued;
-    },
-    generateSubtitle: async (payload) => ({ ok: true, payload })
-  }
+  capture: captureApi
 });

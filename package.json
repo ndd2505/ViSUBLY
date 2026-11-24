@@ -30,6 +30,12 @@
       "build/icon.png",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "browser-extension/chrome",
+        "to": "browser-extension/chrome"
+      }
+    ],
     "asarUnpack": [
       "**/node_modules/@ffmpeg-installer/**/*"
     ],

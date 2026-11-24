@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ViSUBLY Grabber</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="logo">&#8681;</span> ViSUBLY Grabber</div>
+    <div class="conn" id="conn"><span class="dot" id="dot"></span><span id="connText">Đang kiểm tra...</span></div>
+  </header>
+
+  <section id="notRunning" class="notice" hidden>Mở ViSUBLY trên máy tính trước.</section>
+
+  <section id="pairBox" class="card" hidden>
+    <label for="code">Nhập mã ghép nối 6 số</label>
+    <div class="row">
+      <input id="code" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="000000">
+      <button id="pairBtn" class="primary">Ghép nối</button>
+    </div>
+    <p class="hint">Mở ViSUBLY &rsaquo; Cài đặt &rsaquo; Kết nối trình duyệt để lấy mã</p>
+    <p class="err" id="pairErr" hidden></p>
+  </section>
+
+  <main>
+    <ul id="list" class="list"></ul>
+    <p id="empty" class="empty" hidden>Chưa thấy video nào. Hãy bấm phát video trên trang.</p>
+  </main>
+
+  <footer>
+    <button id="forget" class="link" hidden>Hủy ghép nối</button>
+  </footer>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

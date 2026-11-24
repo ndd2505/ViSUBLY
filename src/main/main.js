@@ -1,18 +1,26 @@
-const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker, shell } = require("electron");
-const { spawn } = require("node:child_process");
+const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker, shell, Notification, nativeImage } = require("electron");
+const { spawn, spawnSync } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const airplayServer = require("./airplay-server");
 
-const appIconPath = path.join(__dirname, "../renderer/assets/brand/visubly-app-logo-concept-v2.png");
+const projectRoot = path.resolve(__dirname, "..", "..");
+// build/icon.* is shipped inside app.asar (see package.json build.files), so this works packaged and in dev.
+const appIconPath = path.join(projectRoot, "build", process.platform === "win32" ? "icon.ico" : "icon.png");
+const notificationIconPath = path.join(projectRoot, "build", "icon.png");
 
 let mainWindow;
 let airplayPowerBlockerId = null;
 let airplayPowerBlockerStopTimer = null;
+let appQuitting = false;
 
-const runtimeRoot = process.env.VISUBLY_RUNTIME_DIR || path.join("D:\\", "Projects", "ViSUBLY", ".runtime");
+// Runtime data root: VISUBLY_RUNTIME_DIR > packaged userData (%APPDATA%\Visubly Studio) > <projectRoot>/.runtime (dev).
+const runtimeRoot = path.resolve(
+  process.env.VISUBLY_RUNTIME_DIR || (app.isPackaged ? app.getPath("userData") : path.join(projectRoot, ".runtime"))
+);
 const runtimePaths = {
   userData: path.join(runtimeRoot, "user-data"),
   sessionData: path.join(runtimeRoot, "session-data"),
@@ -21,20 +29,24 @@ const runtimePaths = {
   crashDumps: path.join(runtimeRoot, "crash-dumps"),
   temp: path.join(runtimeRoot, "temp")
 };
+const engineTempDir = path.join(runtimePaths.temp, "engine");
+const settingsPath = path.join(runtimePaths.userData, "settings.json");
+const mainLogPath = path.join(runtimePaths.logs, "main.log");
+// Queue written by pre-1.0 dev builds; copied (never moved) into the new data dir on first run.
+const legacyQueuePath =
+  process.platform === "win32" ? path.join("D:\\", "Projects", "ViSUBLY", ".runtime", "user-data", "download-queue.json") : "";
 
-const extractingVideoDir = process.env.VISUBLY_EXTRACTING_VIDEO_DIR || path.join("D:\\", "Projects", "Extracting Video");
-const runnerScript = path.join(extractingVideoDir, "hls2mp4_runner.py");
-const defaultPythonPath = path.join(
-  "C:\\",
-  "Users",
-  "ADMIN",
-  "AppData",
-  "Local",
-  "Programs",
-  "Python",
-  "Python312",
-  "python.exe"
-);
+// Downloader engine: packaged -> bundled PyInstaller exe in resources/engine; dev -> Python + engine/downloader.
+const engineExecutableName = process.platform === "win32" ? "visubly-downloader.exe" : "visubly-downloader";
+const bundledEnginePath = app.isPackaged ? path.join(process.resourcesPath, "engine", engineExecutableName) : "";
+const devEngineDir =
+  (!app.isPackaged && process.env.VISUBLY_EXTRACTING_VIDEO_DIR) || path.join(projectRoot, "engine", "downloader");
+const runnerScript = path.join(devEngineDir, "hls2mp4_runner.py");
+const legacyPythonPath = path.join(os.homedir(), "AppData", "Local", "Programs", "Python", "Python312", "python.exe");
+const ffmpegPath = resolveFfmpegPath();
+const runnerTimeoutMs = 120000;
+let resolvedEngine = null;
+
 const videoFolderExtensions = new Set([
   ".mp4",
   ".m4v",
@@ -54,16 +66,34 @@ const airplayPowerBlockerGraceMs = Math.max(0, Number(process.env.VISUBLY_AIRPLA
 const airplayPowerBlockerMode =
   process.env.VISUBLY_AIRPLAY_KEEP_DISPLAY_AWAKE === "1" ? "prevent-display-sleep" : "prevent-app-suspension";
 const downloadStatePath = path.join(runtimePaths.userData, "download-queue.json");
-const maxParallelDownloadProcesses = 1;
+const maxParallelDownloadProcesses = 3;
 const downloadStateFlushMs = 300;
+const defaultSettings = Object.freeze({
+  downloadDir: "",
+  maxParallelDownloads: 2,
+  segmentWorkers: 8,
+  notifyOnComplete: true,
+  captureBridgeEnabled: true,
+  captureBridgePort: 47653
+});
+let settings = { ...defaultSettings };
 const downloadQueue = {
   items: [],
   activeIds: new Set(),
   processes: new Map(),
-  parallelItems: maxParallelDownloadProcesses,
-  localWorkers: 8
+  parallelItems: defaultSettings.maxParallelDownloads,
+  localWorkers: defaultSettings.segmentWorkers
 };
 let downloadStateFlushTimer = null;
+const activeNotifications = new Set();
+
+// Browser capture bridge (src/main/capture-bridge.js is optional; the app runs without it).
+const captureBridgeModulePath = path.join(__dirname, "capture-bridge.js");
+const pendingCaptureTtlMs = 60 * 60 * 1000;
+const pendingCaptures = new Map();
+let captureBridge = null;
+let captureBridgeError = "";
+let captureBridgeTransition = Promise.resolve();
 
 for (const dir of Object.values(runtimePaths)) {
   fs.mkdirSync(dir, { recursive: true });
@@ -77,7 +107,17 @@ for (const [name, dir] of Object.entries(runtimePaths)) {
   }
 }
 
-loadDownloadQueue();
+// Must run after app.setPath("userData") because the lock lives in the user data dir.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => focusMainWindow());
+  const legacy = migrateLegacyQueue();
+  settings = loadSettings(legacy);
+  applySettingsToQueue();
+  loadDownloadQueue();
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -87,7 +127,7 @@ function createWindow() {
     minHeight: 720,
     frame: false,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
-    icon: appIconPath,
+    icon: loadAppIcon(),
     backgroundColor: "#f0eee9",
     show: false,
     webPreferences: {
@@ -102,26 +142,78 @@ function createWindow() {
   mainWindow.once("ready-to-show", () => mainWindow.show());
 }
 
+function loadAppIcon() {
+  try {
+    const image = nativeImage.createFromPath(appIconPath);
+    return image.isEmpty() ? undefined : image;
+  } catch {
+    return undefined;
+  }
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady()) createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  // Windows refuses focus() from a background app; a brief always-on-top bounce brings it forward.
+  mainWindow.setAlwaysOnTop(true);
+  mainWindow.focus();
+  mainWindow.setAlwaysOnTop(false);
+}
+
+function sendToRenderer(channel, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const contents = mainWindow.webContents;
+  if (contents.isLoading()) {
+    contents.once("did-finish-load", () => {
+      if (!contents.isDestroyed()) contents.send(channel, payload);
+    });
+  } else {
+    contents.send(channel, payload);
+  }
+  return true;
+}
+
+function logMain(level, message) {
+  const line = `[${new Date().toISOString()}] [${level}] ${message}`;
+  if (!app.isPackaged) console.log(line);
+  try {
+    fs.appendFileSync(mainLogPath, `${line}\n`, "utf8");
+  } catch {
+    // Logging must never break the app.
+  }
+}
+
 if (process.platform === "win32") app.setAppUserModelId("app.visubly.studio");
 
-app.whenReady().then(() => {
-  createWindow();
+if (gotSingleInstanceLock) {
+  app.whenReady().then(() => {
+    createWindow();
+    startCaptureBridge();
+    setTimeout(cleanupStaleEngineTemp, 15000);
 
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
   });
-});
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", () => {
+  appQuitting = true;
   stopAirplayPowerBlocker("App is quitting.");
+  stopCaptureBridge();
   if (downloadStateFlushTimer) {
     clearTimeout(downloadStateFlushTimer);
     downloadStateFlushTimer = null;
   }
+  if (!gotSingleInstanceLock) return;
   for (const [itemId, child] of downloadQueue.processes.entries()) {
     const item = getDownloadItem(itemId);
     if (item && item.status !== "done") {
@@ -134,6 +226,54 @@ app.on("before-quit", () => {
   downloadQueue.activeIds.clear();
   downloadQueue.processes.clear();
   persistDownloadQueue();
+});
+
+// --- Settings & app info API ---
+ipcMain.handle("settings:get", () => ({ ...settings }));
+
+ipcMain.handle("settings:update", async (_event, partial = {}) => updateSettings(partial));
+
+ipcMain.handle("settings:selectDownloadDir", async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "Choose download folder",
+    defaultPath: settings.downloadDir || undefined,
+    properties: ["openDirectory", "createDirectory"]
+  });
+  if (result.canceled || !result.filePaths.length) return { canceled: true, settings: { ...settings } };
+  const next = await updateSettings({ downloadDir: result.filePaths[0] });
+  return { canceled: false, settings: next };
+});
+
+ipcMain.handle("app:getInfo", () => appInfo());
+
+// --- Browser capture API ---
+ipcMain.handle("capture:confirm", async (_event, payload = {}) => confirmCapture(payload));
+
+ipcMain.handle("capture:dismiss", (_event, captureId) => {
+  const removed = pendingCaptures.delete(String(captureId || ""));
+  return { ok: true, removed };
+});
+
+ipcMain.handle("capture:createPairingCode", async () => {
+  if (!captureBridge) return { ok: false, error: captureBridgeUnavailableMessage() };
+  try {
+    const pairing = await captureBridge.createPairingCode();
+    return { ok: true, ...pairing };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
+
+ipcMain.handle("capture:info", () => captureBridgeInfo());
+
+ipcMain.handle("capture:revokeAll", async () => {
+  if (!captureBridge) return { ok: false, error: captureBridgeUnavailableMessage() };
+  try {
+    await captureBridge.revokeAll();
+    return { ok: true, info: captureBridgeInfo() };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
 });
 
 ipcMain.handle("window:minimize", (event) => {
@@ -566,10 +706,8 @@ ipcMain.handle("download:enqueue", async (_event, items = []) => {
   return { ok: true, items: added, state: downloadSnapshot() };
 });
 
-ipcMain.handle("download:start", async (_event, options = {}) => {
-  if (Number.isFinite(Number(options.parallelItems))) {
-    downloadQueue.parallelItems = normalizeDownloadParallel(options.parallelItems);
-  }
+// options.parallelItems is accepted for compatibility but ignored: settings.maxParallelDownloads is authoritative.
+ipcMain.handle("download:start", async (_event, _options = {}) => {
   pumpDownloadQueue();
   persistAndBroadcastDownloadState({ immediate: true });
   return { ok: true, state: downloadSnapshot() };
@@ -644,6 +782,9 @@ async function prepareDownloadItem(payload) {
   const source = String(payload.source || payload.curl || payload.url || "").trim();
   if (!source && !payload.itemFile) throw new Error("Paste a URL or full curl command first.");
 
+  const name = String(payload.name || "").trim();
+  // Always give the runner an explicit output so its built-in default folder is never used.
+  const output = resolveDownloadOutput({ name, source, output: payload.output, unique: !payload.overwrite });
   const args = [
     "prepare",
     "--source-stdin",
@@ -652,16 +793,19 @@ async function prepareDownloadItem(payload) {
     "--target-quality",
     qualityToResolution(payload.quality || payload.targetQuality || "1080"),
     "--workers",
-    String(Math.max(1, Number(payload.workers || downloadQueue.localWorkers || 8)))
+    String(clampInt(payload.workers, 1, 32, downloadQueue.localWorkers || 8)),
+    "-o",
+    output
   ];
-  if (payload.name) args.push("-n", String(payload.name));
-  if (payload.output) args.push("-o", String(payload.output));
+  if (name) args.push("-n", name);
   if (payload.referer) args.push("--referer", String(payload.referer));
   if (payload.userAgent !== undefined) args.push("--user-agent", String(payload.userAgent || ""));
+  for (const header of normalizeHeaderLines(payload.headers)) args.push("--header", header);
   if (payload.selectedUrl) args.push("--selected-url", String(payload.selectedUrl));
   if (payload.selectedQuality) args.push("--selected-quality", String(payload.selectedQuality));
   if (payload.overwrite) args.push("--overwrite");
   if (payload.noPreflight) args.push("--no-preflight");
+  pushFfmpegArg(args);
 
   const result = await runRunnerJson(args, source);
   const preparedEvent = [...result.events].reverse().find((event) => event.event === "prepared");
@@ -670,7 +814,7 @@ async function prepareDownloadItem(payload) {
     throw new Error(errorEvent?.message || "Download parser did not return a prepared item.");
   }
   const item = normalizeDownloadItem(preparedEvent.item, {
-    name: String(payload.name || "").trim(),
+    name,
     sourceText: source,
     quality: payload.quality || qualityFromResolution(preparedEvent.item.selected_quality)
   });
@@ -684,19 +828,29 @@ async function prepareDownloadItem(payload) {
 
 function runRunnerJson(args, stdinText = "") {
   return new Promise((resolve, reject) => {
-    if (!fs.existsSync(runnerScript)) {
-      reject(new Error(`Download runner not found: ${runnerScript}`));
+    let child;
+    try {
+      child = spawnEngine(args, ["pipe", "pipe", "pipe"]);
+    } catch (error) {
+      reject(error);
       return;
     }
 
-    const child = spawn(resolvePython(), [runnerScript, ...args], {
-      cwd: extractingVideoDir,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
     const events = [];
     let stdoutBuffer = "";
     let stderrBuffer = "";
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(child);
+      finish(new Error(`Download runner timed out after ${Math.round(runnerTimeoutMs / 1000)}s.`));
+    }, runnerTimeoutMs);
 
     child.stdout.on("data", (chunk) => {
       stdoutBuffer = parseJsonLines(stdoutBuffer + chunk.toString(), (event) => events.push(event));
@@ -704,38 +858,50 @@ function runRunnerJson(args, stdinText = "") {
     child.stderr.on("data", (chunk) => {
       stderrBuffer += chunk.toString();
     });
-    child.on("error", reject);
+    child.stdin.on("error", () => {
+      // The runner may exit before reading stdin; the close handler reports the real error.
+    });
+    child.on("error", (error) => finish(error));
     child.on("close", (code) => {
       parseJsonLines(stdoutBuffer + "\n", (event) => events.push(event));
       if (code === 0) {
-        resolve({ events });
+        finish(null, { events });
         return;
       }
       const errorEvent = [...events].reverse().find((event) => event.event === "error");
-      reject(new Error(errorEvent?.message || stderrBuffer.trim() || `Download runner exited with code ${code}.`));
+      finish(new Error(errorEvent?.message || stderrBuffer.trim() || `Download runner exited with code ${code}.`));
     });
     child.stdin.end(stdinText || "");
   });
 }
 
 function startDownloadProcess(item) {
-  if (!fs.existsSync(runnerScript)) {
+  let child;
+  let outputExistedAtStart = false;
+  const itemPath = path.join(runtimePaths.temp, `download-${item.id}-${Date.now()}.json`);
+  const eventLogPath = path.join(runtimePaths.logs, `download-${safeFilePart(item.name)}-${item.id}.jsonl`);
+  try {
+    // Re-check the target right before starting: another item or an older file may now own the name.
+    const desired = item.output || "";
+    item.output = resolveDownloadOutput({ name: item.name, output: desired, unique: !item.overwrite }, item.id);
+    if (desired && path.resolve(desired) !== path.resolve(item.output)) {
+      appendDownloadLog(item, `Output already exists; saving as ${item.output}`);
+    }
+    outputExistedAtStart = fs.existsSync(item.output);
+    item.outputClaimed = !outputExistedAtStart;
+    fs.writeFileSync(itemPath, JSON.stringify(itemToRunnerJson(item), null, 2), "utf8");
+    const args = ["download", "--item-file", itemPath, "--event-log-file", eventLogPath, "-o", item.output];
+    pushFfmpegArg(args);
+    child = spawnEngine(args, ["ignore", "pipe", "pipe"]);
+  } catch (error) {
     item.status = "failed";
-    item.error = `Download runner not found: ${runnerScript}`;
+    item.phase = "failed";
+    item.error = error.message;
+    item.outputClaimed = false;
     appendDownloadLog(item, item.error);
     persistAndBroadcastDownloadState();
     return;
   }
-
-  const itemPath = path.join(runtimePaths.temp, `download-${item.id}.json`);
-  const eventLogPath = path.join(runtimePaths.logs, `download-${safeFilePart(item.name)}-${item.id}.jsonl`);
-  fs.writeFileSync(itemPath, JSON.stringify(itemToRunnerJson(item), null, 2), "utf8");
-
-  const child = spawn(resolvePython(), [runnerScript, "download", "--item-file", itemPath, "--event-log-file", eventLogPath], {
-    cwd: extractingVideoDir,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
 
   item.status = "active";
   item.phase = "starting";
@@ -761,40 +927,99 @@ function startDownloadProcess(item) {
       persistAndBroadcastDownloadState({ deferred: true });
     }
   });
-  child.on("error", (error) => {
-    item.status = "failed";
-    item.phase = "failed";
-    item.error = error.message;
-    appendDownloadLog(item, error.message);
-    persistAndBroadcastDownloadState();
-  });
-  child.on("close", (code) => {
-    parseJsonLines(stdoutBuffer + "\n", (event) => applyRunnerEvent(item.id, event));
+  const runOutput = item.output;
+  let finished = false;
+  const finish = (code, spawnError) => {
+    if (finished) return;
+    finished = true;
+    fs.promises.rm(itemPath, { force: true }).catch(() => {});
+    if (appQuitting) return; // before-quit already re-queued and persisted this item.
+    const currentChild = downloadQueue.processes.get(item.id);
+    if (currentChild && currentChild !== child) {
+      // A newer run (cancel then quick retry) owns this item now; only tidy up our own partial file.
+      if (!outputExistedAtStart && path.resolve(runOutput) !== path.resolve(item.output || "")) removeFileWithRetry(runOutput);
+      return;
+    }
+    if (spawnError) item.error = spawnError.message;
+    else parseJsonLines(stdoutBuffer + "\n", (event) => applyRunnerEvent(item.id, event));
     const itemStillTracked = downloadQueue.items.some((entry) => entry.id === item.id);
     downloadQueue.activeIds.delete(item.id);
     downloadQueue.processes.delete(item.id);
     delete item.pid;
-    if (!itemStillTracked) return;
+    if (!itemStillTracked) {
+      removePartialOutput(item);
+      pumpDownloadQueue();
+      return;
+    }
     if (item.status === "canceled" || item.cancelRequested) {
       item.status = "canceled";
       item.phase = "canceled";
       appendDownloadLog(item, "Runner stopped after cancel.");
-    } else if (code === 0) {
+      removePartialOutput(item);
+    } else if (code === 0 && !spawnError) {
       item.status = "done";
       item.phase = "done";
       item.progress = 100;
+      item.outputClaimed = false;
       appendDownloadLog(item, "Download completed.");
+      notifyDownloadFinished(item, true);
       removeDownloadItem(item.id);
     } else {
       item.status = "failed";
       item.phase = "failed";
       item.error = item.error || `Runner exited with code ${code}.`;
       appendDownloadLog(item, item.error);
+      removePartialOutput(item);
+      notifyDownloadFinished(item, false);
     }
     item.updatedAt = new Date().toISOString();
     persistAndBroadcastDownloadState();
     pumpDownloadQueue();
+  };
+  child.on("error", (error) => finish(null, error));
+  child.on("close", (code) => finish(code, null));
+}
+
+// Deletes an unfinished output file, but only when this app created it (outputClaimed).
+function removePartialOutput(item) {
+  if (!item?.outputClaimed || !item.output) return;
+  item.outputClaimed = false;
+  removeFileWithRetry(item.output);
+}
+
+function removeFileWithRetry(target, attempt = 0) {
+  if (!target) return;
+  fs.promises.rm(target, { force: true }).catch((error) => {
+    // ffmpeg may still hold the file for a moment after taskkill.
+    if (attempt < 3) setTimeout(() => removeFileWithRetry(target, attempt + 1), 1500);
+    else logMain("warn", `Could not remove partial output ${target}: ${error.message}`);
   });
+}
+
+function notifyDownloadFinished(item, ok) {
+  if (!settings.notifyOnComplete) return;
+  try {
+    if (!Notification.isSupported()) return;
+    const notification = new Notification({
+      title: ok ? "Download complete" : "Download failed",
+      body: ok ? item.name : `${item.name}: ${item.error || "Unknown error"}`.slice(0, 240),
+      icon: fs.existsSync(notificationIconPath) ? notificationIconPath : undefined
+    });
+    const output = item.output;
+    activeNotifications.add(notification);
+    const release = () => activeNotifications.delete(notification);
+    notification.on("click", () => {
+      release();
+      focusMainWindow();
+      if (ok && output && fs.existsSync(output)) shell.showItemInFolder(output);
+    });
+    notification.on("close", release);
+    notification.on("failed", release);
+    notification.show();
+    setTimeout(release, 5 * 60 * 1000);
+  } catch (error) {
+    logMain("warn", `Notification failed: ${error.message}`);
+  }
 }
 
 function pumpDownloadQueue() {
@@ -881,6 +1106,7 @@ function normalizeDownloadItem(raw = {}, overrides = {}) {
     host: hostFromUrl(url || selectedUrl),
     workers: Math.max(1, Number(raw.workers || overrides.workers || downloadQueue.localWorkers || 8)),
     overwrite: Boolean(raw.overwrite || overrides.overwrite),
+    outputClaimed: Boolean(raw.outputClaimed),
     status: String(raw.status || overrides.status || "queued"),
     phase: String(raw.phase || overrides.phase || "queued"),
     progress: Number(raw.progress || 0),
@@ -932,9 +1158,13 @@ function isNoisyDownloadEvent(event = {}) {
 }
 
 function normalizeDownloadParallel(value) {
-  const next = Number(value);
-  if (!Number.isFinite(next)) return maxParallelDownloadProcesses;
-  return Math.max(1, Math.min(maxParallelDownloadProcesses, next));
+  return clampInt(value, 1, maxParallelDownloadProcesses, defaultSettings.maxParallelDownloads);
+}
+
+function clampInt(value, min, max, fallback) {
+  const next = Math.round(Number(value));
+  if (value === null || value === undefined || value === "" || !Number.isFinite(next)) return fallback;
+  return Math.max(min, Math.min(max, next));
 }
 
 function appendDownloadLog(item, message) {
@@ -967,7 +1197,8 @@ function downloadSnapshot() {
     }),
     parallelItems: downloadQueue.parallelItems,
     localWorkers: downloadQueue.localWorkers,
-    runnerPath: runnerScript
+    runnerPath: app.isPackaged ? bundledEnginePath : runnerScript,
+    downloadDir: settings.downloadDir
   };
 }
 
@@ -1001,9 +1232,8 @@ function persistDownloadQueue() {
 function loadDownloadQueue() {
   try {
     if (!fs.existsSync(downloadStatePath)) return;
+    // Parallelism and workers now come from settings.json; only items are restored here.
     const data = JSON.parse(fs.readFileSync(downloadStatePath, "utf8"));
-    downloadQueue.parallelItems = normalizeDownloadParallel(data.parallelItems || downloadQueue.parallelItems);
-    downloadQueue.localWorkers = Math.max(1, Number(data.localWorkers || downloadQueue.localWorkers));
     downloadQueue.items = Array.isArray(data.items)
       ? data.items.map((item) => {
           const normalized = normalizeDownloadItem(item);
@@ -1013,10 +1243,13 @@ function loadDownloadQueue() {
             normalized.progress = 0;
             appendDownloadLog(normalized, "Recovered from previous app session.");
           }
+          // An interrupted run leaves a partial file that this app created; drop it so the retry reuses the name.
+          if (normalized.status !== "done") removePartialOutput(normalized);
           return normalized;
         }).filter((item) => item.status !== "done")
       : [];
-  } catch {
+  } catch (error) {
+    logMain("warn", `Could not load download queue: ${error.message}`);
     downloadQueue.items = [];
   }
 }
@@ -1061,9 +1294,551 @@ function parseJsonLines(text, onEvent) {
   return rest;
 }
 
+// --- Downloader engine ---
+function resolveEngine() {
+  if (resolvedEngine?.ok) return resolvedEngine;
+  if (app.isPackaged) {
+    const ok = fs.existsSync(bundledEnginePath);
+    resolvedEngine = {
+      kind: "bundled",
+      path: bundledEnginePath,
+      command: bundledEnginePath,
+      args: [],
+      cwd: path.dirname(bundledEnginePath),
+      ok,
+      error: ok ? "" : `Downloader engine not found: ${bundledEnginePath}`
+    };
+    return resolvedEngine;
+  }
+
+  // Dev: python + hls2mp4_runner.py from engine/downloader (or VISUBLY_EXTRACTING_VIDEO_DIR).
+  const python = resolvePython();
+  const scriptOk = fs.existsSync(runnerScript);
+  resolvedEngine = {
+    kind: "python",
+    path: runnerScript,
+    command: python.command,
+    args: [...python.args, runnerScript],
+    cwd: devEngineDir,
+    python: [python.command, ...python.args].join(" "),
+    ok: scriptOk && python.ok,
+    error: !scriptOk
+      ? `Download runner not found: ${runnerScript}`
+      : python.ok
+        ? ""
+        : "Python 3.10+ was not found. Install Python or set VISUBLY_PYTHON."
+  };
+  return resolvedEngine;
+}
+
 function resolvePython() {
-  if (process.env.VISUBLY_PYTHON) return process.env.VISUBLY_PYTHON;
-  return fs.existsSync(defaultPythonPath) ? defaultPythonPath : "python";
+  if (process.env.VISUBLY_PYTHON) return { command: process.env.VISUBLY_PYTHON, args: [], ok: true };
+  const candidates =
+    process.platform === "win32"
+      ? [["py", ["-3"]], ["python", []], [legacyPythonPath, []]]
+      : [["python3", []], ["python", []]];
+  for (const [command, args] of candidates) {
+    if (probePython(command, args)) return { command, args, ok: true };
+  }
+  return { command: process.platform === "win32" ? "python" : "python3", args: [], ok: false };
+}
+
+function probePython(command, args) {
+  try {
+    const result = spawnSync(command, [...args, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], {
+      windowsHide: true,
+      timeout: 10000,
+      encoding: "utf8"
+    });
+    if (result.status !== 0) return false;
+    const [major, minor] = String(result.stdout || "").trim().split(".").map(Number);
+    return major === 3 && minor >= 10;
+  } catch {
+    return false;
+  }
+}
+
+function spawnEngine(args, stdio) {
+  const engine = resolveEngine();
+  if (!engine.ok) throw new Error(engine.error || "Downloader engine is not available.");
+  fs.mkdirSync(engineTempDir, { recursive: true });
+  return spawn(engine.command, [...engine.args, ...args], {
+    cwd: engine.cwd,
+    windowsHide: true,
+    stdio,
+    env: {
+      ...process.env,
+      PYTHONUTF8: "1",
+      PYTHONIOENCODING: "utf-8",
+      // Keeps PyInstaller's _MEI extraction dirs in our own temp folder so stale ones can be cleaned safely.
+      TEMP: engineTempDir,
+      TMP: engineTempDir
+    }
+  });
+}
+
+function resolveFfmpegPath() {
+  try {
+    let binary = require("@ffmpeg-installer/ffmpeg").path;
+    if (binary.includes("app.asar") && !binary.includes("app.asar.unpacked")) {
+      binary = binary.replace("app.asar", "app.asar.unpacked");
+    }
+    return binary;
+  } catch {
+    return "";
+  }
+}
+
+function pushFfmpegArg(args) {
+  if (ffmpegPath && fs.existsSync(ffmpegPath)) args.push("--ffmpeg", ffmpegPath);
+}
+
+async function cleanupStaleEngineTemp() {
+  const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+  let entries = [];
+  try {
+    entries = await fs.promises.readdir(engineTempDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith("_MEI")) continue;
+    const fullPath = path.join(engineTempDir, entry.name);
+    try {
+      const stat = await fs.promises.stat(fullPath);
+      if (stat.mtimeMs < cutoff) await fs.promises.rm(fullPath, { recursive: true, force: true });
+    } catch {
+      // In use or already gone.
+    }
+  }
+}
+
+// --- Output paths ---
+function ensureDownloadDir() {
+  const dir = settings.downloadDir || defaultDownloadDir({});
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (error) {
+    throw new Error(`Download folder is not available: ${dir} (${error.message})`);
+  }
+  return dir;
+}
+
+function resolveDownloadOutput({ name = "", source = "", output = "", unique = true } = {}, excludeItemId = "") {
+  let target = String(output || "").trim();
+  if (!target || !path.isAbsolute(target)) {
+    target = path.join(ensureDownloadDir(), `${safeOutputStem(name || nameFromSource(source))}.mp4`);
+  } else if (!path.extname(target)) {
+    target += ".mp4";
+  }
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+  } catch (error) {
+    throw new Error(`Download folder is not available: ${path.dirname(target)} (${error.message})`);
+  }
+  return unique ? uniqueOutputPath(target, excludeItemId) : target;
+}
+
+function uniqueOutputPath(target, excludeItemId = "") {
+  const dir = path.dirname(target);
+  const ext = path.extname(target) || ".mp4";
+  const stem = path.basename(target, ext);
+  const key = (value) => path.resolve(value).toLowerCase();
+  const reserved = new Set(
+    downloadQueue.items
+      .filter((item) => item.id !== excludeItemId && item.output && item.status !== "done")
+      .map((item) => key(item.output))
+  );
+  for (let index = 0; index < 10000; index += 1) {
+    const candidate = path.join(dir, index ? `${stem} (${index})${ext}` : `${stem}${ext}`);
+    if (!reserved.has(key(candidate)) && !fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(dir, `${stem} ${Date.now()}${ext}`);
+}
+
+function safeOutputStem(value) {
+  let stem = String(value || "")
+    .normalize("NFC")
+    .replace(/\.(mp4|m4v|mkv|mov|webm|ts)$/i, "")
+    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/_+/g, "_")
+    .replace(/^[ ._]+|[ ._]+$/g, "");
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem)) stem = `${stem}_video`;
+  return stem.slice(0, 100).replace(/[ .]+$/, "") || "video";
+}
+
+function nameFromSource(source) {
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(
+    now.getMinutes()
+  )}${pad(now.getSeconds())}`;
+  const match = String(source || "").match(/https?:\/\/[^\s'"\\]+/i);
+  if (!match) return `video_${stamp}`;
+  try {
+    const url = new URL(match[0]);
+    const last = decodeURIComponent(url.pathname.split("/").filter(Boolean).pop() || "");
+    let stem = last.replace(/\.[^.]+$/, "");
+    if (!stem || /^(index|master|playlist|manifest|chunklist.*|prog_index|main|video|media|stream|output)$/i.test(stem)) {
+      stem = url.hostname.replace(/^www\./, "");
+    }
+    return `${stem}_${stamp}`;
+  } catch {
+    return `video_${stamp}`;
+  }
+}
+
+function normalizeHeaderLines(headers) {
+  if (!Array.isArray(headers)) return [];
+  return headers
+    .map((header) => String(header || "").replace(/[\r\n]+/g, " ").trim())
+    .filter((header) => /^[A-Za-z0-9-]+\s*:/.test(header));
+}
+
+// --- Settings ---
+function migrateLegacyQueue() {
+  const result = { legacyFound: false, migrated: false };
+  if (!legacyQueuePath || !fs.existsSync(legacyQueuePath)) return result;
+  result.legacyFound = true;
+  if (path.resolve(legacyQueuePath).toLowerCase() === path.resolve(downloadStatePath).toLowerCase()) return result;
+  if (fs.existsSync(downloadStatePath)) return result;
+  try {
+    fs.copyFileSync(legacyQueuePath, downloadStatePath, fs.constants.COPYFILE_EXCL);
+    result.migrated = true;
+    logMain("info", `Copied legacy download queue from ${legacyQueuePath}`);
+  } catch (error) {
+    logMain("warn", `Legacy queue migration failed: ${error.message}`);
+  }
+  return result;
+}
+
+function defaultDownloadDir(legacy = {}) {
+  // Keep this PC's existing behavior (downloads on E:\) when upgrading from the dev build.
+  if ((legacy.legacyFound || legacy.migrated) && process.platform === "win32" && fs.existsSync("E:\\")) return "E:\\";
+  let videos;
+  try {
+    videos = app.getPath("videos");
+  } catch {
+    videos = path.join(os.homedir(), "Videos");
+  }
+  return path.join(videos, "ViSUBLY");
+}
+
+function sanitizeSettings(input = {}, base = defaultSettings) {
+  const next = { ...defaultSettings, ...base };
+  const dir = typeof input.downloadDir === "string" ? input.downloadDir.trim() : "";
+  if (dir && path.isAbsolute(dir)) next.downloadDir = path.normalize(dir);
+  next.maxParallelDownloads = clampInt(input.maxParallelDownloads, 1, maxParallelDownloadProcesses, next.maxParallelDownloads);
+  next.segmentWorkers = clampInt(input.segmentWorkers, 1, 32, next.segmentWorkers);
+  if (typeof input.notifyOnComplete === "boolean") next.notifyOnComplete = input.notifyOnComplete;
+  if (typeof input.captureBridgeEnabled === "boolean") next.captureBridgeEnabled = input.captureBridgeEnabled;
+  next.captureBridgePort = clampInt(input.captureBridgePort, 1024, 65535, next.captureBridgePort);
+  return next;
+}
+
+function loadSettings(legacy) {
+  let stored = null;
+  try {
+    if (fs.existsSync(settingsPath)) stored = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  } catch (error) {
+    logMain("warn", `settings.json is unreadable; using defaults: ${error.message}`);
+    try {
+      fs.copyFileSync(settingsPath, `${settingsPath}.bak`);
+    } catch {
+      // Best effort.
+    }
+  }
+  const next = sanitizeSettings(stored && typeof stored === "object" ? stored : {}, defaultSettings);
+  if (!next.downloadDir) next.downloadDir = defaultDownloadDir(legacy);
+  if (!stored || JSON.stringify(stored) !== JSON.stringify(next)) writeSettingsFile(next);
+  return next;
+}
+
+function writeSettingsFile(value) {
+  try {
+    const tempPath = `${settingsPath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(value, null, 2), "utf8");
+    fs.renameSync(tempPath, settingsPath);
+  } catch (error) {
+    logMain("error", `Could not save settings: ${error.message}`);
+  }
+}
+
+function applySettingsToQueue() {
+  downloadQueue.parallelItems = normalizeDownloadParallel(settings.maxParallelDownloads);
+  downloadQueue.localWorkers = settings.segmentWorkers;
+}
+
+async function updateSettings(partial = {}) {
+  const previous = settings;
+  const changes = partial && typeof partial === "object" ? partial : {};
+  const next = sanitizeSettings({ ...previous, ...changes }, previous);
+  if (next.downloadDir !== previous.downloadDir) {
+    try {
+      fs.mkdirSync(next.downloadDir, { recursive: true });
+    } catch (error) {
+      throw new Error(`Cannot use download folder ${next.downloadDir}: ${error.message}`);
+    }
+  }
+  settings = next;
+  writeSettingsFile(next);
+  applySettingsToQueue();
+  if (next.maxParallelDownloads > previous.maxParallelDownloads && downloadQueue.activeIds.size) pumpDownloadQueue();
+  if (
+    next.captureBridgeEnabled !== previous.captureBridgeEnabled ||
+    next.captureBridgePort !== previous.captureBridgePort
+  ) {
+    await restartCaptureBridge();
+  }
+  sendToRenderer("settings:changed", { ...settings });
+  broadcastDownloadState();
+  return { ...settings };
+}
+
+function appInfo() {
+  const engine = resolveEngine();
+  return {
+    version: app.getVersion(),
+    dataDir: runtimeRoot,
+    downloadDir: settings.downloadDir,
+    engine: {
+      kind: engine.kind,
+      path: engine.path,
+      ok: engine.ok,
+      ...(engine.python ? { python: engine.python } : {}),
+      ...(engine.error ? { error: engine.error } : {})
+    },
+    ffmpeg: { path: ffmpegPath, ok: Boolean(ffmpegPath) && fs.existsSync(ffmpegPath) },
+    captureBridge: captureBridgeInfo()
+  };
+}
+
+// --- Browser capture bridge ---
+function loadCaptureBridgeFactory() {
+  if (!fs.existsSync(captureBridgeModulePath)) {
+    captureBridgeError = "Capture bridge module is not installed.";
+    return null;
+  }
+  try {
+    const { createCaptureBridge } = require("./capture-bridge");
+    if (typeof createCaptureBridge !== "function") throw new Error("createCaptureBridge export is missing.");
+    return createCaptureBridge;
+  } catch (error) {
+    captureBridgeError = `Capture bridge failed to load: ${error.message}`;
+    logMain("error", captureBridgeError);
+    return null;
+  }
+}
+
+function startCaptureBridge() {
+  captureBridgeTransition = captureBridgeTransition.then(async () => {
+    if (!settings.captureBridgeEnabled || captureBridge) return;
+    const createCaptureBridge = loadCaptureBridgeFactory();
+    if (!createCaptureBridge) return;
+    let bridge = null;
+    try {
+      bridge = createCaptureBridge({
+        port: settings.captureBridgePort,
+        dataDir: runtimePaths.userData,
+        onCapture: handleCapturedMedia,
+        logger: captureBridgeLogger
+      });
+      const started = await bridge.start();
+      captureBridge = bridge;
+      captureBridgeError = "";
+      logMain("info", `Capture bridge listening on port ${started?.port ?? settings.captureBridgePort}`);
+    } catch (error) {
+      captureBridgeError = `Capture bridge could not start: ${error.message}`;
+      logMain("error", captureBridgeError);
+      try {
+        await bridge?.stop();
+      } catch {
+        // Ignore cleanup errors.
+      }
+    }
+  });
+  return captureBridgeTransition;
+}
+
+function stopCaptureBridge() {
+  captureBridgeTransition = captureBridgeTransition.then(async () => {
+    const bridge = captureBridge;
+    captureBridge = null;
+    if (!bridge) return;
+    try {
+      await bridge.stop();
+    } catch (error) {
+      logMain("warn", `Capture bridge stop failed: ${error.message}`);
+    }
+  });
+  return captureBridgeTransition;
+}
+
+async function restartCaptureBridge() {
+  await stopCaptureBridge();
+  if (!settings.captureBridgeEnabled) captureBridgeError = "";
+  await startCaptureBridge();
+}
+
+const captureBridgeLogger = {
+  debug: (...args) => {
+    if (!app.isPackaged) console.debug("[capture-bridge]", ...args);
+  },
+  info: (...args) => logMain("info", `[capture-bridge] ${args.join(" ")}`),
+  warn: (...args) => logMain("warn", `[capture-bridge] ${args.join(" ")}`),
+  error: (...args) => logMain("error", `[capture-bridge] ${args.join(" ")}`),
+  log: (...args) => logMain("info", `[capture-bridge] ${args.join(" ")}`)
+};
+
+function captureBridgeUnavailableMessage() {
+  if (!settings.captureBridgeEnabled) return "Browser capture is turned off in settings.";
+  return captureBridgeError || "Browser capture bridge is not running.";
+}
+
+function captureBridgeInfo() {
+  let info = { running: false, port: settings.captureBridgePort, pairedClients: 0 };
+  if (captureBridge) {
+    try {
+      info = { ...info, ...captureBridge.info() };
+    } catch (error) {
+      info.error = error.message;
+    }
+  }
+  return {
+    ...info,
+    enabled: settings.captureBridgeEnabled,
+    available: fs.existsSync(captureBridgeModulePath),
+    ...(captureBridgeError && !info.running ? { error: captureBridgeError } : {})
+  };
+}
+
+async function handleCapturedMedia(payload = {}) {
+  const url = String(payload.url || "").trim();
+  if (!/^https?:\/\//i.test(url)) return { ok: false, message: "Only http(s) media URLs can be captured." };
+  prunePendingCaptures();
+
+  const type = { hls: "m3u8", dash: "dash", mp4: "mp4" }[String(payload.type || "").toLowerCase()] || "m3u8";
+  const headers = payload.headers && typeof payload.headers === "object" ? payload.headers : {};
+  const pageUrl = String(payload.pageUrl || "");
+  const host = hostFromUrl(pageUrl) || hostFromUrl(url);
+  const title = String(payload.pageTitle || "").trim();
+  const name = safeOutputStem(title || host || "video");
+  const extraHeaders = [];
+  if (headers.origin) extraHeaders.push(`Origin: ${headers.origin}`);
+  if (headers.cookie) extraHeaders.push(`Cookie: ${headers.cookie}`);
+  const prepareArgs = {
+    source: url,
+    type,
+    name,
+    referer: headers.referer || pageUrl || undefined,
+    ...(headers.userAgent ? { userAgent: String(headers.userAgent) } : {}),
+    headers: extraHeaders,
+    noPreflight: true
+  };
+
+  const captureId = randomUUID();
+  const capture = {
+    captureId,
+    name,
+    host,
+    pageUrl,
+    type,
+    url,
+    detectedAt: payload.detectedAt || new Date().toISOString(),
+    receivedAt: Date.now(),
+    prepareArgs,
+    preparedItem: null,
+    variants: [],
+    error: ""
+  };
+  try {
+    capture.preparedItem = await prepareDownloadItem(prepareArgs);
+    capture.variants = capture.preparedItem.variants || [];
+  } catch (error) {
+    capture.error = error.message;
+    logMain("warn", `Capture prepare failed for ${host}: ${error.message}`);
+  }
+  pendingCaptures.set(captureId, capture);
+
+  focusMainWindow();
+  sendToRenderer("capture:incoming", {
+    captureId,
+    name,
+    host,
+    pageUrl,
+    type,
+    detectedAt: capture.detectedAt,
+    variants: capture.variants,
+    preparedItem: capture.preparedItem,
+    ...(capture.error ? { error: capture.error } : {})
+  });
+  return { ok: true };
+}
+
+async function confirmCapture(payload = {}) {
+  const captureId = String(payload.captureId || "");
+  const capture = pendingCaptures.get(captureId);
+  if (!capture) return { ok: false, error: "This capture has expired or was already handled." };
+
+  const name = safeOutputStem(String(payload.name || "").trim() || capture.name);
+  const quality = String(payload.quality || "").trim();
+  let prepared = capture.preparedItem;
+  try {
+    if (!prepared) {
+      // The first prepare failed (e.g. network hiccup); try once more with the user's choices.
+      prepared = await prepareDownloadItem({ ...capture.prepareArgs, name, ...(quality ? { quality } : {}) });
+    }
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
+  const variant = pickVariant(prepared.variants, quality);
+  const item = normalizeDownloadItem(
+    {
+      ...prepared,
+      id: randomUUID(),
+      name,
+      output: "",
+      status: "queued",
+      phase: "queued",
+      progress: 0,
+      workers: settings.segmentWorkers,
+      quality: (variant && qualityFromResolution(variant.resolution)) || quality || prepared.quality,
+      ...(variant ? { selectedUrl: variant.url, selectedQuality: variant.resolution || null } : {})
+    },
+    { name }
+  );
+  try {
+    item.output = resolveDownloadOutput({ name });
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  appendDownloadLog(item, `Captured from ${capture.pageUrl || capture.host}.`);
+  const added = addDownloadItem(item);
+  pendingCaptures.delete(captureId);
+  pumpDownloadQueue();
+  persistAndBroadcastDownloadState({ immediate: true });
+  return { ok: true, item: added, state: downloadSnapshot() };
+}
+
+function pickVariant(variants, quality) {
+  if (!Array.isArray(variants) || !variants.length || !quality) return null;
+  const wanted = String(quality).toLowerCase();
+  const wantedHeight = qualityFromResolution(qualityToResolution(wanted)) || wanted.replace(/p$/, "");
+  return (
+    variants.find((variant) => String(variant.resolution || "").toLowerCase() === wanted) ||
+    variants.find((variant) => String(variant.url || "") === quality) ||
+    variants.find((variant) => qualityFromResolution(variant.resolution) === wantedHeight) ||
+    null
+  );
+}
+
+function prunePendingCaptures() {
+  const cutoff = Date.now() - pendingCaptureTtlMs;
+  for (const [captureId, capture] of pendingCaptures) {
+    if (capture.receivedAt < cutoff) pendingCaptures.delete(captureId);
+  }
 }
 
 function qualityToResolution(quality) {

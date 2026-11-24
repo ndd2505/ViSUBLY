@@ -1,5 +1,28 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+// Returns an unsubscribe function, like the existing on* helpers.
+const subscribe = (channel) => (callback) => {
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+};
+
+const settingsApi = {
+  get: () => ipcRenderer.invoke("settings:get"),
+  update: (partial) => ipcRenderer.invoke("settings:update", partial),
+  selectDownloadDir: () => ipcRenderer.invoke("settings:selectDownloadDir"),
+  onChange: subscribe("settings:changed")
+};
+
+const captureApi = {
+  onIncoming: subscribe("capture:incoming"),
+  confirm: (payload) => ipcRenderer.invoke("capture:confirm", payload),
+  dismiss: (captureId) => ipcRenderer.invoke("capture:dismiss", captureId),
+  createPairingCode: () => ipcRenderer.invoke("capture:createPairingCode"),
+  info: () => ipcRenderer.invoke("capture:info"),
+  revokeAll: () => ipcRenderer.invoke("capture:revokeAll")
+};
+
 const downloadApi = {
   getState: () => ipcRenderer.invoke("download:getState"),
   prepareItem: (payload) => ipcRenderer.invoke("download:prepare", payload),
@@ -56,6 +79,11 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
     }
   },
   download: downloadApi,
+  settings: settingsApi,
+  app: {
+    getInfo: () => ipcRenderer.invoke("app:getInfo")
+  },
+  capture: captureApi,
   integrations: {
     startDownloadBatch: async (items) => {
       const queued = await downloadApi.enqueueItems(items);

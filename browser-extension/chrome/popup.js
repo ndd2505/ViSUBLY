@@ -71,7 +71,14 @@ function card(g) {
   } else {
     if (g.probing) li.append(el('p', 'probing', 'Đang đọc chất lượng…'));
     const btn = el('button', 'dl', 'Tải bằng ViSUBLY');
-    btn.disabled = !!sendingId;
+    // Wait for the quality list; the button only becomes the fallback once the
+    // app has answered without variants (single-quality stream, probe failed or
+    // app not reachable), at which point g.probing is false.
+    btn.disabled = !!sendingId || !!g.probing;
+    if (g.probing) {
+      btn.title = 'Đợi ViSUBLY đọc xong danh sách chất lượng';
+      btn.setAttribute('aria-busy', 'true');
+    }
     btn.addEventListener('click', () => sendGroup(g));
     li.append(btn);
   }

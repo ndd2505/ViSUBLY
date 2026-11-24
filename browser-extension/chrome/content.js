@@ -7,9 +7,26 @@
   let host = null, root = null, pill = null, toast = null;
   let target = null, hovering = false, toastTimer = 0, sending = false;
   let rescanTimer = 0, rafId = 0;
+  // Never touch the DOM while the page is still booting: frameworks such as
+  // Next.js/React hydrate <body> and crash ("Application error: a client-side
+  // exception") when they find a node they did not render. Wait for load + idle.
+  let pageReady = false;
+  function markReady() {
+    const go = () => { pageReady = true; scheduleUpdate(); };
+    setTimeout(() => {
+      if ('requestIdleCallback' in window) requestIdleCallback(go, { timeout: 3000 });
+      else go();
+    }, 1500);
+  }
+  if (document.readyState === 'complete') markReady();
+  else addEventListener('load', markReady, { once: true });
 
   function ensureUi() {
-    if (host) return;
+    if (host) {
+      // Some sites wipe foreign nodes; re-attach outside the app's <body> tree.
+      if (!host.isConnected) document.documentElement.appendChild(host);
+      return;
+    }
     host = document.createElement('div');
     host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;';
     root = host.attachShadow({ mode: 'closed' });
@@ -41,7 +58,8 @@
       showToast(r && r.ok ? '✓ ' + (r.message || 'Đã gửi tới ViSUBLY') : (r && r.error) || 'Gửi thất bại', !!(r && r.ok));
     });
     root.append(style, pill, toast);
-    (document.body || document.documentElement).appendChild(host);
+    // Sibling of <body> (not inside it), so it is never part of the page's React tree.
+    document.documentElement.appendChild(host);
   }
 
   function showToast(text, ok) {
@@ -81,6 +99,7 @@
   function update() {
     rafId = 0;
     if (!count) { if (host) { pill.style.display = 'none'; toast.style.display = 'none'; } return; }
+    if (!pageReady) return;
     target = findTarget();
     if (!target) { if (host) pill.style.display = 'none'; return; }
     ensureUi();

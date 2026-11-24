@@ -1,6 +1,6 @@
 "use strict";
 
-const localDownloadFallback = { items: [], parallelItems: 2, localWorkers: 8 };
+const localDownloadFallback = { items: [], parallelItems: 1, localWorkers: 8 };
 
 const desktop = window.visublyDesktop || {
   platform: navigator.platform.toLowerCase().includes("mac") ? "darwin" : "win32",
@@ -39,14 +39,14 @@ const desktop = window.visublyDesktop || {
       return { ok: true, items, state: localDownloadFallback };
     },
     startQueue: async () => {
-      localDownloadFallback.items.forEach((item) => {
-        if (item.status === "queued") {
-          item.status = "active";
-          item.phase = "ffmpeg_download";
-          item.progress = Math.max(item.progress || 0, 12);
-          item.logs = [...(item.logs || []), "Local preview started."];
-        }
-      });
+      const active = localDownloadFallback.items.some((item) => ["active", "preparing", "muxing"].includes(item.status));
+      const next = active ? null : localDownloadFallback.items.find((item) => item.status === "queued");
+      if (next) {
+        next.status = "active";
+        next.phase = "ffmpeg_download";
+        next.progress = Math.max(next.progress || 0, 12);
+        next.logs = [...(next.logs || []), "Local preview started."];
+      }
       return { ok: true, state: localDownloadFallback };
     },
     cancelItem: async (itemId) => {
@@ -67,9 +67,11 @@ const desktop = window.visublyDesktop || {
       return { ok: true, state: localDownloadFallback };
     },
     clearCompleted: async () => {
-      localDownloadFallback.items = localDownloadFallback.items.filter((item) => !["done", "failed", "canceled"].includes(item.status));
+      localDownloadFallback.items = localDownloadFallback.items.filter((item) => item.status !== "done");
       return { ok: true, state: localDownloadFallback };
     },
+    openOutput: async () => ({ ok: false, error: "Open output is available in the desktop app." }),
+    revealOutput: async () => ({ ok: false, error: "Reveal output is available in the desktop app." }),
     onEvent: () => () => {},
     onState: () => () => {}
   },
@@ -170,8 +172,9 @@ const state = {
     active: -1,
     preparing: false,
     prepareError: "",
+    actionError: "",
     terminalItemId: "",
-    parallelItems: 2
+    parallelItems: 1
   },
   subtitle: {
     videoPath: "D:\\Movies\\Inside_No9_S08E04.mkv",
@@ -208,10 +211,11 @@ const state = {
     lastVolume: 0.8,
     activeCueIndex: -1,
     subtitleOn: true,
+    folderContext: null,
     style: {
       fontSize: 19,
       bottom: 58,
-      background: true,
+      background: false,
       outline: true
     }
   },
@@ -225,7 +229,8 @@ const state = {
     error: "",
     scannedAt: "",
     skippedFolders: 0,
-    truncated: false
+    truncated: false,
+    pendingScrollPath: ""
   },
   remote: {
     qrUrl: null,
@@ -243,6 +248,7 @@ let downloadTimer = null;
 let processingTimer = null;
 let folderThumbTimer = null;
 let folderRenderTimer = null;
+let downloadRenderTimer = null;
 let playerControlsIdleTimer = null;
 let folderThumbActive = 0;
 let folderThumbQueue = [];
@@ -280,7 +286,7 @@ function icon(name) {
 }
 
 function logo() {
-  return `<div class="logo"><span class="logo-mark">Vi${starSvg("logo-star")}</span><span class="logo-word">subly</span></div>`;
+  return `<div class="logo"><img class="logo-icon" src="./assets/brand/visubly-app-logo-concept-v2.png" alt=""><span class="logo-word">ViSUBLY</span></div>`;
 }
 
 function starSvg(className = "") {
@@ -319,7 +325,8 @@ function titleForScreen() {
   }[state.screen] || "Visubly";
 }
 
-function render() {
+function render(options = {}) {
+  const scrollSnapshot = options.preserveScroll ? captureScrollSnapshot() : [];
   root.innerHTML = `
     <div class="shell">
       ${renderTitlebar()}
@@ -332,6 +339,43 @@ function render() {
     </div>
   `;
   attachDynamicHandlers();
+  if (scrollSnapshot.length) restoreScrollSnapshot(scrollSnapshot);
+}
+
+function captureScrollSnapshot() {
+  const selectors = [
+    ".main",
+    ".screen",
+    ".running-list",
+    ".queue-list",
+    ".download-terminal",
+    ".player-folder-list",
+    ".player-transcript",
+    ".folder-screen"
+  ];
+
+  return selectors
+    .map((selector) => {
+      const element = document.querySelector(selector);
+      if (!element) return null;
+      return {
+        selector,
+        left: element.scrollLeft,
+        top: element.scrollTop
+      };
+    })
+    .filter(Boolean);
+}
+
+function restoreScrollSnapshot(snapshot) {
+  window.requestAnimationFrame(() => {
+    snapshot.forEach(({ selector, left, top }) => {
+      const element = document.querySelector(selector);
+      if (!element) return;
+      element.scrollLeft = left;
+      element.scrollTop = top;
+    });
+  });
 }
 
 function renderRemoteModal() {
@@ -720,6 +764,10 @@ function renderWizardStep() {
 
 function renderDownloadRunning() {
   const selectedItem = selectedDownloadItem();
+  const busyStatuses = ["active", "preparing", "muxing"];
+  const activeCount = state.download.items.filter((item) => busyStatuses.includes(item.status)).length;
+  const queuedCount = state.download.items.filter((item) => item.status === "queued").length;
+  const doneCount = state.download.items.filter((item) => item.status === "done").length;
   return `
     <section class="screen">
       <div class="top-row">
@@ -728,16 +776,27 @@ function renderDownloadRunning() {
           <h1 class="h1">Downloading batch</h1>
         </div>
         <div style="display:flex;gap:8px">
+          ${doneCount ? btn("Clear done", "clear-finished-downloads", "", "x") : ""}
           ${btn("Edit batch", "edit-batch", "", "arrowL")}
           ${btn("Home", "go-home", "ghost", "home")}
         </div>
       </div>
+      <div class="download-status-strip">
+        <span>${activeCount} running</span>
+        <span>${queuedCount} queued</span>
+        <span>${doneCount} done</span>
+        <span>1 at a time</span>
+      </div>
+      ${state.download.actionError ? `<div class="note danger-note download-action-error">${escapeHtml(state.download.actionError)}</div>` : ""}
       <div class="download-workbench">
         <div class="running-list">
         ${state.download.items.map((item, index) => {
           const status = item.status;
           const progress = status === "done" ? 100 : Math.round(item.progress || 0);
           const rowClass = item.id === selectedItem?.id ? "selected" : "";
+          const isBusy = busyStatuses.includes(status);
+          const canRemove = !isBusy;
+          const itemAttrs = `data-id="${escapeAttr(item.id)}"`;
           return `
             <div class="running-row ${rowClass}" data-action="select-download-log" data-id="${escapeAttr(item.id)}">
               <div class="running-row-main">
@@ -747,10 +806,13 @@ function renderDownloadRunning() {
                   <div class="mono muted">${phaseLabel(item.phase)} · ${escapeHtml(progressMeta(item))}</div>
                   <div class="mono muted">${qualityLabel(item.quality)} · ${statusLabel(status)}</div>
                 </div>
-                <div style="display:flex;align-items:center;gap:8px">
-                  ${["active", "preparing", "muxing"].includes(status) ? btn("Cancel", "cancel-download", "danger", "x", `data-id="${escapeAttr(item.id)}"`) : ""}
-                  ${["failed", "canceled"].includes(status) ? btn("Retry", "retry-download", "primary", "download", `data-id="${escapeAttr(item.id)}"`) : ""}
+                <div class="download-row-actions">
+                  ${isBusy ? btn("Cancel", "cancel-download", "danger", "x", itemAttrs) : ""}
+                  ${["failed", "canceled"].includes(status) ? btn("Retry", "retry-download", "primary", "download", itemAttrs) : ""}
+                  ${status === "done" && item.output ? btn("Open", "open-download-output", "primary", "play", itemAttrs) : ""}
+                  ${status === "done" && item.output ? btn("Folder", "reveal-download-output", "", "folder", itemAttrs) : ""}
                   ${status === "done" ? `<span class="badge" style="background:var(--lime)">✓ ready</span>${btn("Subtitle this", "subtitle-downloaded", "violet", "sub", `data-index="${index}"`)}` : `<span class="badge" style="background:var(--paper)">${Math.round(progress)}%</span>`}
+                  ${canRemove ? btn("Remove", "remove-download", "ghost", "x", itemAttrs) : ""}
                 </div>
               </div>
               <div class="row-progress"><div style="width:${progress}%"></div></div>
@@ -1025,6 +1087,9 @@ function renderPlayerStudio() {
   state.player.fullscreen = fullscreenActive;
   const videoName = p.displayName || (p.videoPath ? pathBaseName(p.videoPath) : "No MP4 selected");
   const srtName = p.srtPath ? pathBaseName(p.srtPath) : "";
+  const folderVideoIndex = currentFolderVideoIndex();
+  const showFolderPanel = folderVideoIndex >= 0 && !p.theater && !fullscreenActive;
+  const showFolderRail = folderVideoIndex >= 0;
   const overlayClasses = [
     "subtitle-overlay",
     "visubly-subtitle",
@@ -1040,14 +1105,16 @@ function renderPlayerStudio() {
           <div class="eyebrow">03 · WATCH</div>
           <h1 class="h1">Player studio</h1>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;align-items:center">
+          ${folderVideoIndex >= 0 ? btn("Back to folder", "back-to-folder-context", "", "folder") : ""}
+          ${folderVideoIndex >= 0 ? `<span class="player-now-playing" title="${escapeAttr(videoName)}"><span>Playing</span><strong>${escapeHtml(videoName)}</strong></span>` : ""}
           ${btn("Choose MP4", "choose-video", "primary", "folder")}
           ${btn("Load SRT", "choose-srt", "", "captions")}
           ${btn("VI", "player-vi", state.playerMode === "vi" ? "lime" : "")}
           ${btn("EN", "player-en", state.playerMode === "en" ? "lime" : "")}
         </div>
       </div>
-      <div class="player-layout ${hasSubtitles ? "" : "no-transcript"} ${p.theater ? "theater" : ""}">
+      <div class="player-layout ${hasSubtitles && !showFolderPanel ? "" : "no-transcript"} ${showFolderPanel ? "has-folder-panel" : ""} ${p.theater ? "theater" : ""}">
         <div class="player-workbench" data-player-workbench>
           <div class="player-frame ${p.videoUrl ? "has-video" : ""}" data-player-drop>
             ${p.videoUrl ? `<video id="mainPlayerVideo" class="main-player-video" src="${escapeAttr(p.videoUrl)}" data-source-token="${p.sourceToken}" playsinline preload="metadata"></video>` : `
@@ -1057,11 +1124,9 @@ function renderPlayerStudio() {
                 <div class="muted">Drop an MP4 here to play, or drop SRT to load captions.</div>
               </div>
             `}
+            ${p.videoUrl ? `<div class="player-frame-title" title="${escapeAttr(videoName)}"><span>Playing</span><strong>${escapeHtml(videoName)}</strong></div>` : ""}
             ${hasSubtitles && p.subtitleOn ? `<div class="${overlayClasses} ${subtitleText ? "" : "is-empty"}" style="${overlayStyle}"><span class="main-subtitle-text">${escapeHtml(subtitleText)}</span></div>` : ""}
-            <div class="player-drop-hint">
-              <strong>Drop MP4 / SRT</strong>
-              <span>MP4 plays immediately. SRT updates captions.</span>
-            </div>
+            ${showFolderRail ? renderPlayerFolderRail(folderVideoIndex) : ""}
           </div>
 
           <div class="player-console">
@@ -1084,16 +1149,7 @@ function renderPlayerStudio() {
             </div>
           </div>
 
-          <div class="player-meta-grid ${hasSubtitles ? "" : "single"}">
-            <div class="queue-item">
-              <div class="mono muted">VIDEO</div>
-              <strong>${escapeHtml(videoName)}</strong>
-            </div>
-            ${hasSubtitles ? `<div class="queue-item">
-              <div class="mono muted">SUBTITLE</div>
-              <strong>${escapeHtml(srtName)}</strong>
-            </div>` : ""}
-          </div>
+          ${renderPlayerMediaSummary(videoName, srtName, hasSubtitles, showFolderPanel)}
 
           ${hasSubtitles ? `<div class="player-style-panel">
             <div>
@@ -1111,7 +1167,8 @@ function renderPlayerStudio() {
             </div>
           </div>` : ""}
         </div>
-        ${hasSubtitles ? `<aside class="player-transcript">
+        ${showFolderPanel ? renderPlayerFolderSidebar(folderVideoIndex) : ""}
+        ${hasSubtitles && !showFolderPanel ? `<aside class="player-transcript">
           <div class="mini-row" style="justify-content:space-between">
             <h3 class="h3">Transcript</h3>
             <span class="badge" style="background:var(--mint)">${cues.length} cues</span>
@@ -1127,6 +1184,107 @@ function renderPlayerStudio() {
         </aside>` : ""}
       </div>
     </section>
+  `;
+}
+
+function renderPlayerMediaSummary(videoName, srtName, hasSubtitles, compact = false) {
+  const classes = ["player-meta-grid", hasSubtitles ? "" : "single", compact ? "compact" : ""].filter(Boolean).join(" ");
+  return `
+    <div class="${classes}">
+      <div class="queue-item">
+        <div class="mono muted">VIDEO</div>
+        <strong title="${escapeAttr(videoName)}">${escapeHtml(videoName)}</strong>
+      </div>
+      ${hasSubtitles ? `<div class="queue-item">
+        <div class="mono muted">SUBTITLE</div>
+        <strong title="${escapeAttr(srtName)}">${escapeHtml(srtName)}</strong>
+      </div>` : ""}
+    </div>
+  `;
+}
+
+function renderPlayerFolderRail(activeIndex = currentFolderVideoIndex()) {
+  if (activeIndex < 0 || !state.folder.videos.length) return "";
+  const activeVideo = state.folder.videos[activeIndex];
+
+  return `
+    <aside class="player-folder-rail" data-player-folder-rail>
+      <div class="player-folder-tab" aria-hidden="true">
+        ${icon("folder")}
+        <span>${state.folder.videos.length}</span>
+      </div>
+      <div class="player-folder-panel">
+        <div class="player-folder-head">
+          <div>
+            <div class="mono muted">FOLDER PLAYLIST</div>
+            <strong>${escapeHtml(activeVideo?.groupName || "Other")}</strong>
+          </div>
+          ${btn("Back", "back-to-folder-context", "ghost", "arrowL")}
+        </div>
+        <div class="player-folder-list" data-player-folder-list>
+          ${renderPlayerFolderListItems(activeIndex)}
+        </div>
+      </div>
+    </aside>
+  `;
+}
+
+function renderPlayerFolderSidebar(activeIndex = currentFolderVideoIndex()) {
+  if (activeIndex < 0 || !state.folder.videos.length) return "";
+  const activeVideo = state.folder.videos[activeIndex];
+  return `
+    <aside class="player-folder-sidebar">
+      <div class="player-folder-head">
+        <div>
+          <div class="mono muted">FOLDER PLAYLIST</div>
+          <strong title="${escapeAttr(activeVideo?.groupName || "Other")}">${escapeHtml(activeVideo?.groupName || "Other")}</strong>
+        </div>
+        <span class="badge" style="background:var(--lime)">${state.folder.videos.length}</span>
+      </div>
+      <div class="player-folder-list" data-player-folder-list>
+        ${renderPlayerFolderListItems(activeIndex)}
+      </div>
+    </aside>
+  `;
+}
+
+function renderPlayerFolderListItems(activeIndex = currentFolderVideoIndex()) {
+  let currentFolder = null;
+  let currentGroup = null;
+  let html = "";
+
+  state.folder.videos.forEach((video, index) => {
+    const folderName = video.folderName || video.folder || "This folder";
+    const groupName = video.groupName || "Other";
+    if (folderName !== currentFolder) {
+      currentFolder = folderName;
+      currentGroup = null;
+      html += `<div class="player-folder-section">${escapeHtml(folderName)}</div>`;
+    }
+    if (groupName !== currentGroup) {
+      currentGroup = groupName;
+      html += `<div class="player-folder-group">${escapeHtml(groupName)}</div>`;
+    }
+
+    html += renderPlayerFolderItem(video, index, index === activeIndex);
+  });
+
+  return html;
+}
+
+function renderPlayerFolderItem(video, index, isActive) {
+  const title = video.name || pathBaseName(video.path);
+  const resolution = video.resolutionLabel || inferResolutionFromName(title) || "";
+  const subLabel = hasFolderVideoSubtitle(video) ? "sub" : "no sub";
+  const meta = [resolution, subLabel].filter(Boolean).join(" · ");
+  return `
+    <button class="player-folder-item ${isActive ? "active" : ""}" data-action="open-folder-video" data-video-index="${index}" data-player-folder-item="${index}" title="${escapeAttr(video.relativePath || title)}">
+      <span class="player-folder-play">${isActive ? icon("play") : index + 1}</span>
+      <span class="player-folder-text">
+        <strong>${escapeHtml(title)}</strong>
+        <span>${escapeHtml(meta)}</span>
+      </span>
+    </button>
   `;
 }
 
@@ -1146,26 +1304,24 @@ function renderFolderPlayer() {
   let groupedHtml = "";
   if (hasVideos && renderReady) {
     let currentFolder = null;
-    let currentPrefix = null;
+    let currentGroup = null;
     
     visibleVideos.forEach((video, index) => {
       let isNewFolder = video.folderName !== currentFolder;
-      let isNewPrefix = isNewFolder || video.prefixName !== currentPrefix;
+      let isNewGroup = isNewFolder || video.groupName !== currentGroup;
       
-      if (isNewFolder || isNewPrefix) {
+      if (isNewFolder || isNewGroup) {
         if (index > 0) groupedHtml += `</div>`;
         
         if (isNewFolder) {
           groupedHtml += `<h2 class="folder-group-title" style="margin: 24px 0 12px; font-size: 18px; border-bottom: var(--line); padding-bottom: 8px;">${escapeHtml(video.folderName)}</h2>`;
           currentFolder = video.folderName;
-          currentPrefix = null;
+          currentGroup = null;
         }
         
-        if (video.prefixName && (isNewFolder || video.prefixName !== currentPrefix)) {
-          groupedHtml += `<h3 class="folder-prefix-title" style="margin: 16px 0 12px; font-size: 14px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.5px;">${escapeHtml(video.prefixName)}</h3>`;
-          currentPrefix = video.prefixName;
-        } else if (!video.prefixName && isNewPrefix && currentPrefix !== null) {
-          currentPrefix = null;
+        if (video.groupName && (isNewFolder || video.groupName !== currentGroup)) {
+          groupedHtml += `<h3 class="folder-prefix-title" style="margin: 16px 0 12px; font-size: 14px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0;">${escapeHtml(video.groupName)}</h3>`;
+          currentGroup = video.groupName;
         }
         
         groupedHtml += `<div class="folder-grid">`;
@@ -1261,7 +1417,7 @@ function renderFolderVideoCard(video, selectedPath, index) {
   const subLabel = video.subtitlePath || video.subtitleName ? "Sub file" : isSubbed ? "-vs sub" : "No sub";
 
   return `
-    <button class="folder-video-card ${isActive ? "active" : ""}" data-action="open-folder-video" data-video-index="${index}" data-video-path="${escapeAttr(video.path)}" title="${escapeAttr(video.relativePath || title)}">
+    <button class="folder-video-card ${isActive ? "active" : ""}" data-action="open-folder-video" data-video-index="${index}" data-folder-video-index="${index}" data-video-path="${escapeAttr(video.path)}" title="${escapeAttr(video.relativePath || title)}">
       <div class="folder-thumb">
         <video class="folder-thumb-video" data-src="${escapeAttr(video.url || localPathToFileUrl(video.path))}" data-video-index="${index}" muted playsinline preload="none" data-folder-thumb></video>
         <span class="folder-play">${icon("play")}</span>
@@ -1326,7 +1482,7 @@ function renderIntro() {
       <div class="float-blob blob-d">cURL → mp4</div>
       <div class="intro-card">
         <div class="intro-logo">
-          <span class="intro-tile vi">Vi${starSvg("intro-star")}</span>
+          <img class="intro-brand-icon" src="./assets/brand/visubly-app-logo-concept-v2.png" alt="ViSUBLY logo">
           <span class="intro-tile">S</span>
           <span class="intro-tile">U</span>
           <span class="intro-tile">B</span>
@@ -1382,9 +1538,14 @@ function attachDynamicHandlers() {
   attachPlayerDropTarget();
   attachMainPlayer();
   attachPlayerControlActivity();
+  attachPlayerFolderRail();
   attachMiniPlayers();
-  if (state.screen === "folder") scheduleFolderThumbs();
-  else cancelFolderThumbs();
+  if (state.screen === "folder") {
+    scheduleFolderThumbs();
+    scrollPendingFolderVideoIntoView();
+  } else {
+    cancelFolderThumbs();
+  }
 }
 
 function scheduleFolderThumbs() {
@@ -1433,6 +1594,34 @@ function attachPlayerDropTarget() {
       state.player.playing = true;
       render();
     }
+  });
+}
+
+function attachPlayerFolderRail() {
+  if (state.screen !== "player") return;
+  const pairs = [...document.querySelectorAll("[data-player-folder-list]")]
+    .map((list) => ({ list, active: list.querySelector(".player-folder-item.active") }))
+    .filter((entry) => entry.active);
+  if (!pairs.length) return;
+
+  window.requestAnimationFrame(() => {
+    pairs.forEach(({ active }) => active.scrollIntoView({ block: "center" }));
+  });
+}
+
+function scrollPendingFolderVideoIntoView() {
+  const targetPath = state.folder.pendingScrollPath;
+  if (!targetPath) return;
+  const index = state.folder.videos.findIndex((video) => sameLocalPath(video.path, targetPath));
+  if (index < 0) {
+    state.folder.pendingScrollPath = "";
+    return;
+  }
+
+  window.requestAnimationFrame(() => {
+    const card = document.querySelector(`[data-folder-video-index="${index}"]`);
+    card?.scrollIntoView({ block: "center" });
+    state.folder.pendingScrollPath = "";
   });
 }
 
@@ -1581,12 +1770,17 @@ document.addEventListener("click", async (event) => {
   }
   if (action === "remove-download") {
     const id = actionEl.dataset.id || state.download.items[Number(actionEl.dataset.index)]?.id;
-    if (id) await desktop.download.removeItem(id);
+    state.download.actionError = "";
+    if (id) {
+      const result = await desktop.download.removeItem(id);
+      applyDownloadResult(result);
+    }
     else state.download.items.splice(Number(actionEl.dataset.index), 1);
     return render();
   }
   if (action === "start-downloads") {
-    await desktop.download.startQueue({ parallelItems: state.download.parallelItems });
+    state.download.actionError = "";
+    await desktop.download.startQueue({ parallelItems: 1 });
     state.download.phase = "running";
     await refreshDownloadState();
     render();
@@ -1609,6 +1803,20 @@ document.addEventListener("click", async (event) => {
     state.download.phase = "running";
     return refreshDownloadState();
   }
+  if (action === "clear-finished-downloads") {
+    state.download.actionError = "";
+    const result = await desktop.download.clearCompleted();
+    applyDownloadResult(result);
+    return render();
+  }
+  if (action === "open-download-output" || action === "reveal-download-output") {
+    state.download.actionError = "";
+    const id = actionEl.dataset.id;
+    const command = action === "open-download-output" ? desktop.download.openOutput : desktop.download.revealOutput;
+    const result = command ? await command(id) : { ok: false, error: "This action is not available." };
+    if (result?.ok === false) state.download.actionError = result.error || "Could not open the downloaded file.";
+    return render();
+  }
   if (action === "subtitle-downloaded") {
     const item = state.download.items[Number(actionEl.dataset.index)];
     await loadVideoPath(item.output || `D:\\Downloads\\${item.name}.mp4`, { displayName: item.name });
@@ -1617,7 +1825,7 @@ document.addEventListener("click", async (event) => {
 
   if (action === "choose-video") {
     const picked = await desktop.selectVideo();
-    if (picked) await loadVideoPath(picked);
+    if (picked) await loadVideoPath(picked, { folderContext: null });
     return render();
   }
   if (action === "choose-srt") {
@@ -1642,9 +1850,42 @@ document.addEventListener("click", async (event) => {
     const video = state.folder.videos[Number(actionEl.dataset.videoIndex)];
     const videoPath = video?.path || actionEl.dataset.videoPath;
     if (!videoPath) return;
-    await loadVideoPath(videoPath, { displayName: video?.name || "", subtitlePath: video?.subtitlePath || "" });
+    const wasPlayer = state.screen === "player";
+    const wasFullscreen = wasPlayer && isPlayerWorkbenchFullscreen();
+    const videoIndex = Number(actionEl.dataset.videoIndex);
+    await loadVideoPath(videoPath, {
+      displayName: video?.name || "",
+      subtitlePath: video?.subtitlePath || "",
+      updatePlayerElement: wasFullscreen,
+      folderContext: {
+        folderPath: state.folder.path,
+        videoIndex,
+        videoPath,
+        groupName: video?.groupName || "Other"
+      }
+    });
     state.player.playing = true;
+    if (wasFullscreen) {
+      syncMainPlayerVideoElement(state.player.sourceToken, { autoplay: true });
+      updatePlayerFolderSelection(videoIndex);
+      return;
+    }
+    if (wasPlayer) {
+      render();
+      return;
+    }
     return setScreen("player");
+  }
+  if (action === "back-to-folder-context") {
+    const index = currentFolderVideoIndex();
+    if (index >= 0) {
+      state.folder.visibleLimit = Math.max(
+        Number(state.folder.visibleLimit || folderPageSize),
+        index + 1
+      );
+      state.folder.pendingScrollPath = state.player.videoPath;
+    }
+    return setScreen("folder");
   }
   if (action === "add-cast") {
     const name = state.subtitle.castDraft.trim();
@@ -1814,7 +2055,7 @@ document.addEventListener("MSFullscreenChange", syncFullscreenState);
 function initDownloadBridge() {
   desktop.download?.onState?.((snapshot) => {
     syncDownloadState(snapshot);
-    render();
+    scheduleDownloadRender();
   });
   desktop.download?.onEvent?.((event) => {
     if (event?.event === "item-started" && event.itemId) state.download.terminalItemId = event.itemId;
@@ -1826,16 +2067,31 @@ async function refreshDownloadState() {
   try {
     const snapshot = await desktop.download.getState();
     syncDownloadState(snapshot);
-    render();
+    if (state.screen === "download") render({ preserveScroll: true });
   } catch {
     // The browser fallback keeps the UI usable without Electron IPC.
   }
 }
 
+function scheduleDownloadRender() {
+  if (state.screen !== "download") return;
+  if (downloadRenderTimer) return;
+  downloadRenderTimer = window.setTimeout(() => {
+    downloadRenderTimer = null;
+    if (state.screen !== "download") return;
+    render({ preserveScroll: true });
+  }, 180);
+}
+
+function applyDownloadResult(result = {}) {
+  if (result?.state) syncDownloadState(result.state);
+  if (result?.ok === false) state.download.actionError = result.error || "Download action failed.";
+}
+
 function syncDownloadState(snapshot = {}) {
   if (!Array.isArray(snapshot.items)) return;
   state.download.items = snapshot.items;
-  state.download.parallelItems = snapshot.parallelItems || state.download.parallelItems || 2;
+  state.download.parallelItems = 1;
   const activeItem = state.download.items.find((item) => ["active", "preparing", "muxing"].includes(item.status));
   if (activeItem) state.download.phase = "running";
   if (!state.download.terminalItemId || !state.download.items.some((item) => item.id === state.download.terminalItemId)) {
@@ -1850,6 +2106,19 @@ function selectedDownloadItem() {
     state.download.items[0] ||
     null
   );
+}
+
+function currentFolderVideoIndex() {
+  if (!state.player.videoPath || !state.folder.videos.length) return -1;
+  return state.folder.videos.findIndex((video) => sameLocalPath(video.path, state.player.videoPath));
+}
+
+function sameLocalPath(a, b) {
+  return normalizeLocalPath(a) === normalizeLocalPath(b);
+}
+
+function normalizeLocalPath(value) {
+  return String(value || "").replaceAll("/", "\\").toLowerCase();
 }
 
 async function addDownloadItem() {
@@ -1956,6 +2225,45 @@ function chooseApproval(pick) {
   render();
 }
 
+function syncMainPlayerVideoElement(sourceToken = state.player.sourceToken, options = {}) {
+  const video = document.getElementById("mainPlayerVideo");
+  if (!video || String(sourceToken) !== String(state.player.sourceToken)) return;
+
+  video.dataset.sourceToken = String(sourceToken);
+  video.muted = state.player.muted;
+  video.volume = state.player.volume;
+  if (state.player.videoUrl && video.src !== state.player.videoUrl) {
+    video.src = state.player.videoUrl;
+    video.load();
+  }
+
+  attachMainPlayer();
+  updatePlayerUi();
+
+  if (options.autoplay) {
+    video.play().catch(() => {
+      state.player.playing = false;
+      updatePlayerUi();
+    });
+  }
+}
+
+function updatePlayerFolderSelection(activeIndex) {
+  document.querySelectorAll("[data-player-folder-item]").forEach((button) => {
+    const index = Number(button.dataset.playerFolderItem);
+    const isActive = index === activeIndex;
+    button.classList.toggle("active", isActive);
+    const marker = button.querySelector(".player-folder-play");
+    if (marker) marker.innerHTML = isActive ? icon("play") : String(index + 1);
+  });
+
+  const groupName = state.folder.videos[activeIndex]?.groupName || "Other";
+  document.querySelectorAll(".player-folder-head strong").forEach((heading) => {
+    heading.textContent = groupName;
+    heading.title = groupName;
+  });
+}
+
 function attachMainPlayer() {
   const video = document.getElementById("mainPlayerVideo");
   if (!video) return;
@@ -1973,7 +2281,7 @@ function attachMainPlayer() {
     updatePlayerUi();
   };
 
-  video.addEventListener("loadedmetadata", () => {
+  video.onloadedmetadata = () => {
     if (!isCurrentSource()) return;
     state.player.duration = Number.isFinite(video.duration) ? video.duration : 0;
     if (state.player.currentTime > 0 && state.player.currentTime < state.player.duration) {
@@ -1983,43 +2291,44 @@ function attachMainPlayer() {
       state.player.currentTime = 0;
     }
     updatePlayerUi();
-  });
-  video.addEventListener("timeupdate", syncState);
-  video.addEventListener("play", syncState);
-  video.addEventListener("pause", syncState);
-  video.addEventListener("ended", syncState);
-  video.addEventListener("volumechange", () => {
+  };
+  video.ontimeupdate = syncState;
+  video.onplay = syncState;
+  video.onpause = syncState;
+  video.onended = syncState;
+  video.onvolumechange = () => {
     if (!isCurrentSource()) return;
     state.player.muted = video.muted || video.volume === 0;
     state.player.volume = video.volume;
     if (video.volume > 0) state.player.lastVolume = video.volume;
     updatePlayerUi();
-  });
+  };
 
   const scrubber = document.querySelector("[data-player-scrubber]");
-  scrubber?.addEventListener("click", (event) => {
+  if (scrubber) scrubber.onclick = (event) => {
     if (!state.player.duration) return;
     const rect = scrubber.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
     seekMainPlayer(ratio * state.player.duration);
-  });
-  scrubber?.addEventListener("mousemove", (event) => {
+  };
+  if (scrubber) scrubber.onmousemove = (event) => {
     updateScrubberPreview(scrubber, event.clientX);
-  });
-  scrubber?.addEventListener("mouseleave", () => {
+  };
+  if (scrubber) scrubber.onmouseleave = () => {
     scrubber.classList.remove("previewing");
-  });
+  };
 
   const playerFrame = document.querySelector("[data-player-drop]");
-  playerFrame?.addEventListener("click", () => {
+  if (playerFrame) playerFrame.onclick = (event) => {
+    if (event.target.closest("button, input, [data-player-folder-rail]")) return;
     toggleMainPlayer();
-  });
+  };
 
   const volumeSlider = document.querySelector("[data-volume-slider]");
-  volumeSlider?.addEventListener("input", (event) => {
+  if (volumeSlider) volumeSlider.oninput = (event) => {
     const value = Math.min(1, Math.max(0, Number(event.target.value) || 0));
     setMainPlayerVolume(value);
-  });
+  };
 
   if (state.player.playing) {
     video.play().catch(() => {
@@ -2195,7 +2504,7 @@ function updatePlayerUi() {
   if (cueIndex !== state.player.activeCueIndex) {
     state.player.activeCueIndex = cueIndex;
     const activeLine = document.querySelector(`.transcript-line[data-cue-index="${cueIndex}"]`);
-    activeLine?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    activeLine?.scrollIntoView({ block: "center", behavior: "smooth" });
   }
 
   const playButton = document.querySelector('[data-action="toggle-player"]');
@@ -2425,7 +2734,8 @@ function emptyFolderState() {
     error: "",
     scannedAt: "",
     skippedFolders: 0,
-    truncated: false
+    truncated: false,
+    pendingScrollPath: ""
   };
 }
 
@@ -2495,15 +2805,16 @@ function applyFolderScan(result = {}) {
     } else {
       v.prefixName = null;
     }
+    v.groupName = v.prefixName || "Other";
   });
 
   videos.sort((a, b) => {
     if (a.folderName !== b.folderName) return a.folderName.localeCompare(b.folderName);
     
-    if (a.prefixName !== b.prefixName) {
-      if (!a.prefixName) return 1;
-      if (!b.prefixName) return -1;
-      return a.prefixName.localeCompare(b.prefixName);
+    if (a.groupName !== b.groupName) {
+      if (a.groupName === "Other") return 1;
+      if (b.groupName === "Other") return -1;
+      return a.groupName.localeCompare(b.groupName);
     }
     
     const nameA = a.name || "";
@@ -2528,6 +2839,10 @@ function applyFolderScan(result = {}) {
 async function loadVideoPath(pathValue, options = {}) {
   if (!pathValue) return;
   const sourceToken = setVideoPath(pathValue, options);
+  if (typeof options.afterSourceSet === "function") {
+    await options.afterSourceSet(sourceToken);
+  }
+  if (options.updatePlayerElement) syncMainPlayerVideoElement(sourceToken);
   try {
     const url = await desktop.toFileUrl(pathValue);
     if (sourceToken !== state.player.sourceToken) return;
@@ -2536,6 +2851,7 @@ async function loadVideoPath(pathValue, options = {}) {
     if (sourceToken !== state.player.sourceToken) return;
     state.player.videoUrl = localPathToFileUrl(pathValue);
   }
+  if (options.updatePlayerElement) syncMainPlayerVideoElement(sourceToken, { autoplay: state.player.playing });
 
   let subtitleLoaded = false;
   if (options.subtitlePath) {
@@ -2606,6 +2922,7 @@ function setVideoPath(pathValue, options = {}) {
   state.player.duration = 0;
   state.player.playing = false;
   state.player.activeCueIndex = -1;
+  state.player.folderContext = options.folderContext || null;
   return state.player.sourceToken;
 }
 

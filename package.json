@@ -20,6 +20,7 @@
   "build": {
     "appId": "app.visubly.studio",
     "productName": "Visubly Studio",
+    "afterPack": "scripts/after-pack.js",
     "files": [
       "src/**/*",
       "package.json",
@@ -29,15 +30,20 @@
       "**/node_modules/@ffmpeg-installer/ffmpeg/**/*"
     ],
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "build"
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "nsis",
         "portable"
       ],
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false
+    },
+    "nsis": {
+      "script": "build/installer.nsi"
     },
     "mac": {
       "target": "dmg",

@@ -1,10 +1,12 @@
-const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, powerSaveBlocker, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const airplayServer = require("./airplay-server");
+
+const appIconPath = path.join(__dirname, "../renderer/assets/brand/visubly-app-logo-concept-v2.png");
 
 let mainWindow;
 let airplayPowerBlockerId = null;
@@ -52,13 +54,16 @@ const airplayPowerBlockerGraceMs = Math.max(0, Number(process.env.VISUBLY_AIRPLA
 const airplayPowerBlockerMode =
   process.env.VISUBLY_AIRPLAY_KEEP_DISPLAY_AWAKE === "1" ? "prevent-display-sleep" : "prevent-app-suspension";
 const downloadStatePath = path.join(runtimePaths.userData, "download-queue.json");
+const maxParallelDownloadProcesses = 1;
+const downloadStateFlushMs = 300;
 const downloadQueue = {
   items: [],
   activeIds: new Set(),
   processes: new Map(),
-  parallelItems: 2,
+  parallelItems: maxParallelDownloadProcesses,
   localWorkers: 8
 };
+let downloadStateFlushTimer = null;
 
 for (const dir of Object.values(runtimePaths)) {
   fs.mkdirSync(dir, { recursive: true });
@@ -82,6 +87,7 @@ function createWindow() {
     minHeight: 720,
     frame: false,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
+    icon: appIconPath,
     backgroundColor: "#f0eee9",
     show: false,
     webPreferences: {
@@ -95,6 +101,8 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
 }
+
+if (process.platform === "win32") app.setAppUserModelId("app.visubly.studio");
 
 app.whenReady().then(() => {
   createWindow();
@@ -110,6 +118,10 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   stopAirplayPowerBlocker("App is quitting.");
+  if (downloadStateFlushTimer) {
+    clearTimeout(downloadStateFlushTimer);
+    downloadStateFlushTimer = null;
+  }
   for (const [itemId, child] of downloadQueue.processes.entries()) {
     const item = getDownloadItem(itemId);
     if (item && item.status !== "done") {
@@ -556,10 +568,10 @@ ipcMain.handle("download:enqueue", async (_event, items = []) => {
 
 ipcMain.handle("download:start", async (_event, options = {}) => {
   if (Number.isFinite(Number(options.parallelItems))) {
-    downloadQueue.parallelItems = Math.max(1, Math.min(6, Number(options.parallelItems)));
+    downloadQueue.parallelItems = normalizeDownloadParallel(options.parallelItems);
   }
   pumpDownloadQueue();
-  persistAndBroadcastDownloadState();
+  persistAndBroadcastDownloadState({ immediate: true });
   return { ok: true, state: downloadSnapshot() };
 });
 
@@ -574,7 +586,7 @@ ipcMain.handle("download:cancel", async (_event, itemId) => {
   if (child) killProcessTree(child);
   downloadQueue.activeIds.delete(item.id);
   downloadQueue.processes.delete(item.id);
-  persistAndBroadcastDownloadState();
+  persistAndBroadcastDownloadState({ immediate: true });
   pumpDownloadQueue();
   return { ok: true, state: downloadSnapshot() };
 });
@@ -602,15 +614,30 @@ ipcMain.handle("download:remove", async (_event, itemId) => {
   downloadQueue.activeIds.delete(item.id);
   downloadQueue.processes.delete(item.id);
   downloadQueue.items = downloadQueue.items.filter((entry) => entry.id !== item.id);
-  persistAndBroadcastDownloadState();
-  pumpDownloadQueue();
+  persistAndBroadcastDownloadState({ immediate: true });
   return { ok: true, state: downloadSnapshot() };
 });
 
 ipcMain.handle("download:clearCompleted", async () => {
-  downloadQueue.items = downloadQueue.items.filter((item) => !["done", "failed", "canceled"].includes(item.status));
-  persistAndBroadcastDownloadState();
+  downloadQueue.items = downloadQueue.items.filter((item) => item.status !== "done");
+  persistAndBroadcastDownloadState({ immediate: true });
   return { ok: true, state: downloadSnapshot() };
+});
+
+ipcMain.handle("download:openOutput", async (_event, itemId) => {
+  const outputPath = downloadOutputPath(itemId);
+  if (!outputPath) return { ok: false, error: "Output file is not available yet." };
+  if (!fs.existsSync(outputPath)) return { ok: false, error: `Output file was not found: ${outputPath}` };
+  const error = await shell.openPath(outputPath);
+  return error ? { ok: false, error } : { ok: true };
+});
+
+ipcMain.handle("download:revealOutput", (_event, itemId) => {
+  const outputPath = downloadOutputPath(itemId);
+  if (!outputPath) return { ok: false, error: "Output file is not available yet." };
+  if (!fs.existsSync(outputPath)) return { ok: false, error: `Output file was not found: ${outputPath}` };
+  shell.showItemInFolder(outputPath);
+  return { ok: true };
 });
 
 async function prepareDownloadItem(payload) {
@@ -731,7 +758,7 @@ function startDownloadProcess(item) {
     const text = chunk.toString().trim();
     if (text) {
       appendDownloadLog(item, text);
-      persistAndBroadcastDownloadState();
+      persistAndBroadcastDownloadState({ deferred: true });
     }
   });
   child.on("error", (error) => {
@@ -743,9 +770,11 @@ function startDownloadProcess(item) {
   });
   child.on("close", (code) => {
     parseJsonLines(stdoutBuffer + "\n", (event) => applyRunnerEvent(item.id, event));
+    const itemStillTracked = downloadQueue.items.some((entry) => entry.id === item.id);
     downloadQueue.activeIds.delete(item.id);
     downloadQueue.processes.delete(item.id);
     delete item.pid;
+    if (!itemStillTracked) return;
     if (item.status === "canceled" || item.cancelRequested) {
       item.status = "canceled";
       item.phase = "canceled";
@@ -755,6 +784,7 @@ function startDownloadProcess(item) {
       item.phase = "done";
       item.progress = 100;
       appendDownloadLog(item, "Download completed.");
+      removeDownloadItem(item.id);
     } else {
       item.status = "failed";
       item.phase = "failed";
@@ -816,7 +846,7 @@ function applyRunnerEvent(itemId, event) {
     item.error = item.error || `Runner failed with code ${event.exit_code ?? "unknown"}.`;
   }
 
-  persistAndBroadcastDownloadState();
+  persistAndBroadcastDownloadState({ deferred: isNoisyDownloadEvent(event) });
 }
 
 function addDownloadItem(raw) {
@@ -897,6 +927,16 @@ function statusForPhase(phase) {
   return "active";
 }
 
+function isNoisyDownloadEvent(event = {}) {
+  return ["progress", "log", "ffmpeg_output", "warning"].includes(event.event);
+}
+
+function normalizeDownloadParallel(value) {
+  const next = Number(value);
+  if (!Number.isFinite(next)) return maxParallelDownloadProcesses;
+  return Math.max(1, Math.min(maxParallelDownloadProcesses, next));
+}
+
 function appendDownloadLog(item, message) {
   const text = String(message || "").trim();
   if (!text) return;
@@ -909,9 +949,18 @@ function getDownloadItem(itemId) {
   return downloadQueue.items.find((item) => item.id === itemId);
 }
 
+function removeDownloadItem(itemId) {
+  downloadQueue.items = downloadQueue.items.filter((item) => item.id !== itemId);
+}
+
+function downloadOutputPath(itemId) {
+  const item = getDownloadItem(itemId);
+  return item?.output ? path.resolve(item.output) : "";
+}
+
 function downloadSnapshot() {
   return {
-    items: downloadQueue.items.map((item) => {
+    items: downloadQueue.items.filter((item) => item.status !== "done").map((item) => {
       const copy = { ...item };
       delete copy.cancelRequested;
       return copy;
@@ -922,7 +971,24 @@ function downloadSnapshot() {
   };
 }
 
-function persistAndBroadcastDownloadState() {
+function persistAndBroadcastDownloadState(options = {}) {
+  if (!options.deferred || options.immediate) {
+    flushDownloadState();
+    return;
+  }
+
+  if (downloadStateFlushTimer) return;
+  downloadStateFlushTimer = setTimeout(() => {
+    downloadStateFlushTimer = null;
+    flushDownloadState();
+  }, downloadStateFlushMs);
+}
+
+function flushDownloadState() {
+  if (downloadStateFlushTimer) {
+    clearTimeout(downloadStateFlushTimer);
+    downloadStateFlushTimer = null;
+  }
   persistDownloadQueue();
   broadcastDownloadState();
 }
@@ -936,7 +1002,7 @@ function loadDownloadQueue() {
   try {
     if (!fs.existsSync(downloadStatePath)) return;
     const data = JSON.parse(fs.readFileSync(downloadStatePath, "utf8"));
-    downloadQueue.parallelItems = Math.max(1, Number(data.parallelItems || downloadQueue.parallelItems));
+    downloadQueue.parallelItems = normalizeDownloadParallel(data.parallelItems || downloadQueue.parallelItems);
     downloadQueue.localWorkers = Math.max(1, Number(data.localWorkers || downloadQueue.localWorkers));
     downloadQueue.items = Array.isArray(data.items)
       ? data.items.map((item) => {
@@ -948,7 +1014,7 @@ function loadDownloadQueue() {
             appendDownloadLog(normalized, "Recovered from previous app session.");
           }
           return normalized;
-        })
+        }).filter((item) => item.status !== "done")
       : [];
   } catch {
     downloadQueue.items = [];

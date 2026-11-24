@@ -9,6 +9,8 @@ const downloadApi = {
   retryItem: (itemId) => ipcRenderer.invoke("download:retry", itemId),
   removeItem: (itemId) => ipcRenderer.invoke("download:remove", itemId),
   clearCompleted: () => ipcRenderer.invoke("download:clearCompleted"),
+  openOutput: (itemId) => ipcRenderer.invoke("download:openOutput", itemId),
+  revealOutput: (itemId) => ipcRenderer.invoke("download:revealOutput", itemId),
   onEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("download:event", listener);

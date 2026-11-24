@@ -29,12 +29,15 @@ const checks = [
   ["download flow", js.includes("renderDownload")],
   ["download queue bridge", preload.includes("downloadApi")],
   ["download runner integration", main.includes("hls2mp4_runner.py")],
+  ["capture confirm dialog", js.includes("renderCaptureDialog") && preload.includes("prepareManual")],
+  ["settings screen", js.includes("renderSettings") && preload.includes("openExtensionFolder")],
+  ["theme setting", main.includes("nativeTheme") && html.includes("theme-boot.js")],
   ["folder player screen", js.includes("renderFolderPlayer")],
   ["folder scan bridge", preload.includes("selectVideoFolder") && main.includes("scanVideoFolder")],
+  ["subtitle decoding", preload.includes("readSubtitleText") && main.includes("decodeSubtitleBuffer")],
+  ["system player fallback", preload.includes("openInSystemPlayer")],
   ["AirPlay stay-awake blocker", main.includes("powerSaveBlocker") && preload.includes("onPowerState")],
-  ["subtitle flow", js.includes("renderSubtitle")],
-  ["approval flow", js.includes("renderApprove")],
-  ["ChatGPT option", js.includes("chatgpt")]
+  ["no demo leftovers", !/flaggedSegments|sampleCurl|renderApprove|startDownloadSimulation|visubly-app-logo-concept/.test(js)]
 ];
 
 const failed = checks.filter(([, ok]) => !ok);

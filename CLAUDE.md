@@ -1,0 +1,14 @@
+# ViSUBLY (Visubly Studio)
+
+Electron desktop app (Windows first, Mac/iPhone later) for grabbing videos (HLS/MP4/DASH) from the browser like IDM, playing them with subtitles, and later generating Vietnamese AI subtitles. A Chrome MV3 extension (`browser-extension/chrome`) sends detected streams to the app over a paired localhost bridge.
+
+**Read `docs/HANDOFF.md` first.** It covers the current state, architecture, IPC and bridge APIs, build and test commands, known limitations and the backlog.
+
+## Rules
+- Reply to the user in Vietnamese.
+- For any non-trivial request, present a phased plan and wait for approval before editing code. Read-only investigation is fine.
+- After app code changes, rebuild the Windows package: `npm.cmd run package:win`.
+- Never kill processes you did not start. Never commit `ViSUBLY_Expo_Source/` or the root `download-queue.json`.
+- PowerShell 5.1: commit with `git commit -F <message-file>`; stage explicit paths only.
+- `D:\Projects\Extracting Video` is read-only source; the engine copy lives in `engine/downloader/`.
+- Keep the renderer's `<video>` element alive across re-renders (see HANDOFF §3).

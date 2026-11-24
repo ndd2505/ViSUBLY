@@ -7,6 +7,7 @@ export async function getToken() {
   return token || '';
 }
 export async function setToken(token) {
+  lastStatus = null;
   if (token) await chrome.storage.local.set({ token });
   else await chrome.storage.local.remove('token');
 }
@@ -41,12 +42,21 @@ export async function probe() {
   return { running: false, port: null, paired: false };
 }
 
-async function post(port, path, body, token) {
+// Probing many streams in a row: reuse one ping result for a few seconds.
+let lastStatus = null;
+async function cachedStatus() {
+  if (lastStatus && Date.now() - lastStatus.at < 4000) return lastStatus.st;
+  const st = await probe();
+  lastStatus = { at: Date.now(), st };
+  return st;
+}
+
+async function post(port, path, body, token, timeoutMs = 8000) {
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Visubly-Token': token } : {}) },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   let j = {};
   try { j = await res.json(); } catch { /* ignore */ }
@@ -77,5 +87,25 @@ export async function sendCapture(payload) {
     return { ok: false, code: 'rejected', error: json.error || 'ViSUBLY từ chối yêu cầu' };
   } catch {
     return { ok: false, code: 'network', error: 'Lỗi mạng khi gửi tới ViSUBLY' };
+  }
+}
+
+// Asks the app to read a playlist: { ok, kind, variants, durationSec, isLive, isShort } or { ok:false, code }.
+export async function probeStream(payload) {
+  const st = await cachedStatus();
+  if (!st.running) return { ok: false, code: 'not-running' };
+  const token = await getToken();
+  if (!token || !st.paired) return { ok: false, code: 'not-paired' };
+  try {
+    // The app queues probes (2 at a time, 30 s each), so allow for waiting in line.
+    const { status, json } = await post(st.port, '/v1/probe', payload, token, 75000);
+    if (status === 200 && json && json.ok) return json;
+    if (status === 429) return { ok: false, code: 'rate-limited' };
+    if (status === 401) { lastStatus = null; return { ok: false, code: 'not-paired' }; }
+    if (status === 404) return { ok: false, code: 'unsupported' }; // app older than 1.1
+    return { ok: false, code: 'failed', error: (json && json.error) || 'Không đọc được video' };
+  } catch {
+    lastStatus = null;
+    return { ok: false, code: 'network' };
   }
 }

@@ -113,6 +113,25 @@
   }
   function scheduleUpdate() { if (!rafId) rafId = requestAnimationFrame(update); }
 
+  // Tell the background whether the page's main (largest) video plays, plus its duration and
+  // direct src, so the pill can pick the matching stream instead of a preview. Read-only on the DOM.
+  let lastPlayback = '';
+  function reportPlayback() {
+    const v = findTarget();
+    if (!v && !lastPlayback) return; // pages without video stay silent
+    const playing = !!(v && !v.paused && !v.ended);
+    const duration = v && Number.isFinite(v.duration) ? Math.round(v.duration * 10) / 10 : 0;
+    const src = v && /^https?:/i.test(v.currentSrc || '') ? v.currentSrc : '';
+    const sig = `${playing}|${duration}|${src}`;
+    if (sig === lastPlayback) return;
+    lastPlayback = sig;
+    try { chrome.runtime.sendMessage({ type: 'playback', playing, duration, src }).catch(() => {}); } catch { /* extension reloaded */ }
+  }
+  let playbackTimer = 0;
+  function schedulePlayback() {
+    if (!playbackTimer) playbackTimer = setTimeout(() => { playbackTimer = 0; reportPlayback(); }, 120);
+  }
+
   // Hover tracking (cheap, passive).
   document.addEventListener('mousemove', (e) => {
     if (!count) return;
@@ -125,6 +144,8 @@
   addEventListener('scroll', scheduleUpdate, { passive: true, capture: true });
   addEventListener('resize', scheduleUpdate, { passive: true });
   for (const ev of ['play', 'pause', 'ended', 'loadedmetadata']) document.addEventListener(ev, scheduleUpdate, true);
+  for (const ev of ['play', 'playing', 'pause', 'ended', 'durationchange']) document.addEventListener(ev, schedulePlayback, true);
+  setInterval(reportPlayback, 2000); // autoplay that started before this script, size changes
 
   // Videos added later: throttled observer.
   const mo = new MutationObserver(() => {

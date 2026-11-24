@@ -1,12 +1,20 @@
-import { probe, pair, sendCapture, setToken } from './app-client.js';
+import { probe, pair, sendCapture, setToken, probeStream } from './app-client.js';
+import {
+  MIN_MP4_BYTES, NOISE_EXT, classifyUrl, classifyContentType, upsertStream, markPlaybackStart,
+  buildGroups, isShortGroup, needsProbe, rankGroups, pickBestGroup, describeGroups,
+} from './lib/streams.js';
 
-const MAX_PER_TAB = 30;
 const OWN_PORTS = new Set(['47653', '47654', '47655', '47656']);
-const MIN_MP4_BYTES = 200 * 1024;
 const BADGE_COLOR = '#FF8B6E';
 const REQ_TYPES = ['xmlhttprequest', 'media', 'other', 'object', 'sub_frame', 'main_frame'];
+const POPUP_PROBE_LIMIT = 8;
+const PILL_PROBE_ROUNDS = 3;
+const PROBE_CONCURRENCY = 2;
+const PROBE_SPACING_MS = 350; // stays under the app's 3 probes/second limit
+const PROBE_RETRY_MS = 60000; // a playlist the app could not read is retried after this
 
 // ---------- storage (chrome.storage.session, serialized) ----------
+// tabs[tabId] = { streams: [...], probes: { [streamKey]: probe result }, playback: {...} }
 let cache = null;
 let chain = Promise.resolve();
 async function load() {
@@ -24,29 +32,24 @@ function withState(fn) {
   chain = run.catch(() => {});
   return run;
 }
+function readTab(tabs, tabId) {
+  let t = tabs[tabId];
+  if (Array.isArray(t)) t = { streams: t }; // 1.0.x layout
+  t = t && typeof t === 'object' ? t : {};
+  return {
+    streams: Array.isArray(t.streams) ? t.streams : [],
+    probes: t.probes && typeof t.probes === 'object' ? t.probes : {},
+    playback: t.playback || { playing: false },
+  };
+}
+function tabState(tabs, tabId) {
+  const t = readTab(tabs, tabId);
+  tabs[tabId] = t;
+  return t;
+}
+const normalCount = (t) => buildGroups(t.streams, t.probes).filter((g) => !isShortGroup(g)).length;
 
 // ---------- detection ----------
-const NOISE_EXT = /\.(ts|m4s|aac|m4a|mp3|vtt|webvtt|srt|jpg|jpeg|png|gif|webp|css|js|json|key|cmfv|cmfa)$/i;
-function classifyUrl(u) {
-  let p;
-  try { p = new URL(u); } catch { return null; }
-  if (p.protocol !== 'http:' && p.protocol !== 'https:') return null;
-  const path = p.pathname.toLowerCase();
-  if (path.endsWith('.m3u8')) return 'hls';
-  if (path.endsWith('.mpd')) return 'dash';
-  if (path.endsWith('.mp4')) return 'mp4';
-  return null;
-}
-function classifyContentType(ct) {
-  ct = (ct || '').toLowerCase().split(';')[0].trim();
-  if (ct === 'application/vnd.apple.mpegurl' || ct === 'application/x-mpegurl' || ct === 'audio/mpegurl' || ct === 'audio/x-mpegurl') return 'hls';
-  if (ct === 'application/dash+xml') return 'dash';
-  if (ct === 'video/mp4') return 'mp4';
-  return null;
-}
-function dedupeKey(u) {
-  try { const p = new URL(u); return p.origin + p.pathname; } catch { return u; }
-}
 function isOwn(d) {
   if (d.tabId < 0) return true;
   if ((d.initiator || '').startsWith('chrome-extension://')) return true;
@@ -61,14 +64,6 @@ function getHeader(list, name) {
   const h = (list || []).find((x) => x.name.toLowerCase() === name);
   return h ? h.value : undefined;
 }
-function score(s) {
-  let sc = s.type === 'mp4' ? 20 : 50;
-  const name = (s.url.split('?')[0].split('/').pop() || '').toLowerCase();
-  if (/master|index|playlist|manifest/.test(name)) sc += 20;
-  if (/(^|[_\-.])(\d{3,4}p?|audio|video|chunk|segment|frag)([_\-.]|$)/.test(name)) sc -= 15;
-  if (s.sizeHint) sc += Math.min(10, Math.log10(s.sizeHint));
-  return sc;
-}
 
 const reqHeaders = new Map(); // requestId -> {headers, t}
 function pruneReqHeaders() {
@@ -82,29 +77,23 @@ function updateBadge(tabId, count) {
   chrome.action.setBadgeBackgroundColor({ tabId, color: BADGE_COLOR }).catch(() => {});
   chrome.tabs.sendMessage(tabId, { type: 'count', count }).catch(() => {});
 }
+function notifyPopup(tabId) {
+  chrome.runtime.sendMessage({ type: 'tabState', tabId }).catch(() => {}); // no popup open: ignore
+}
 
 async function addStream(tabId, entry) {
   let tab = null;
   try { tab = await chrome.tabs.get(tabId); } catch { return; }
-  const key = dedupeKey(entry.url);
   const count = await withState((tabs) => {
-    const list = tabs[tabId] || [];
-    const ex = list.find((s) => s.key === key);
-    if (ex) {
-      Object.assign(ex, { url: entry.url, headers: { ...ex.headers, ...entry.headers }, detectedAt: Date.now() });
-      if (entry.sizeHint) ex.sizeHint = entry.sizeHint;
-    } else {
-      list.push({
-        id: Math.random().toString(36).slice(2, 10), key, url: entry.url, type: entry.type, headers: entry.headers,
-        pageUrl: (tab && (tab.url || tab.pendingUrl)) || '', pageTitle: (tab && tab.title) || '',
-        detectedAt: Date.now(), sizeHint: entry.sizeHint || 0,
-      });
-    }
-    list.sort((a, b) => score(b) - score(a) || b.detectedAt - a.detectedAt);
-    tabs[tabId] = list.slice(0, MAX_PER_TAB);
-    return tabs[tabId].length;
+    const t = tabState(tabs, tabId);
+    upsertStream(t.streams, entry, {
+      pageUrl: (tab && (tab.url || tab.pendingUrl)) || '', pageTitle: (tab && tab.title) || '',
+      playing: !!t.playback.playing,
+    });
+    return normalCount(t);
   });
   updateBadge(tabId, count);
+  notifyPopup(tabId);
 }
 
 chrome.webRequest.onBeforeSendHeaders.addListener((d) => {
@@ -158,40 +147,176 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   withState((tabs) => { delete tabs[tabId]; });
 });
 
-// ---------- messaging ----------
-const publicStream = (s) => ({ id: s.id, url: s.url, type: s.type, detectedAt: s.detectedAt, sizeHint: s.sizeHint });
+// ---------- probing (the app reads playlists; the extension cannot see response bodies) ----------
+const probing = new Map(); // `${tabId}|${streamKey}` -> Promise<result>
+const probeQueue = [];
+let probeActive = 0;
+let lastProbeStart = 0;
+let pumpTimer = 0;
+let appNote = ''; // why quality info is missing: 'not-running' | 'not-paired' | 'unsupported'
 
-async function sendStream(tabId, streamId) {
-  const tabs = await load();
-  const list = tabs[tabId] || [];
-  const s = streamId ? list.find((x) => x.id === streamId) : list[0];
-  if (!s) return { ok: false, error: 'Chưa thấy video nào trên trang này' };
-  let tab = null;
-  try { tab = await chrome.tabs.get(tabId); } catch { /* ignore */ }
+function requestHeaders(s, tab) {
   const headers = { ...s.headers };
   if (!headers.userAgent) headers.userAgent = navigator.userAgent;
   const pageUrl = (tab && tab.url) || s.pageUrl;
   if (!headers.referer && pageUrl) headers.referer = pageUrl;
-  return sendCapture({
-    url: s.url, type: s.type, headers, pageUrl,
+  return headers;
+}
+
+function queueProbe(tabId, stream) {
+  const id = `${tabId}|${stream.key}`;
+  if (probing.has(id)) return probing.get(id);
+  const p = new Promise((resolve) => { probeQueue.push({ tabId, stream, resolve }); });
+  probing.set(id, p);
+  p.finally(() => probing.delete(id));
+  pumpProbes();
+  return p;
+}
+
+function pumpProbes() {
+  while (probeActive < PROBE_CONCURRENCY && probeQueue.length) {
+    const wait = lastProbeStart + PROBE_SPACING_MS - Date.now();
+    if (wait > 0) {
+      if (!pumpTimer) pumpTimer = setTimeout(() => { pumpTimer = 0; pumpProbes(); }, wait);
+      return;
+    }
+    const job = probeQueue.shift();
+    probeActive += 1;
+    lastProbeStart = Date.now();
+    runProbeJob(job).catch(() => job.resolve({ ok: false, code: 'failed' })).finally(() => { probeActive -= 1; pumpProbes(); });
+  }
+}
+
+async function runProbeJob({ tabId, stream, resolve }) {
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { resolve({ ok: false, code: 'gone' }); return; }
+  const payload = { url: stream.url, type: stream.type, headers: requestHeaders(stream, tab) };
+  let r = await probeStream(payload);
+  for (let i = 0; i < 2 && r.code === 'rate-limited'; i++) {
+    await new Promise((ok) => setTimeout(ok, 1100));
+    r = await probeStream(payload);
+  }
+  if (r.ok) appNote = '';
+  else if (['not-running', 'not-paired', 'unsupported'].includes(r.code)) appNote = r.code;
+  if (r.ok || r.code === 'failed') {
+    const stored = r.ok
+      ? {
+        ok: true, kind: r.kind || '', durationSec: Number(r.durationSec) || 0, isLive: !!r.isLive, isShort: !!r.isShort,
+        renditions: Array.isArray(r.renditions) ? r.renditions.slice(0, 20) : [],
+        variants: (Array.isArray(r.variants) ? r.variants : []).slice(0, 12).map((v) => ({
+          url: String(v.url || ''), height: Number(v.height) || 0, resolution: String(v.resolution || ''),
+          bandwidth: Number(v.bandwidth) || 0, estBytes: Number(v.estBytes) || 0,
+        })),
+        at: Date.now(),
+      }
+      : { ok: false, code: 'failed', at: Date.now() };
+    const count = await withState((tabs) => {
+      if (!tabs[tabId]) return null; // tab navigated away meanwhile
+      const t = tabState(tabs, tabId);
+      if (!t.streams.some((s) => s.key === stream.key)) return null;
+      t.probes[stream.key] = stored;
+      return normalCount(t);
+    });
+    if (count !== null) updateBadge(tabId, count);
+  }
+  notifyPopup(tabId);
+  resolve(r);
+}
+
+function probingKeys(tabId) {
+  const prefix = `${tabId}|`;
+  return new Set([...probing.keys()].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length)));
+}
+
+function ensureProbes(tabId, t, groups, limit) {
+  let n = 0;
+  for (const g of rankGroups(groups)) {
+    if (n >= limit) break;
+    if (!needsProbe(g)) continue;
+    const prev = t.probes[g.key];
+    if (prev && !prev.ok && Date.now() - prev.at < PROBE_RETRY_MS) continue;
+    n += 1;
+    queueProbe(tabId, g.root);
+  }
+}
+
+// ---------- messaging ----------
+async function getState(tabId) {
+  const tabs = await load();
+  const t = readTab(tabs, tabId);
+  const st = await probe();
+  const groups = buildGroups(t.streams, t.probes);
+  if (st.running && st.paired) ensureProbes(tabId, t, groups, POPUP_PROBE_LIMIT);
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { /* ignore */ }
+  const pageTitle = (tab && tab.title) || (t.streams[0] && t.streams[0].pageTitle) || '';
+  const view = describeGroups(groups, { pageTitle, probing: probingKeys(tabId) });
+  let note = '';
+  if (view.groups.length + view.short.length) {
+    if (!st.running || !st.paired) note = 'Mở và ghép nối ViSUBLY để xem chất lượng và dung lượng.';
+    else if (appNote === 'unsupported') note = 'Cập nhật ViSUBLY để xem chất lượng và dung lượng.';
+  }
+  return { ...view, running: st.running, paired: st.paired, note };
+}
+
+async function sendGroup(tabId, opts = {}) {
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { /* ignore */ }
+  let t = readTab(await load(), tabId);
+  let groups = buildGroups(t.streams, t.probes);
+  if (!groups.length) return { ok: false, error: 'Chưa thấy video nào trên trang này' };
+  let g = null;
+  if (opts.groupId) {
+    g = groups.find((x) => x.id === opts.groupId) || groups.find((x) => x.members.some((m) => m.id === opts.groupId));
+    if (!g) return { ok: false, error: 'Video này không còn trên trang, hãy mở lại popup' };
+  } else {
+    // Floating pill: read the front-runner first so a preview or a rendition is not sent by mistake.
+    for (let i = 0; i < PILL_PROBE_ROUNDS; i++) {
+      g = pickBestGroup(groups, t.playback);
+      const prev = g && t.probes[g.key];
+      if (!g || !needsProbe(g) || (prev && !prev.ok && Date.now() - prev.at < PROBE_RETRY_MS)) break;
+      const r = await queueProbe(tabId, g.root);
+      if (!r || (!r.ok && r.code !== 'failed')) break; // app unreachable: send what we have
+      t = readTab(await load(), tabId);
+      groups = buildGroups(t.streams, t.probes);
+      if (!groups.length) return { ok: false, error: 'Chưa thấy video nào trên trang này' };
+    }
+    g = pickBestGroup(groups, t.playback);
+  }
+  const s = g.root;
+  const pageUrl = (tab && tab.url) || s.pageUrl;
+  const payload = {
+    url: s.url, type: s.type, headers: requestHeaders(s, tab), pageUrl,
     pageTitle: (tab && tab.title) || s.pageTitle || '', detectedAt: s.detectedAt,
-  });
+  };
+  if (opts.variantUrl) payload.preferredVariantUrl = String(opts.variantUrl);
+  if (opts.height) payload.preferredHeight = Math.round(Number(opts.height)) || 0;
+  return sendCapture(payload);
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     const senderTab = sender.tab && sender.tab.id;
     switch (msg && msg.type) {
-      case 'getState': {
-        const tabs = await load();
-        const st = await probe();
-        return { streams: (tabs[msg.tabId] || []).map(publicStream), running: st.running, paired: st.paired };
+      case 'getState': return getState(msg.tabId);
+      case 'count': return { count: normalCount(readTab(await load(), senderTab)) };
+      case 'send':
+        return sendGroup(msg.tabId != null ? msg.tabId : senderTab, { groupId: msg.groupId, variantUrl: msg.variantUrl, height: msg.height });
+      case 'playback': {
+        if (senderTab == null) return { ok: false };
+        await withState((tabs) => {
+          const t = tabState(tabs, senderTab);
+          const now = Date.now();
+          const playing = !!msg.playing;
+          if (playing && !t.playback.playing) markPlaybackStart(t.streams, now);
+          t.playback = {
+            playing, at: now,
+            duration: Number.isFinite(Number(msg.duration)) ? Number(msg.duration) : 0,
+            src: typeof msg.src === 'string' ? msg.src.slice(0, 2048) : '',
+          };
+        });
+        return { ok: true };
       }
-      case 'count': {
-        const tabs = await load();
-        return { count: (tabs[senderTab] || []).length };
-      }
-      case 'send': return sendStream(msg.tabId != null ? msg.tabId : senderTab, msg.streamId);
       case 'pair': return pair(String(msg.code || '').trim());
       case 'unpair': await setToken(''); return { ok: true };
       default: return { ok: false, error: 'unknown message' };

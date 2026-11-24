@@ -1,29 +1,101 @@
 const $ = (id) => document.getElementById(id);
 const send = (msg) => chrome.runtime.sendMessage(msg);
 let tabId = null;
+const statusById = new Map(); // groupId -> { cls, text } survives re-renders
+let sendingId = '';
 
-function fileName(url) {
-  try {
-    const p = new URL(url).pathname.split('/').filter(Boolean);
-    let n = decodeURIComponent(p[p.length - 1] || '');
-    if (n.length > 34) n = n.slice(0, 18) + '…' + n.slice(-13);
-    return n || 'video';
-  } catch { return 'video'; }
-}
-function host(url) { try { return new URL(url).host; } catch { return ''; } }
-function ago(t) {
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
-  if (s < 10) return 'vừa xong';
-  if (s < 60) return `${s} giây trước`;
-  if (s < 3600) return `${Math.round(s / 60)} phút trước`;
-  return `${Math.round(s / 3600)} giờ trước`;
-}
-function size(n) {
-  if (!n) return '';
-  return n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
 }
 
+function setStatus(groupId, r) {
+  statusById.set(groupId, r === 'sending'
+    ? { cls: 'status', text: 'Đang gửi...' }
+    : { cls: `status ${r && r.ok ? 'ok' : 'bad'}`, text: r && r.ok ? '✓ Đã gửi' : (r && r.error) || 'Lỗi' });
+}
+
+async function sendGroup(g, variant) {
+  if (sendingId) return;
+  sendingId = g.id;
+  setStatus(g.id, 'sending');
+  rerender();
+  const r = await send({ type: 'send', tabId, groupId: g.id, variantUrl: variant ? variant.url : undefined, height: variant ? variant.height : undefined });
+  sendingId = '';
+  setStatus(g.id, r);
+  rerender();
+  if (r && r.code === 'not-paired') refresh();
+}
+
+function metaLine(g) {
+  const sub = el('div', 'sub');
+  const parts = [g.host, g.duration, g.size].filter(Boolean);
+  sub.append(parts.join(' · '));
+  if (g.isLive) sub.append(el('span', 'live', 'Trực tiếp'));
+  return sub;
+}
+
+function nameLine(g) {
+  const name = el('div', 'name', g.title);
+  if (g.hint && g.hint !== g.title) {
+    name.append(el('span', 'hint-inline', g.hint));
+    name.title = g.hint;
+  }
+  return name;
+}
+
+function card(g) {
+  const li = el('li', 'item');
+  const head = el('div', 'head');
+  const meta = el('div', 'meta');
+  meta.append(nameLine(g), metaLine(g));
+  head.append(el('span', `badge ${g.type}`, g.type.toUpperCase()), meta);
+  li.append(head);
+
+  const busy = sendingId === g.id;
+  if (g.variants.length) {
+    const grid = el('div', 'chips');
+    for (const v of g.variants) {
+      const chip = el('button', 'chip');
+      chip.type = 'button';
+      chip.disabled = !!sendingId;
+      chip.title = `Tải ${v.label} bằng ViSUBLY`;
+      chip.append(el('strong', '', v.label));
+      if (v.size) chip.append(el('span', '', v.size));
+      chip.addEventListener('click', () => sendGroup(g, v));
+      grid.append(chip);
+    }
+    li.append(grid);
+  } else {
+    if (g.probing) li.append(el('p', 'probing', 'Đang đọc chất lượng…'));
+    const btn = el('button', 'dl', 'Tải bằng ViSUBLY');
+    btn.disabled = !!sendingId;
+    btn.addEventListener('click', () => sendGroup(g));
+    li.append(btn);
+  }
+  const st = statusById.get(g.id);
+  if (st || busy) li.append(el('div', (st && st.cls) || 'status', (st && st.text) || 'Đang gửi...'));
+  return li;
+}
+
+function shortRow(g) {
+  const li = el('li', 'item mini');
+  const meta = el('div', 'meta');
+  meta.append(nameLine(g), metaLine(g));
+  const btn = el('button', 'mini-dl', 'Tải');
+  btn.disabled = !!sendingId;
+  btn.addEventListener('click', () => sendGroup(g));
+  li.append(el('span', `badge ${g.type}`, g.type.toUpperCase()), meta, btn);
+  const st = statusById.get(g.id);
+  if (st) li.append(el('div', `${st.cls} full`, st.text));
+  return li;
+}
+
+let lastState = null;
 function render(state) {
+  lastState = state;
   const dot = $('dot');
   $('notRunning').hidden = state.running;
   $('pairBox').hidden = !(state.running && !state.paired);
@@ -32,49 +104,38 @@ function render(state) {
   else if (!state.paired) { dot.className = 'dot warn'; $('connText').textContent = 'Chưa ghép nối'; }
   else { dot.className = 'dot ok'; $('connText').textContent = 'Đã kết nối'; }
 
+  const groups = state.groups || [];
+  const short = state.short || [];
+  $('note').hidden = !state.note;
+  $('note').textContent = state.note || '';
   const list = $('list');
   list.textContent = '';
-  $('empty').hidden = state.streams.length > 0;
-  for (const s of state.streams) {
-    const li = document.createElement('li');
-    li.className = 'item';
-    const badge = document.createElement('span');
-    badge.className = `badge ${s.type}`;
-    badge.textContent = s.type.toUpperCase();
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    const name = document.createElement('div');
-    name.className = 'name'; name.textContent = fileName(s.url); name.title = s.url;
-    const sub = document.createElement('div');
-    sub.className = 'sub';
-    sub.textContent = [host(s.url), size(s.sizeHint), ago(s.detectedAt)].filter(Boolean).join(' · ');
-    meta.append(name, sub);
-    const actions = document.createElement('div');
-    actions.className = 'actions';
-    const btn = document.createElement('button');
-    btn.className = 'dl'; btn.textContent = 'Tải bằng ViSUBLY';
-    const status = document.createElement('span');
-    status.className = 'status';
-    btn.addEventListener('click', async () => {
-      btn.disabled = true; status.className = 'status'; status.textContent = 'Đang gửi...';
-      const r = await send({ type: 'send', tabId, streamId: s.id });
-      btn.disabled = false;
-      status.className = `status ${r && r.ok ? 'ok' : 'bad'}`;
-      status.textContent = r && r.ok ? '✓ Đã gửi' : (r && r.error) || 'Lỗi';
-      if (r && r.code === 'not-paired') refresh();
-    });
-    actions.append(btn, status);
-    li.append(badge, meta, actions);
-    list.append(li);
-  }
+  for (const g of groups) list.append(card(g));
+  $('empty').hidden = groups.length + short.length > 0;
+  if (!groups.length && short.length) { $('empty').hidden = false; $('empty').textContent = 'Chỉ thấy video ngắn hoặc video xem trước trên trang này.'; }
+  else $('empty').textContent = 'Chưa thấy video nào. Hãy bấm phát video trên trang.';
+  $('shortBox').hidden = !short.length;
+  $('shortCount').textContent = String(short.length);
+  const sl = $('shortList');
+  sl.textContent = '';
+  for (const g of short) sl.append(shortRow(g));
 }
+function rerender() { if (lastState) render(lastState); }
 
 async function refresh() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   tabId = tab ? tab.id : null;
-  const state = tabId == null ? { streams: [], running: false, paired: false } : await send({ type: 'getState', tabId });
-  render(state);
+  const state = tabId == null ? { groups: [], short: [], running: false, paired: false } : await send({ type: 'getState', tabId });
+  render(state || { groups: [], short: [], running: false, paired: false });
 }
+
+// Probe results arrive one by one; re-read the state when the background says so.
+let refreshTimer = 0;
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'tabState' || msg.tabId !== tabId) return;
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refresh, 150);
+});
 
 $('pairBtn').addEventListener('click', async () => {
   const code = $('code').value.trim();

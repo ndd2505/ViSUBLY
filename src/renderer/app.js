@@ -83,7 +83,8 @@ const desktop = window.visublyDesktop || {
 
 const root = document.getElementById("app-root");
 const folderPageSize = 120;
-const playerControlsIdleMs = 8000;
+const playerControlsIdleMs = 2500;
+const playerPrefsKey = "visubly.player.prefs";
 
 const qualities = [
   { id: "2160", label: "2160p", note: "4K · HEVC · 3.4 GB" },
@@ -137,28 +138,6 @@ const flaggedSegments = [
   }
 ];
 
-const sampleSrt = `1
-00:00:02,000 --> 00:00:06,200
-Bình tĩnh nào ông tướng, làm gì căng vậy.
-
-2
-00:00:07,400 --> 00:00:11,600
-Mọi thứ rối tinh rối mù hết rồi, phải không?
-
-3
-00:00:13,000 --> 00:00:17,500
-Thôi, tao đi cái đã.
-
-4
-00:00:19,000 --> 00:00:23,400
-Cậu ấy đang bắt nhầm hướng rồi.
-
-5
-00:00:25,000 --> 00:00:30,400
-Xong xuôi rồi đó, dễ như húp cháo!`;
-
-const sampleCues = parseSrt(sampleSrt);
-
 const state = {
   screen: "home",
   intro: true,
@@ -199,7 +178,9 @@ const state = {
     videoUrl: "",
     displayName: "",
     srtPath: "",
-    cues: sampleCues,
+    cues: [],
+    subtitleNotice: "",
+    mediaError: null,
     sourceToken: 0,
     currentTime: 0,
     duration: 0,
@@ -250,6 +231,16 @@ let folderThumbTimer = null;
 let folderRenderTimer = null;
 let downloadRenderTimer = null;
 let playerControlsIdleTimer = null;
+let playerControlsHidden = false;
+let playerScrubbing = false;
+let playerScrubFrame = 0;
+let playerScrubPendingTime = null;
+let playerKeyboardModality = false;
+let playerLastPointer = { x: -1, y: -1 };
+let playerFolderCenteredPath = "";
+let reuseMainPlayerVideo = false;
+let lastRenderedScreen = "";
+let lastRenderedModalKey = "";
 let folderThumbActive = 0;
 let folderThumbQueue = [];
 const maxFolderThumbLoads = 1;
@@ -280,7 +271,12 @@ function icon(name) {
     theater: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 6v12"/><path d="M17 6v12"/><path d="M7 10h10"/><path d="M7 14h10"/>',
     fullscreen: '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
     fullscreenExit: '<path d="M9 3v4a2 2 0 0 1-2 2H3"/><path d="M15 3v4a2 2 0 0 0 2 2h4"/><path d="M9 21v-4a2 2 0 0 0-2-2H3"/><path d="M15 21v-4a2 2 0 0 1 2-2h4"/>',
-    minus: '<path d="M5 12h14"/>'
+    minus: '<path d="M5 12h14"/>',
+    pause: '<rect x="6.5" y="5" width="3.5" height="14" rx="1"/><rect x="14" y="5" width="3.5" height="14" rx="1"/>',
+    rewind: '<path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5v4.6h4.6"/>',
+    forward: '<path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5v4.6h-4.6"/>',
+    skipPrev: '<path d="M6 5v14"/><path d="M19 5 9 12l10 7z"/>',
+    skipNext: '<path d="M18 5v14"/><path d="M5 5l10 7-10 7z"/>'
   };
   return `<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.home}</svg>`;
 }
@@ -326,8 +322,21 @@ function titleForScreen() {
 }
 
 function render(options = {}) {
-  const scrollSnapshot = options.preserveScroll ? captureScrollSnapshot() : [];
-  root.innerHTML = `
+  // While the player stage is fullscreen, replacing root.innerHTML would remove the
+  // fullscreen element and kick the user out of fullscreen. Patch the stage instead.
+  if (renderPlayerWhileFullscreen()) return;
+
+  const samePlayerScreen = state.screen === "player" && lastRenderedScreen === "player";
+  const preserveScroll = options.preserveScroll ?? samePlayerScreen;
+  const scrollSnapshot = preserveScroll ? captureScrollSnapshot() : [];
+  const folderListMemory = samePlayerScreen ? capturePlayerFolderListScroll() : null;
+  // Keep the playing <video> element alive across re-renders: re-inserting it in the
+  // same task keeps decoding/playback going instead of reloading the file.
+  const keptVideo = takeReusableMainPlayerVideo();
+  reuseMainPlayerVideo = Boolean(keptVideo);
+  let html = "";
+  try {
+    html = `
     <div class="shell">
       ${renderTitlebar()}
       <div class="app">
@@ -338,8 +347,42 @@ function render(options = {}) {
       ${renderRemoteModal()}
     </div>
   `;
-  attachDynamicHandlers();
-  if (scrollSnapshot.length) restoreScrollSnapshot(scrollSnapshot);
+  } finally {
+    reuseMainPlayerVideo = false;
+  }
+  root.innerHTML = html;
+  if (keptVideo) root.querySelector("[data-main-video-slot]")?.replaceWith(keptVideo);
+  lastRenderedScreen = state.screen;
+  lastRenderedModalKey = remoteModalKey();
+  attachDynamicHandlers({ folderListMemory });
+  if (scrollSnapshot.length) restoreScrollSnapshot(scrollSnapshot, { immediate: samePlayerScreen });
+}
+
+function remoteModalKey() {
+  if (state.remote.pairingActive && state.remote.pairingPin) return `pin:${state.remote.pairingPin}`;
+  if (state.remote.qrUrl || state.remote.loading) return "qr";
+  return "";
+}
+
+function takeReusableMainPlayerVideo() {
+  if (state.screen !== "player" || !state.player.videoUrl) return null;
+  const video = document.getElementById("mainPlayerVideo");
+  if (!video) return null;
+  if (video.dataset.sourceToken !== String(state.player.sourceToken)) return null;
+  if (video.dataset.videoUrl !== state.player.videoUrl) return null;
+  return video;
+}
+
+function renderPlayerWhileFullscreen() {
+  if (state.screen !== "player" || !isPlayerStageFullscreen()) return false;
+  const modalKey = remoteModalKey();
+  if (modalKey && modalKey !== lastRenderedModalKey) {
+    // A pairing PIN / QR modal must be visible: leave fullscreen, the
+    // fullscreenchange handler then runs the full render.
+    exitDocumentFullscreen().catch(() => {});
+  }
+  patchPlayerStage();
+  return true;
 }
 
 function captureScrollSnapshot() {
@@ -349,7 +392,6 @@ function captureScrollSnapshot() {
     ".running-list",
     ".queue-list",
     ".download-terminal",
-    ".player-folder-list",
     ".player-transcript",
     ".folder-screen"
   ];
@@ -367,15 +409,18 @@ function captureScrollSnapshot() {
     .filter(Boolean);
 }
 
-function restoreScrollSnapshot(snapshot) {
-  window.requestAnimationFrame(() => {
+function restoreScrollSnapshot(snapshot, options = {}) {
+  const apply = () => {
     snapshot.forEach(({ selector, left, top }) => {
       const element = document.querySelector(selector);
       if (!element) return;
       element.scrollLeft = left;
       element.scrollTop = top;
     });
-  });
+  };
+  // Same-screen player renders restore synchronously so the page never flashes to the top.
+  if (options.immediate) apply();
+  window.requestAnimationFrame(apply);
 }
 
 function renderRemoteModal() {
@@ -590,7 +635,9 @@ function stat(label, value, color) {
 }
 
 function renderMediaThumb(label, clipStart = 0, clipEnd = 6, classes = "") {
-  const cue = state.player.cues.find((item) => item.start >= clipStart) || state.player.cues[0];
+  // Only ever preview real subtitle lines; never demo text.
+  const cues = hasRealSubtitleTrack() ? state.player.cues : [];
+  const cue = cues.find((item) => item.start >= clipStart) || cues[0];
   const subtitle = cue?.text || "Hover preview";
   if (!state.player.videoUrl) {
     return `
@@ -1076,27 +1123,37 @@ function renderPlayer() {
   `;
 }
 
-function renderPlayerStudio() {
+function playerViewModel() {
   const p = state.player;
-  const hasSubtitles = hasRealSubtitleTrack();
-  const cues = hasSubtitles ? p.cues : [];
-  const subtitleText = hasSubtitles ? activeSubtitleText(p.currentTime) : "";
-  const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
-  const visibleVolume = p.muted ? 0 : p.volume;
-  const fullscreenActive = isDocumentFullscreen();
-  state.player.fullscreen = fullscreenActive;
-  const videoName = p.displayName || (p.videoPath ? pathBaseName(p.videoPath) : "No MP4 selected");
-  const srtName = p.srtPath ? pathBaseName(p.srtPath) : "";
-  const folderVideoIndex = currentFolderVideoIndex();
-  const showFolderPanel = folderVideoIndex >= 0 && !p.theater && !fullscreenActive;
-  const showFolderRail = folderVideoIndex >= 0;
-  const overlayClasses = [
-    "subtitle-overlay",
-    "visubly-subtitle",
-    p.style.background ? "with-bg" : "",
-    p.style.outline ? "with-outline" : ""
+  const fullscreen = isPlayerStageFullscreen();
+  p.fullscreen = fullscreen;
+  const hasVideo = Boolean(p.videoUrl);
+  const folderIndex = currentFolderVideoIndex();
+  return {
+    p,
+    hasVideo,
+    fullscreen,
+    overlay: hasVideo && (fullscreen || p.theater),
+    hasSubtitles: hasRealSubtitleTrack(),
+    videoName: p.displayName || (p.videoPath ? pathBaseName(p.videoPath) : "No video selected"),
+    srtName: p.srtPath ? pathBaseName(p.srtPath) : "",
+    folderIndex,
+    folderCount: state.folder.videos.length,
+    showFolderPanel: folderIndex >= 0 && !p.theater && !fullscreen,
+    showFolderRail: folderIndex >= 0
+  };
+}
+
+function renderPlayerStudio() {
+  const m = playerViewModel();
+  const p = m.p;
+  const cues = m.hasSubtitles ? p.cues : [];
+  const layoutClasses = [
+    "player-layout",
+    m.hasSubtitles && !m.showFolderPanel ? "" : "no-transcript",
+    m.showFolderPanel ? "has-folder-panel" : "",
+    p.theater ? "theater" : ""
   ].filter(Boolean).join(" ");
-  const overlayStyle = `--subtitle-font-size:${p.style.fontSize}px;--subtitle-bottom:${p.style.bottom}px`;
 
   return `
     <section class="screen player-screen ${p.theater ? "is-theater" : ""}">
@@ -1106,52 +1163,21 @@ function renderPlayerStudio() {
           <h1 class="h1">Player studio</h1>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;align-items:center">
-          ${folderVideoIndex >= 0 ? btn("Back to folder", "back-to-folder-context", "", "folder") : ""}
-          ${folderVideoIndex >= 0 ? `<span class="player-now-playing" title="${escapeAttr(videoName)}"><span>Playing</span><strong>${escapeHtml(videoName)}</strong></span>` : ""}
+          ${m.folderIndex >= 0 ? btn("Back to folder", "back-to-folder-context", "", "folder") : ""}
+          ${m.folderIndex >= 0 ? `<span class="player-now-playing" title="${escapeAttr(m.videoName)}"><span>Playing</span><strong>${escapeHtml(m.videoName)}</strong></span>` : ""}
           ${btn("Choose MP4", "choose-video", "primary", "folder")}
           ${btn("Load SRT", "choose-srt", "", "captions")}
           ${btn("VI", "player-vi", state.playerMode === "vi" ? "lime" : "")}
           ${btn("EN", "player-en", state.playerMode === "en" ? "lime" : "")}
         </div>
       </div>
-      <div class="player-layout ${hasSubtitles && !showFolderPanel ? "" : "no-transcript"} ${showFolderPanel ? "has-folder-panel" : ""} ${p.theater ? "theater" : ""}">
+      <div class="${layoutClasses}">
         <div class="player-workbench" data-player-workbench>
-          <div class="player-frame ${p.videoUrl ? "has-video" : ""}" data-player-drop>
-            ${p.videoUrl ? `<video id="mainPlayerVideo" class="main-player-video" src="${escapeAttr(p.videoUrl)}" data-source-token="${p.sourceToken}" playsinline preload="metadata"></video>` : `
-              <div class="player-empty">
-                <span class="play-dot">${icon("play")}</span>
-                <h3 class="h3">Choose an MP4 to preview subtitles</h3>
-                <div class="muted">Drop an MP4 here to play, or drop SRT to load captions.</div>
-              </div>
-            `}
-            ${p.videoUrl ? `<div class="player-frame-title" title="${escapeAttr(videoName)}"><span>Playing</span><strong>${escapeHtml(videoName)}</strong></div>` : ""}
-            ${hasSubtitles && p.subtitleOn ? `<div class="${overlayClasses} ${subtitleText ? "" : "is-empty"}" style="${overlayStyle}"><span class="main-subtitle-text">${escapeHtml(subtitleText)}</span></div>` : ""}
-            ${showFolderRail ? renderPlayerFolderRail(folderVideoIndex) : ""}
-          </div>
+          ${renderPlayerStage(m)}
 
-          <div class="player-console">
-            <button class="btn icon" data-action="seek-back" title="Back 5 seconds" ${p.videoUrl ? "" : "disabled"}>${icon("arrowL")}</button>
-            <button class="btn icon primary" data-action="toggle-player" title="${p.playing ? "Pause" : "Play"}" ${p.videoUrl ? "" : "disabled"}>${icon(p.playing ? "minus" : "play")}</button>
-            <button class="btn icon" data-action="seek-forward" title="Forward 5 seconds" ${p.videoUrl ? "" : "disabled"}>${icon("arrowR")}</button>
-            <div class="volume-control">
-              <button class="btn icon ${p.muted ? "danger" : ""}" data-action="toggle-mute" title="${p.muted ? "Unmute" : "Mute"}" aria-pressed="${p.muted ? "true" : "false"}" ${p.videoUrl ? "" : "disabled"}>${icon(p.muted ? "volumeOff" : "volume")}</button>
-              <input class="volume-slider" data-volume-slider type="range" min="0" max="1" step="0.01" value="${visibleVolume}" style="--volume-level:${visibleVolume * 100}%" aria-label="Volume" ${p.videoUrl ? "" : "disabled"}>
-              <span class="volume-value mono">${Math.round(visibleVolume * 100)}%</span>
-            </div>
-            <div class="player-scrubber" data-player-scrubber role="slider" aria-label="Video timeline" aria-valuetext="${formatClock(p.currentTime)} of ${formatClock(p.duration)}">
-              <div class="player-scrubber-fill" data-player-scrubber-fill style="width:${progress}%"></div>
-              <span class="player-scrubber-tooltip mono" data-player-scrubber-tooltip>${formatHoverClock(p.currentTime)}</span>
-            </div>
-            <span class="player-time mono">${formatClock(p.currentTime)} / ${formatClock(p.duration)}</span>
-            <div class="player-view-actions">
-              <button class="btn icon ${p.theater ? "lime" : ""}" data-action="toggle-theater" title="${p.theater ? "Exit theater mode" : "Theater mode"}" aria-label="${p.theater ? "Exit theater mode" : "Theater mode"}" aria-pressed="${p.theater ? "true" : "false"}" ${p.videoUrl ? "" : "disabled"}>${icon("theater")}</button>
-              <button class="btn icon ${fullscreenActive ? "lime" : ""}" data-action="toggle-fullscreen" title="${fullscreenActive ? "Exit fullscreen" : "Fullscreen"}" aria-label="${fullscreenActive ? "Exit fullscreen" : "Fullscreen"}" aria-pressed="${fullscreenActive ? "true" : "false"}" ${p.videoUrl ? "" : "disabled"}>${icon(fullscreenActive ? "fullscreenExit" : "fullscreen")}</button>
-            </div>
-          </div>
+          ${renderPlayerMediaSummary(m.videoName, m.srtName, m.hasSubtitles, m.showFolderPanel)}
 
-          ${renderPlayerMediaSummary(videoName, srtName, hasSubtitles, showFolderPanel)}
-
-          ${hasSubtitles ? `<div class="player-style-panel">
+          ${m.hasSubtitles ? `<div class="player-style-panel">
             <div>
               <div class="mono muted">SUBTITLE STYLE</div>
               <h3 class="h3">Sticker caption</h3>
@@ -1167,15 +1193,15 @@ function renderPlayerStudio() {
             </div>
           </div>` : ""}
         </div>
-        ${showFolderPanel ? renderPlayerFolderSidebar(folderVideoIndex) : ""}
-        ${hasSubtitles && !showFolderPanel ? `<aside class="player-transcript">
+        ${m.showFolderPanel ? renderPlayerFolderSidebar(m.folderIndex) : ""}
+        ${m.hasSubtitles && !m.showFolderPanel ? `<aside class="player-transcript">
           <div class="mini-row" style="justify-content:space-between">
             <h3 class="h3">Transcript</h3>
             <span class="badge" style="background:var(--mint)">${cues.length} cues</span>
           </div>
           <div class="queue-list">
             ${cues.map((cue, index) => `
-              <button class="subtitle-line transcript-line ${p.currentTime >= cue.start && p.currentTime <= cue.end ? "active" : ""}" data-action="seek-cue" data-time="${cue.start}" data-cue-index="${index}" data-cue-start="${cue.start}" data-cue-end="${cue.end}">
+              <button class="subtitle-line transcript-line ${isCueActive(cue, p.currentTime) ? "active" : ""}" data-action="seek-cue" data-time="${cue.start}" data-cue-index="${index}" data-cue-start="${cue.start}" data-cue-end="${cue.end}">
                 <div class="mono muted">${formatClock(cue.start)} · ${formatClock(cue.end)}</div>
                 <strong>${escapeHtml(cue.text)}</strong>
               </button>
@@ -1187,8 +1213,142 @@ function renderPlayerStudio() {
   `;
 }
 
+function playerStageClasses(m) {
+  return [
+    "player-stage",
+    m.overlay ? "is-overlay" : "",
+    m.fullscreen ? "is-fullscreen" : "",
+    // Re-renders must not pop the hidden overlay bar back up mid-playback.
+    m.overlay && playerControlsHidden && m.p.playing ? "is-controls-idle" : ""
+  ].filter(Boolean).join(" ");
+}
+
+function playerFrameClasses(m) {
+  return ["player-frame", m.hasVideo ? "has-video" : ""].filter(Boolean).join(" ");
+}
+
+// The stage is the fullscreen target: video frame + overlays + control bar only.
+function renderPlayerStage(m) {
+  return `
+    <div class="${playerStageClasses(m)}" data-player-stage>
+      <div class="${playerFrameClasses(m)}" data-player-drop>
+        ${renderPlayerVideoElement(m)}
+        ${renderPlayerFrameLayer(m)}
+      </div>
+      ${renderPlayerConsole(m)}
+    </div>
+  `;
+}
+
+function renderPlayerVideoElement(m) {
+  const p = m.p;
+  if (!m.hasVideo) {
+    return `
+      <div class="player-empty">
+        <span class="play-dot">${icon("play")}</span>
+        <h3 class="h3">Choose an MP4 to preview subtitles</h3>
+        <div class="muted">Drop an MP4 here to play, or drop SRT to load captions.</div>
+      </div>
+    `;
+  }
+  if (reuseMainPlayerVideo) return `<span data-main-video-slot hidden></span>`;
+  return `<video id="mainPlayerVideo" class="main-player-video" src="${escapeAttr(p.videoUrl)}" data-source-token="${p.sourceToken}" data-video-url="${escapeAttr(p.videoUrl)}" playsinline preload="metadata"></video>`;
+}
+
+function renderPlayerFrameLayer(m) {
+  const p = m.p;
+  const subtitleText = m.hasSubtitles ? activeSubtitleText(p.currentTime) : "";
+  const overlayClasses = [
+    "subtitle-overlay",
+    "visubly-subtitle",
+    p.style.background ? "with-bg" : "",
+    p.style.outline ? "with-outline" : "",
+    subtitleText ? "" : "is-empty"
+  ].filter(Boolean).join(" ");
+  const overlayStyle = `--subtitle-font-size:${p.style.fontSize}px;--subtitle-bottom:${p.style.bottom}px`;
+  const titleLabel = m.folderIndex >= 0 ? `Playing · ${m.folderIndex + 1}/${m.folderCount}` : "Playing";
+
+  return `
+    <div class="player-frame-layer" data-player-layer>
+      ${m.hasVideo ? `<div class="player-frame-title" title="${escapeAttr(m.videoName)}"><span>${escapeHtml(titleLabel)}</span><strong>${escapeHtml(m.videoName)}</strong></div>` : ""}
+      ${m.hasSubtitles && p.subtitleOn ? `<div class="${overlayClasses}" style="${overlayStyle}"><span class="main-subtitle-text">${escapeHtml(subtitleText)}</span></div>` : ""}
+      ${m.hasVideo && p.mediaError ? renderPlayerMediaError(m) : ""}
+      ${m.showFolderRail ? renderPlayerFolderRail(m.folderIndex) : ""}
+    </div>
+  `;
+}
+
+function playerControlButton(action, iconName, label, options = {}) {
+  const classes = ["btn", "icon", options.className || ""].filter(Boolean).join(" ");
+  const pressed = typeof options.pressed === "boolean" ? ` aria-pressed="${options.pressed ? "true" : "false"}"` : "";
+  return `<button class="${classes}" type="button" data-action="${action}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}"${pressed} ${options.disabled ? "disabled" : ""}>${icon(iconName)}</button>`;
+}
+
+function renderPlayerConsole(m) {
+  const p = m.p;
+  const noVideo = !m.hasVideo;
+  const visibleVolume = p.muted ? 0 : p.volume;
+  const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
+  const inFolder = m.folderIndex >= 0;
+  const hasPrev = inFolder && m.folderIndex > 0;
+  const hasNext = inFolder && m.folderIndex < m.folderCount - 1;
+  const fullscreenLabel = m.fullscreen ? "Exit fullscreen (F)" : "Fullscreen (F)";
+  const theaterLabel = p.theater ? "Exit theater mode (T)" : "Theater mode (T)";
+
+  return `
+    <div class="player-console" data-player-console role="group" aria-label="Player controls">
+      <div class="player-transport">
+        ${inFolder ? playerControlButton("player-prev", "skipPrev", "Previous video (Shift+P)", { disabled: !hasPrev }) : ""}
+        ${playerControlButton("seek-back", "rewind", "Back 5 seconds (Left arrow)", { disabled: noVideo })}
+        ${playerControlButton("toggle-player", p.playing ? "pause" : "play", p.playing ? "Pause (Space)" : "Play (Space)", { disabled: noVideo, className: "primary player-play" })}
+        ${playerControlButton("seek-forward", "forward", "Forward 5 seconds (Right arrow)", { disabled: noVideo })}
+        ${inFolder ? playerControlButton("player-next", "skipNext", "Next video (Shift+N)", { disabled: !hasNext }) : ""}
+      </div>
+      <div class="volume-control">
+        ${playerControlButton("toggle-mute", p.muted ? "volumeOff" : "volume", p.muted ? "Unmute (M)" : "Mute (M)", { disabled: noVideo, pressed: p.muted, className: p.muted ? "danger" : "" })}
+        <input class="volume-slider" data-volume-slider type="range" min="0" max="1" step="0.01" value="${visibleVolume}" style="--volume-level:${visibleVolume * 100}%" aria-label="Volume" aria-valuetext="${Math.round(visibleVolume * 100)}%" ${noVideo ? "disabled" : ""}>
+        <span class="volume-value mono">${Math.round(visibleVolume * 100)}%</span>
+      </div>
+      <div class="player-scrubber" data-player-scrubber role="slider" tabindex="${noVideo ? "-1" : "0"}" aria-label="Seek" aria-valuemin="0" aria-valuemax="${Math.round(p.duration || 0)}" aria-valuenow="${Math.round(p.currentTime || 0)}" aria-valuetext="${formatClock(p.currentTime)} of ${formatClock(p.duration)}">
+        <div class="player-scrubber-fill" data-player-scrubber-fill style="width:${progress}%"></div>
+        <span class="player-scrubber-tooltip mono" data-player-scrubber-tooltip>${formatHoverClock(p.currentTime)}</span>
+      </div>
+      <span class="player-time mono">${formatClock(p.currentTime)} / ${formatClock(p.duration)}</span>
+      <div class="player-view-actions">
+        ${m.hasSubtitles ? playerControlButton("subtitle-toggle", "captions", p.subtitleOn ? "Hide subtitles" : "Show subtitles", { pressed: p.subtitleOn, className: p.subtitleOn ? "lime" : "" }) : ""}
+        ${m.fullscreen ? "" : playerControlButton("toggle-theater", "theater", theaterLabel, { disabled: noVideo, pressed: p.theater, className: p.theater ? "lime" : "" })}
+        ${playerControlButton("toggle-fullscreen", m.fullscreen ? "fullscreenExit" : "fullscreen", fullscreenLabel, { disabled: noVideo, pressed: m.fullscreen, className: m.fullscreen ? "lime" : "" })}
+      </div>
+    </div>
+  `;
+}
+
+function renderPlayerMediaError(m) {
+  const error = m.p.mediaError;
+  const canOpenExternally = typeof desktop.openInSystemPlayer === "function";
+  const hasNext = m.folderIndex >= 0 && m.folderIndex < m.folderCount - 1;
+  const isWarning = error.kind === "warning";
+  return `
+    <div class="player-error ${isWarning ? "is-warning" : ""}" role="alert">
+      <div class="player-error-card">
+        <span class="player-error-icon">${icon(isWarning ? "video" : "x")}</span>
+        <strong>${escapeHtml(error.title)}</strong>
+        <p>${escapeHtml(error.detail)}</p>
+        ${error.technical ? `<code class="player-error-tech mono">${escapeHtml(error.technical)}</code>` : ""}
+        <div class="player-error-actions">
+          ${canOpenExternally ? btn("Open in system player", "open-video-externally", "primary", "play") : ""}
+          ${hasNext ? btn("Next video", "player-next", "", "skipNext") : ""}
+          ${btn("Choose another", "choose-video", canOpenExternally ? "" : "primary", "folder")}
+          ${isWarning ? btn("Dismiss", "dismiss-media-error", "ghost", "x") : ""}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderPlayerMediaSummary(videoName, srtName, hasSubtitles, compact = false) {
   const classes = ["player-meta-grid", hasSubtitles ? "" : "single", compact ? "compact" : ""].filter(Boolean).join(" ");
+  const notice = state.player.subtitleNotice;
   return `
     <div class="${classes}">
       <div class="queue-item">
@@ -1199,6 +1359,7 @@ function renderPlayerMediaSummary(videoName, srtName, hasSubtitles, compact = fa
         <div class="mono muted">SUBTITLE</div>
         <strong title="${escapeAttr(srtName)}">${escapeHtml(srtName)}</strong>
       </div>` : ""}
+      ${notice ? `<div class="player-notice" role="status">${escapeHtml(notice)}</div>` : ""}
     </div>
   `;
 }
@@ -1221,7 +1382,7 @@ function renderPlayerFolderRail(activeIndex = currentFolderVideoIndex()) {
           </div>
           ${btn("Back", "back-to-folder-context", "ghost", "arrowL")}
         </div>
-        <div class="player-folder-list" data-player-folder-list>
+        <div class="player-folder-list" data-player-folder-list="rail">
           ${renderPlayerFolderListItems(activeIndex)}
         </div>
       </div>
@@ -1241,7 +1402,7 @@ function renderPlayerFolderSidebar(activeIndex = currentFolderVideoIndex()) {
         </div>
         <span class="badge" style="background:var(--lime)">${state.folder.videos.length}</span>
       </div>
-      <div class="player-folder-list" data-player-folder-list>
+      <div class="player-folder-list" data-player-folder-list="sidebar">
         ${renderPlayerFolderListItems(activeIndex)}
       </div>
     </aside>
@@ -1517,7 +1678,7 @@ function screenHeader(eyebrow, title, meta, backScreen) {
   `;
 }
 
-function attachDynamicHandlers() {
+function attachDynamicHandlers(options = {}) {
   const drop = document.getElementById("dropZone");
   if (drop) {
     drop.addEventListener("dragover", (event) => {
@@ -1535,10 +1696,10 @@ function attachDynamicHandlers() {
       }
     });
   }
-  attachPlayerDropTarget();
+  attachPlayerStage();
   attachMainPlayer();
-  attachPlayerControlActivity();
-  attachPlayerFolderRail();
+  attachPlayerFolderRail(options.folderListMemory || null);
+  syncPlayerControlsVisibility();
   attachMiniPlayers();
   if (state.screen === "folder") {
     scheduleFolderThumbs();
@@ -1565,18 +1726,39 @@ function cancelFolderThumbs() {
   folderThumbActive = 0;
 }
 
-function attachPlayerDropTarget() {
-  const playerDrop = document.querySelector("[data-player-drop]");
+// Stage handlers use on* properties so they stay idempotent: the stage element
+// survives fullscreen patches and must not accumulate duplicate listeners.
+function attachPlayerStage() {
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage) {
+    clearPlayerControlsTimer();
+    return;
+  }
+
+  stage.onpointermove = (event) => {
+    if (event.screenX === playerLastPointer.x && event.screenY === playerLastPointer.y) return;
+    playerLastPointer = { x: event.screenX, y: event.screenY };
+    showPlayerControls();
+  };
+  stage.onpointerdown = () => showPlayerControls();
+  stage.onmouseleave = () => {
+    // Pointer left the picture (theater mode / second monitor): hide right away.
+    if (!state.player.playing || !stage.classList.contains("is-overlay") || playerScrubbing) return;
+    if (playerKeyboardModality && stage.contains(document.activeElement)) return;
+    hidePlayerControls(stage);
+  };
+
+  const playerDrop = stage.querySelector("[data-player-drop]");
   if (!playerDrop) return;
 
-  playerDrop.addEventListener("dragover", (event) => {
+  playerDrop.ondragover = (event) => {
     event.preventDefault();
     playerDrop.classList.add("dragging");
-  });
-  playerDrop.addEventListener("dragleave", (event) => {
+  };
+  playerDrop.ondragleave = (event) => {
     if (!playerDrop.contains(event.relatedTarget)) playerDrop.classList.remove("dragging");
-  });
-  playerDrop.addEventListener("drop", async (event) => {
+  };
+  playerDrop.ondrop = async (event) => {
     event.preventDefault();
     playerDrop.classList.remove("dragging");
     const file = event.dataTransfer.files?.[0];
@@ -1590,23 +1772,86 @@ function attachPlayerDropTarget() {
     }
 
     if (isVideoPath(filePath)) {
-      await loadVideoPath(filePath);
+      const token = await loadVideoPath(filePath);
+      if (token !== state.player.sourceToken) return;
       state.player.playing = true;
       render();
     }
+  };
+
+  const ignoreFrameClick = (event) => Boolean(event.target.closest("button, input, a, [data-player-folder-rail], .player-error"));
+  // Single click toggles playback, double click toggles fullscreen (the two
+  // single clicks cancel each other out, like most desktop players).
+  playerDrop.onclick = (event) => {
+    if (!state.player.videoUrl || ignoreFrameClick(event)) return;
+    toggleMainPlayer();
+    showPlayerControls();
+  };
+  playerDrop.ondblclick = (event) => {
+    if (!state.player.videoUrl || ignoreFrameClick(event)) return;
+    togglePlayerFullscreen();
+  };
+}
+
+function capturePlayerFolderListScroll() {
+  const scroll = {};
+  document.querySelectorAll("[data-player-folder-list]").forEach((list) => {
+    if (list.clientHeight) scroll[list.dataset.playerFolderList] = list.scrollTop;
+  });
+  return { path: playerFolderCenteredPath, scroll };
+}
+
+// Keep the active playlist item visible by scrolling only the list itself;
+// scrollIntoView() would also scroll the page and the overflow-hidden frame.
+function attachPlayerFolderRail(memory = null) {
+  if (state.screen !== "player" || !document.querySelector("[data-player-folder-list]")) return;
+  const activePath = state.player.videoPath;
+  window.requestAnimationFrame(() => {
+    document.querySelectorAll("[data-player-folder-list]").forEach((list) => {
+      if (!list.clientHeight) return;
+      const key = list.dataset.playerFolderList;
+      const remembered = memory?.scroll?.[key];
+      if (memory?.path && sameLocalPath(memory.path, activePath) && Number.isFinite(remembered)) {
+        list.scrollTop = remembered;
+        return;
+      }
+      const active = list.querySelector(".player-folder-item.active");
+      if (active) scrollChildIntoContainer(list, active);
+    });
+    playerFolderCenteredPath = activePath;
   });
 }
 
-function attachPlayerFolderRail() {
-  if (state.screen !== "player") return;
-  const pairs = [...document.querySelectorAll("[data-player-folder-list]")]
-    .map((list) => ({ list, active: list.querySelector(".player-folder-item.active") }))
-    .filter((entry) => entry.active);
-  if (!pairs.length) return;
+function scrollChildIntoContainer(container, child, behavior = "auto") {
+  if (!container || !child || !container.clientHeight) return;
+  const containerRect = container.getBoundingClientRect();
+  const childRect = child.getBoundingClientRect();
+  const offset = childRect.top - containerRect.top - container.clientTop + container.scrollTop;
+  const target = Math.max(0, offset - (container.clientHeight - childRect.height) / 2);
+  if (Math.abs(target - container.scrollTop) < 2) return;
+  container.scrollTo({ top: target, behavior });
+}
 
-  window.requestAnimationFrame(() => {
-    pairs.forEach(({ active }) => active.scrollIntoView({ block: "center" }));
-  });
+function patchPlayerStage() {
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage) return;
+  const m = playerViewModel();
+  const active = document.activeElement;
+  const focusedAction = active && stage.contains(active) ? active.closest?.("[data-action]")?.dataset.action || "" : "";
+  const folderListMemory = capturePlayerFolderListScroll();
+
+  stage.className = playerStageClasses(m);
+  const frame = stage.querySelector("[data-player-drop]");
+  if (frame) frame.className = playerFrameClasses(m);
+  const layer = stage.querySelector("[data-player-layer]");
+  if (layer) layer.outerHTML = renderPlayerFrameLayer(m);
+  const consoleEl = stage.querySelector("[data-player-console]");
+  if (consoleEl) consoleEl.outerHTML = renderPlayerConsole(m);
+
+  attachPlayerStage();
+  attachMainPlayer();
+  attachPlayerFolderRail(folderListMemory);
+  if (focusedAction) stage.querySelector(`[data-action="${focusedAction}"]`)?.focus({ preventScroll: true });
 }
 
 function scrollPendingFolderVideoIntoView() {
@@ -1635,6 +1880,9 @@ document.addEventListener("click", async (event) => {
   const actionEl = event.target.closest("[data-action]");
   if (!actionEl) return;
   const action = actionEl.dataset.action;
+  // A mouse click must not leave focus on a player control, otherwise Space would
+  // re-activate that button instead of toggling playback. Keyboard clicks keep focus.
+  if (event.detail > 0 && actionEl.closest("[data-player-stage]")) actionEl.blur();
 
   if (action === "minimize") return desktop.minimize();
   if (action === "maximize") return desktop.toggleMaximize();
@@ -1666,7 +1914,7 @@ document.addEventListener("click", async (event) => {
   if (action === "copy-remote-link") {
     if (state.remote.testUrl) {
       navigator.clipboard.writeText(state.remote.testUrl);
-      const b = e.target.closest("button");
+      const b = actionEl.closest("button");
       if (b) {
         const old = b.innerHTML;
         b.innerHTML = "Đã Copy!";
@@ -1847,35 +2095,15 @@ document.addEventListener("click", async (event) => {
     return render();
   }
   if (action === "open-folder-video") {
-    const video = state.folder.videos[Number(actionEl.dataset.videoIndex)];
-    const videoPath = video?.path || actionEl.dataset.videoPath;
-    if (!videoPath) return;
-    const wasPlayer = state.screen === "player";
-    const wasFullscreen = wasPlayer && isPlayerWorkbenchFullscreen();
-    const videoIndex = Number(actionEl.dataset.videoIndex);
-    await loadVideoPath(videoPath, {
-      displayName: video?.name || "",
-      subtitlePath: video?.subtitlePath || "",
-      updatePlayerElement: wasFullscreen,
-      folderContext: {
-        folderPath: state.folder.path,
-        videoIndex,
-        videoPath,
-        groupName: video?.groupName || "Other"
-      }
-    });
-    state.player.playing = true;
-    if (wasFullscreen) {
-      syncMainPlayerVideoElement(state.player.sourceToken, { autoplay: true });
-      updatePlayerFolderSelection(videoIndex);
-      return;
-    }
-    if (wasPlayer) {
-      render();
-      return;
-    }
-    return setScreen("player");
+    return openFolderVideo(Number(actionEl.dataset.videoIndex), actionEl.dataset.videoPath || "");
   }
+  if (action === "player-prev") return stepFolderVideo(-1);
+  if (action === "player-next") return stepFolderVideo(1);
+  if (action === "dismiss-media-error") {
+    state.player.mediaError = null;
+    return render();
+  }
+  if (action === "open-video-externally") return openVideoExternally();
   if (action === "back-to-folder-context") {
     const index = currentFolderVideoIndex();
     if (index >= 0) {
@@ -1939,8 +2167,8 @@ document.addEventListener("click", async (event) => {
   if (action === "open-player") return setScreen("player");
   if (action === "toggle-player") return toggleMainPlayer();
   if (action === "toggle-mute") return toggleMainMute();
-  if (action === "seek-back") return seekMainPlayer(state.player.currentTime - 5);
-  if (action === "seek-forward") return seekMainPlayer(state.player.currentTime + 5);
+  if (action === "seek-back") return seekMainPlayerBy(-5);
+  if (action === "seek-forward") return seekMainPlayerBy(5);
   if (action === "toggle-theater") return toggleTheaterMode();
   if (action === "toggle-fullscreen") return togglePlayerFullscreen();
   if (action === "subtitle-toggle") {
@@ -1998,42 +2226,11 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Tab") playerKeyboardModality = true;
+  if (handlePlayerShortcut(event)) return;
+
   const tag = document.activeElement?.tagName;
   if (tag === "TEXTAREA" || tag === "INPUT") return;
-
-  if (state.screen === "player") {
-    if (event.key === " " || event.key === "Spacebar") {
-      event.preventDefault();
-      toggleMainPlayer();
-      return;
-    }
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      seekMainPlayer(state.player.currentTime - 5);
-      return;
-    }
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      seekMainPlayer(state.player.currentTime + 5);
-      return;
-    }
-    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-      if (!state.player.videoUrl) return;
-      event.preventDefault();
-      adjustMainPlayerVolume(event.key === "ArrowUp" ? 0.05 : -0.05);
-      return;
-    }
-    if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "t") {
-      event.preventDefault();
-      toggleTheaterMode();
-      return;
-    }
-    if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "f") {
-      event.preventDefault();
-      togglePlayerFullscreen();
-      return;
-    }
-  }
 
   if (state.screen !== "approve") return;
   if (event.key === "ArrowLeft" && state.approvals.cursor > 0) {
@@ -2048,9 +2245,99 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-document.addEventListener("fullscreenchange", syncFullscreenState);
-document.addEventListener("webkitfullscreenchange", syncFullscreenState);
-document.addEventListener("MSFullscreenChange", syncFullscreenState);
+document.addEventListener("pointerdown", () => {
+  playerKeyboardModality = false;
+}, true);
+
+// Safety net: if the scrubber was re-rendered mid-drag its own pointerup never fires.
+["pointerup", "pointercancel"].forEach((type) => window.addEventListener(type, () => {
+  if (!playerScrubbing) return;
+  playerScrubbing = false;
+  schedulePlayerControlsHide();
+}));
+
+document.addEventListener("focusin", (event) => {
+  if (playerKeyboardModality && event.target?.closest?.("[data-player-stage]")) showPlayerControls();
+});
+
+if ("onfullscreenchange" in document) {
+  document.addEventListener("fullscreenchange", syncFullscreenState);
+} else {
+  document.addEventListener("webkitfullscreenchange", syncFullscreenState);
+}
+
+function isTextEntryElement(element) {
+  if (!element || element === document.body) return false;
+  if (element.isContentEditable) return true;
+  const tag = element.tagName;
+  if (tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (tag !== "INPUT") return false;
+  return !["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"].includes(String(element.type || "").toLowerCase());
+}
+
+function handlePlayerShortcut(event) {
+  if (state.screen !== "player" || event.defaultPrevented) return false;
+  if (event.ctrlKey || event.metaKey || event.altKey) return false;
+  if (isTextEntryElement(event.target) || isTextEntryElement(document.activeElement)) return false;
+  if (remoteModalKey() || state.intro) return false;
+
+  const p = state.player;
+  const key = event.key;
+  const lower = key.length === 1 ? key.toLowerCase() : key;
+
+  if (key === "Escape") {
+    // Esc leaves fullscreen first (Chromium usually consumes it, this is the fallback)
+    // and theater mode only when not fullscreen, so fullscreen-from-theater lands in theater.
+    if (getFullscreenElement()) {
+      event.preventDefault();
+      exitDocumentFullscreen().catch(() => {});
+      return true;
+    }
+    if (p.theater && p.videoUrl) {
+      event.preventDefault();
+      toggleTheaterMode();
+      return true;
+    }
+    return false;
+  }
+  if (!p.videoUrl) return false;
+
+  showPlayerControls();
+  const onButton = Boolean(event.target?.closest?.("button, a[href], summary"));
+  if (key === " " || key === "Spacebar") {
+    // Keyboard users who tabbed to a control get native activation of that control.
+    if (onButton && playerKeyboardModality) return false;
+    event.preventDefault();
+    if (!event.repeat) toggleMainPlayer();
+    return true;
+  }
+  if (key === "ArrowLeft" || key === "ArrowRight") {
+    event.preventDefault();
+    seekMainPlayerBy(key === "ArrowLeft" ? -5 : 5);
+    return true;
+  }
+  if (key === "ArrowUp" || key === "ArrowDown") {
+    event.preventDefault();
+    adjustMainPlayerVolume(key === "ArrowUp" ? 0.05 : -0.05);
+    return true;
+  }
+  const toggles = {
+    m: () => toggleMainMute(),
+    f: () => togglePlayerFullscreen(),
+    t: () => toggleTheaterMode()
+  };
+  if (event.shiftKey && (lower === "n" || lower === "p")) {
+    event.preventDefault();
+    if (!event.repeat) stepFolderVideo(lower === "n" ? 1 : -1);
+    return true;
+  }
+  if (toggles[lower]) {
+    event.preventDefault();
+    if (!event.repeat) toggles[lower]();
+    return true;
+  }
+  return false;
+}
 
 function initDownloadBridge() {
   desktop.download?.onState?.((snapshot) => {
@@ -2205,7 +2492,9 @@ function startProcessingSimulation() {
     }
     p.done = p.values.every((v) => v >= 100);
     if (p.done) stopProcessingSimulation();
-    render();
+    // Progress only shows on the processing screen; re-rendering other screens every
+    // 420 ms (e.g. the player while a video plays) rebuilds their controls for nothing.
+    if (state.screen === "processing") render();
   }, 420);
 }
 
@@ -2225,49 +2514,23 @@ function chooseApproval(pick) {
   render();
 }
 
-function syncMainPlayerVideoElement(sourceToken = state.player.sourceToken, options = {}) {
-  const video = document.getElementById("mainPlayerVideo");
-  if (!video || String(sourceToken) !== String(state.player.sourceToken)) return;
-
-  video.dataset.sourceToken = String(sourceToken);
-  video.muted = state.player.muted;
-  video.volume = state.player.volume;
-  if (state.player.videoUrl && video.src !== state.player.videoUrl) {
-    video.src = state.player.videoUrl;
-    video.load();
-  }
-
-  attachMainPlayer();
-  updatePlayerUi();
-
-  if (options.autoplay) {
-    video.play().catch(() => {
-      state.player.playing = false;
-      updatePlayerUi();
-    });
-  }
-}
-
-function updatePlayerFolderSelection(activeIndex) {
-  document.querySelectorAll("[data-player-folder-item]").forEach((button) => {
-    const index = Number(button.dataset.playerFolderItem);
-    const isActive = index === activeIndex;
-    button.classList.toggle("active", isActive);
-    const marker = button.querySelector(".player-folder-play");
-    if (marker) marker.innerHTML = isActive ? icon("play") : String(index + 1);
-  });
-
-  const groupName = state.folder.videos[activeIndex]?.groupName || "Other";
-  document.querySelectorAll(".player-folder-head strong").forEach((heading) => {
-    heading.textContent = groupName;
-    heading.title = groupName;
-  });
+// A reused <video> (fullscreen patch, folder next/prev) may still point at the
+// previous source: swap its src in place instead of creating a new element.
+function ensureMainPlayerVideoSource(video) {
+  const p = state.player;
+  if (!p.videoUrl) return;
+  if (video.dataset.sourceToken === String(p.sourceToken) && video.dataset.videoUrl === p.videoUrl) return;
+  video.dataset.sourceToken = String(p.sourceToken);
+  video.dataset.videoUrl = p.videoUrl;
+  video.src = p.videoUrl;
+  video.load();
 }
 
 function attachMainPlayer() {
   const video = document.getElementById("mainPlayerVideo");
   if (!video) return;
 
+  ensureMainPlayerVideoSource(video);
   video.muted = state.player.muted;
   video.volume = state.player.volume;
   const sourceToken = video.dataset.sourceToken;
@@ -2290,39 +2553,85 @@ function attachMainPlayer() {
       video.currentTime = 0;
       state.player.currentTime = 0;
     }
+    if (!video.videoWidth && !video.videoHeight && !state.player.mediaError) {
+      // Audio decodes but the picture does not (typically HEVC without hardware support).
+      state.player.mediaError = describeMissingVideoTrack();
+      render();
+      return;
+    }
     updatePlayerUi();
   };
   video.ontimeupdate = syncState;
-  video.onplay = syncState;
-  video.onpause = syncState;
-  video.onended = syncState;
+  video.onplay = () => {
+    syncState();
+    showPlayerControls();
+  };
+  video.onpause = () => {
+    syncState();
+    showPlayerControls();
+  };
+  video.onended = () => {
+    syncState();
+    showPlayerControls();
+    if (!isCurrentSource() || playerScrubbing) return;
+    // Folder playlists continue with the next file.
+    const index = currentFolderVideoIndex();
+    if (index >= 0 && index < state.folder.videos.length - 1) openFolderVideo(index + 1);
+  };
+  video.onerror = () => {
+    if (!isCurrentSource() || !video.error) return;
+    state.player.playing = false;
+    state.player.mediaError = describeMediaError(video.error, state.player.videoPath);
+    render();
+  };
   video.onvolumechange = () => {
     if (!isCurrentSource()) return;
     state.player.muted = video.muted || video.volume === 0;
     state.player.volume = video.volume;
     if (video.volume > 0) state.player.lastVolume = video.volume;
+    savePlayerPrefs();
     updatePlayerUi();
   };
 
   const scrubber = document.querySelector("[data-player-scrubber]");
-  if (scrubber) scrubber.onclick = (event) => {
-    if (!state.player.duration) return;
-    const rect = scrubber.getBoundingClientRect();
-    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-    seekMainPlayer(ratio * state.player.duration);
-  };
-  if (scrubber) scrubber.onmousemove = (event) => {
-    updateScrubberPreview(scrubber, event.clientX);
-  };
-  if (scrubber) scrubber.onmouseleave = () => {
-    scrubber.classList.remove("previewing");
-  };
-
-  const playerFrame = document.querySelector("[data-player-drop]");
-  if (playerFrame) playerFrame.onclick = (event) => {
-    if (event.target.closest("button, input, [data-player-folder-rail]")) return;
-    toggleMainPlayer();
-  };
+  if (scrubber) {
+    scrubber.onpointerdown = (event) => {
+      if (event.button !== 0 || !state.player.duration) return;
+      event.preventDefault();
+      playerScrubbing = true;
+      scrubber.classList.add("is-scrubbing", "previewing");
+      try {
+        scrubber.setPointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture is best effort.
+      }
+      updateScrubberPreview(scrubber, event.clientX);
+      scrubPlayerTo(scrubber, event.clientX);
+    };
+    scrubber.onpointermove = (event) => {
+      updateScrubberPreview(scrubber, event.clientX);
+      if (playerScrubbing) scrubPlayerTo(scrubber, event.clientX);
+    };
+    const endScrub = (event) => {
+      if (!playerScrubbing) return;
+      playerScrubbing = false;
+      scrubber.classList.remove("is-scrubbing");
+      if (event.type === "pointerup") scrubPlayerTo(scrubber, event.clientX, true);
+      try {
+        scrubber.releasePointerCapture(event.pointerId);
+      } catch {
+        // Already released.
+      }
+      if (!scrubber.matches(":hover")) scrubber.classList.remove("previewing");
+      schedulePlayerControlsHide();
+    };
+    scrubber.onpointerup = endScrub;
+    scrubber.onpointercancel = endScrub;
+    scrubber.onlostpointercapture = endScrub;
+    scrubber.onpointerleave = () => {
+      if (!playerScrubbing) scrubber.classList.remove("previewing");
+    };
+  }
 
   const volumeSlider = document.querySelector("[data-volume-slider]");
   if (volumeSlider) volumeSlider.oninput = (event) => {
@@ -2330,13 +2639,155 @@ function attachMainPlayer() {
     setMainPlayerVolume(value);
   };
 
-  if (state.player.playing) {
+  if (state.player.playing && video.paused) {
     video.play().catch(() => {
       state.player.playing = false;
       updatePlayerUi();
     });
   }
   updatePlayerUi();
+}
+
+function scrubPlayerTo(scrubber, clientX, final = false) {
+  const duration = state.player.duration;
+  const rect = scrubber.getBoundingClientRect();
+  if (!duration || !rect.width) return;
+  const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  const time = ratio * duration;
+  state.player.currentTime = time;
+  playerScrubPendingTime = time;
+  updatePlayerUi();
+  if (final) {
+    if (playerScrubFrame) window.cancelAnimationFrame(playerScrubFrame);
+    applyPlayerScrub();
+    return;
+  }
+  // Coalesce seeks to one per frame while dragging.
+  if (!playerScrubFrame) playerScrubFrame = window.requestAnimationFrame(applyPlayerScrub);
+}
+
+function applyPlayerScrub() {
+  playerScrubFrame = 0;
+  if (playerScrubPendingTime === null) return;
+  const time = playerScrubPendingTime;
+  playerScrubPendingTime = null;
+  seekMainPlayer(time);
+}
+
+function describeMediaError(error, videoPath) {
+  const ext = (pathExtension(videoPath) || "video").toUpperCase();
+  const code = Number(error?.code || 0);
+  const technical = String(error?.message || "").trim();
+  const missing = code === 2 || /ERR_FILE_NOT_FOUND|ERR_ACCESS_DENIED|ERR_FILE_/i.test(technical);
+  if (missing) {
+    return {
+      kind: "error",
+      title: "Can't read this video file",
+      detail: "The file could not be opened. It may have been moved, renamed, deleted, or is still being written by a download.",
+      technical
+    };
+  }
+  if (code === 3) {
+    return {
+      kind: "error",
+      title: "Playback stopped: decode error",
+      detail: `Part of this ${ext} file is damaged or uses a codec the built-in player can't decode. Try a system player, or convert it to MP4 (H.264 + AAC).`,
+      technical
+    };
+  }
+  const legacy = ["AVI", "WMV", "FLV", "ASF", "MPG", "MPEG", "VOB", "TS", "M2TS", "MTS", "3GP", "RM", "RMVB", "DIVX"];
+  return {
+    kind: "error",
+    title: `This ${ext} can't play in the built-in player`,
+    detail: legacy.includes(ext)
+      ? `${ext} uses a container or codec that Chromium can't decode. Open it in a system player, or convert it to MP4 (H.264 + AAC).`
+      : "The video or audio codec isn't supported here (often HEVC/H.265 video or AC3/DTS audio). Open it in a system player, or convert it to MP4 (H.264 + AAC).",
+    technical
+  };
+}
+
+function describeMissingVideoTrack() {
+  return {
+    kind: "warning",
+    title: "No picture: the video track can't be decoded",
+    detail: "Audio may still play, but the video codec (often HEVC/H.265 without hardware support) isn't supported by the built-in player. Open it in a system player, or convert it to MP4 (H.264 + AAC).",
+    technical: ""
+  };
+}
+
+async function openFolderVideo(index, fallbackPath = "") {
+  const video = state.folder.videos[index];
+  const videoPath = video?.path || fallbackPath;
+  if (!videoPath) return;
+  const wasPlayer = state.screen === "player";
+  const token = await loadVideoPath(videoPath, {
+    displayName: video?.name || "",
+    subtitlePath: video?.subtitlePath || "",
+    folderContext: {
+      folderPath: state.folder.path,
+      videoIndex: index,
+      videoPath,
+      groupName: video?.groupName || "Other"
+    }
+  });
+  // A newer pick (fast next/next clicks) supersedes this one.
+  if (token !== state.player.sourceToken) return;
+  state.player.playing = true;
+  // In fullscreen render() patches the stage in place, so fullscreen survives.
+  if (wasPlayer && state.screen === "player") return render();
+  return setScreen("player");
+}
+
+function stepFolderVideo(delta) {
+  const index = currentFolderVideoIndex();
+  if (index < 0) return;
+  const next = index + delta;
+  if (next < 0 || next >= state.folder.videos.length) return;
+  return openFolderVideo(next);
+}
+
+async function openVideoExternally() {
+  const videoPath = state.player.videoPath;
+  if (!videoPath || typeof desktop.openInSystemPlayer !== "function") return;
+  document.getElementById("mainPlayerVideo")?.pause();
+  try {
+    const result = await desktop.openInSystemPlayer(videoPath);
+    if (result?.ok === false) throw new Error(result.error || "");
+  } catch (error) {
+    state.player.mediaError = {
+      kind: "error",
+      title: "Couldn't open a system player",
+      detail: error?.message || "No application is registered for this file type.",
+      technical: ""
+    };
+    render();
+  }
+}
+
+function loadPlayerPrefs() {
+  try {
+    const prefs = JSON.parse(window.localStorage.getItem(playerPrefsKey) || "null");
+    if (!prefs || typeof prefs !== "object") return;
+    const volume = Number(prefs.volume);
+    if (Number.isFinite(volume)) state.player.volume = Math.min(1, Math.max(0, volume));
+    const lastVolume = Number(prefs.lastVolume);
+    if (Number.isFinite(lastVolume) && lastVolume > 0) state.player.lastVolume = Math.min(1, lastVolume);
+    state.player.muted = Boolean(prefs.muted);
+  } catch {
+    // Preferences are a convenience; defaults are fine.
+  }
+}
+
+function savePlayerPrefs() {
+  try {
+    window.localStorage.setItem(playerPrefsKey, JSON.stringify({
+      volume: state.player.volume,
+      lastVolume: state.player.lastVolume,
+      muted: state.player.muted
+    }));
+  } catch {
+    // Storage may be unavailable.
+  }
 }
 
 function attachMiniPlayers() {
@@ -2471,6 +2922,7 @@ function updateFolderResolution(video) {
 function updateScrubberPreview(scrubber, clientX) {
   if (!state.player.duration) return;
   const rect = scrubber.getBoundingClientRect();
+  if (!rect.width) return;
   const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
   const previewTime = ratio * state.player.duration;
   const tooltip = scrubber.querySelector("[data-player-scrubber-tooltip]");
@@ -2481,69 +2933,68 @@ function updateScrubberPreview(scrubber, clientX) {
 
 function updatePlayerUi() {
   const p = state.player;
-  const text = hasRealSubtitleTrack() ? activeSubtitleText(p.currentTime) : "";
+  const hasTrack = hasRealSubtitleTrack();
+  const text = hasTrack ? activeSubtitleText(p.currentTime) : "";
   const subtitleBox = document.querySelector(".visubly-subtitle");
   if (subtitleBox) subtitleBox.classList.toggle("is-empty", !text);
 
   const subtitle = document.querySelector(".main-subtitle-text");
-  if (subtitle) subtitle.textContent = text || "";
+  if (subtitle && subtitle.textContent !== text) subtitle.textContent = text;
 
   const time = document.querySelector(".player-time");
   if (time) time.textContent = `${formatClock(p.currentTime)} / ${formatClock(p.duration)}`;
 
+  const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
   const fill = document.querySelector("[data-player-scrubber-fill]");
-  if (fill) {
-    const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
-    fill.style.width = `${progress}%`;
+  if (fill) fill.style.width = `${progress}%`;
+
+  const scrubber = document.querySelector("[data-player-scrubber]");
+  if (scrubber) {
+    scrubber.setAttribute("aria-valuemax", String(Math.round(p.duration || 0)));
+    scrubber.setAttribute("aria-valuenow", String(Math.round(p.currentTime || 0)));
+    scrubber.setAttribute("aria-valuetext", `${formatClock(p.currentTime)} of ${formatClock(p.duration)}`);
   }
 
-  const cueIndex = hasRealSubtitleTrack() ? state.player.cues.findIndex((cue) => p.currentTime >= cue.start && p.currentTime <= cue.end) : -1;
-  document.querySelectorAll(".transcript-line").forEach((line) => {
-    line.classList.toggle("active", Number(line.dataset.cueIndex) === cueIndex);
-  });
-  if (cueIndex !== state.player.activeCueIndex) {
-    state.player.activeCueIndex = cueIndex;
-    const activeLine = document.querySelector(`.transcript-line[data-cue-index="${cueIndex}"]`);
-    activeLine?.scrollIntoView({ block: "center", behavior: "smooth" });
+  const cueIndex = hasTrack ? p.cues.findIndex((cue) => isCueActive(cue, p.currentTime)) : -1;
+  if (cueIndex !== p.activeCueIndex) {
+    p.activeCueIndex = cueIndex;
+    document.querySelectorAll(".transcript-line.active").forEach((line) => line.classList.remove("active"));
+    const activeLine = cueIndex >= 0 ? document.querySelector(`.transcript-line[data-cue-index="${cueIndex}"]`) : null;
+    if (activeLine) {
+      activeLine.classList.add("active");
+      // Scroll the transcript panel only, never the page.
+      scrollChildIntoContainer(activeLine.closest(".player-transcript"), activeLine, "smooth");
+    }
   }
 
   const playButton = document.querySelector('[data-action="toggle-player"]');
-  if (playButton) {
-    playButton.innerHTML = icon(p.playing ? "minus" : "play");
-    playButton.title = p.playing ? "Pause" : "Play";
+  const playState = p.playing ? "playing" : "paused";
+  if (playButton && playButton.dataset.state !== playState) {
+    const label = p.playing ? "Pause (Space)" : "Play (Space)";
+    playButton.dataset.state = playState;
+    playButton.innerHTML = icon(p.playing ? "pause" : "play");
+    playButton.title = label;
+    playButton.setAttribute("aria-label", label);
   }
 
   const muteButton = document.querySelector('[data-action="toggle-mute"]');
-  if (muteButton) {
+  const muteState = p.muted ? "muted" : "sound";
+  if (muteButton && muteButton.dataset.state !== muteState) {
+    const label = p.muted ? "Unmute (M)" : "Mute (M)";
+    muteButton.dataset.state = muteState;
     muteButton.innerHTML = icon(p.muted ? "volumeOff" : "volume");
-    muteButton.title = p.muted ? "Unmute" : "Mute";
+    muteButton.title = label;
+    muteButton.setAttribute("aria-label", label);
     muteButton.setAttribute("aria-pressed", p.muted ? "true" : "false");
     muteButton.classList.toggle("danger", p.muted);
-  }
-
-  const theaterButton = document.querySelector('[data-action="toggle-theater"]');
-  if (theaterButton) {
-    theaterButton.title = p.theater ? "Exit theater mode" : "Theater mode";
-    theaterButton.setAttribute("aria-label", theaterButton.title);
-    theaterButton.setAttribute("aria-pressed", p.theater ? "true" : "false");
-    theaterButton.classList.toggle("lime", p.theater);
-  }
-
-  p.fullscreen = isDocumentFullscreen();
-  const fullscreenButton = document.querySelector('[data-action="toggle-fullscreen"]');
-  if (fullscreenButton) {
-    fullscreenButton.innerHTML = icon(p.fullscreen ? "fullscreenExit" : "fullscreen");
-    fullscreenButton.title = p.fullscreen ? "Exit fullscreen" : "Fullscreen";
-    fullscreenButton.setAttribute("aria-label", fullscreenButton.title);
-    fullscreenButton.setAttribute("aria-pressed", p.fullscreen ? "true" : "false");
-    fullscreenButton.classList.toggle("lime", p.fullscreen);
   }
 
   const visibleVolume = p.muted ? 0 : p.volume;
   const volumeSlider = document.querySelector("[data-volume-slider]");
   if (volumeSlider) {
-    volumeSlider.value = String(visibleVolume);
+    if (document.activeElement !== volumeSlider || Number(volumeSlider.value) !== visibleVolume) volumeSlider.value = String(visibleVolume);
     volumeSlider.style.setProperty("--volume-level", `${visibleVolume * 100}%`);
+    volumeSlider.setAttribute("aria-valuetext", `${Math.round(visibleVolume * 100)}%`);
   }
 
   const volumeValue = document.querySelector(".volume-value");
@@ -2552,9 +3003,15 @@ function updatePlayerUi() {
 
 function toggleMainPlayer() {
   const video = document.getElementById("mainPlayerVideo");
-  if (!video) return;
-  if (video.paused || video.ended) video.play().catch(() => {});
-  else video.pause();
+  if (!video || state.player.mediaError?.kind === "error") return;
+  if (video.paused || video.ended) {
+    video.play().catch(() => {
+      state.player.playing = false;
+      updatePlayerUi();
+    });
+  } else {
+    video.pause();
+  }
 }
 
 function toggleMainMute() {
@@ -2568,20 +3025,22 @@ function toggleMainMute() {
   }
   state.player.muted = video.muted;
   state.player.volume = video.volume;
+  savePlayerPrefs();
   updatePlayerUi();
 }
 
 function setMainPlayerVolume(value) {
   const video = document.getElementById("mainPlayerVideo");
   if (!video) return;
-  const nextVolume = Math.min(1, Math.max(0, Number(value) || 0));
+  const nextVolume = Math.min(1, Math.max(0, Math.round((Number(value) || 0) * 100) / 100));
   video.volume = nextVolume;
   video.muted = nextVolume === 0;
   state.player.volume = nextVolume;
   state.player.muted = video.muted;
   if (nextVolume > 0) state.player.lastVolume = nextVolume;
+  savePlayerPrefs();
   updatePlayerUi();
-  showFullscreenPlayerControls();
+  showPlayerControls();
 }
 
 function adjustMainPlayerVolume(delta) {
@@ -2593,6 +3052,8 @@ function suspendMainPlayerForNavigation() {
   const video = document.getElementById("mainPlayerVideo");
   state.player.lastSuspendedAt = Date.now();
   state.player.playing = false;
+  clearPlayerControlsTimer();
+  playerControlsHidden = false;
   if (!video) return;
 
   state.player.currentTime = video.currentTime || state.player.currentTime || 0;
@@ -2610,30 +3071,31 @@ function suspendMainPlayerForNavigation() {
 
 function toggleTheaterMode() {
   if (state.screen !== "player" || !state.player.videoUrl) return;
+  // Theater is the layout underneath fullscreen; change it after leaving fullscreen.
+  if (getFullscreenElement()) return;
   state.player.theater = !state.player.theater;
-
-  document.querySelector(".player-screen")?.classList.toggle("is-theater", state.player.theater);
-  document.querySelector(".player-layout")?.classList.toggle("theater", state.player.theater);
-  updatePlayerUi();
+  render();
+  showPlayerControls();
 }
 
 async function togglePlayerFullscreen() {
   if (state.screen !== "player" || !state.player.videoUrl) return;
-  const activeElement = getFullscreenElement();
-  if (activeElement) {
-    await exitDocumentFullscreen();
+  if (getFullscreenElement()) {
+    try {
+      await exitDocumentFullscreen();
+    } catch {
+      syncFullscreenState();
+    }
     return;
   }
 
-  const target = document.querySelector("[data-player-workbench]") || document.querySelector("[data-player-drop]");
-  if (!target) return;
-
+  // Only the video stage (picture + subtitles + overlay bar) goes fullscreen.
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage) return;
   try {
-    await requestElementFullscreen(target);
-    syncFullscreenControlVisibility();
+    await requestElementFullscreen(stage);
   } catch {
-    state.player.fullscreen = false;
-    updatePlayerUi();
+    syncFullscreenState();
   }
 }
 
@@ -2645,76 +3107,94 @@ function isDocumentFullscreen() {
   return Boolean(getFullscreenElement());
 }
 
+function isPlayerStageFullscreen() {
+  const element = getFullscreenElement();
+  return Boolean(element && element.isConnected && element.matches?.("[data-player-stage]"));
+}
+
 function requestElementFullscreen(element) {
-  const request = element.requestFullscreen || element.webkitRequestFullscreen || element.msRequestFullscreen;
+  if (element.requestFullscreen) return Promise.resolve(element.requestFullscreen({ navigationUI: "hide" }));
+  const request = element.webkitRequestFullscreen || element.msRequestFullscreen;
   if (!request) return Promise.resolve();
   return Promise.resolve(request.call(element));
 }
 
 function exitDocumentFullscreen() {
   const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
-  if (!exit) return Promise.resolve();
+  if (!exit || !getFullscreenElement()) return Promise.resolve();
   return Promise.resolve(exit.call(document));
 }
 
+// Runs for every fullscreen enter/exit (button, F, double click, Esc, F11).
 function syncFullscreenState() {
-  state.player.fullscreen = isDocumentFullscreen();
-  updatePlayerUi();
-  syncFullscreenControlVisibility();
+  state.player.fullscreen = isPlayerStageFullscreen();
+  if (state.screen !== "player") return;
+  // Entering: render() patches the fullscreen stage in place (overlay classes, exit icon).
+  // Leaving: full render back to the window/theater layout, reusing the same <video>.
+  render();
+  showPlayerControls();
 }
 
-function attachPlayerControlActivity() {
-  const workbench = document.querySelector("[data-player-workbench]");
-  if (!workbench) {
-    clearFullscreenControlsTimer();
+function showPlayerControls() {
+  playerControlsHidden = false;
+  document.querySelector("[data-player-stage]")?.classList.remove("is-controls-idle");
+  schedulePlayerControlsHide();
+}
+
+function schedulePlayerControlsHide() {
+  clearPlayerControlsTimer();
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage || !stage.classList.contains("is-overlay") || !state.player.playing) return;
+  playerControlsIdleTimer = window.setTimeout(hidePlayerControlsWhenIdle, playerControlsIdleMs);
+}
+
+function hidePlayerControlsWhenIdle() {
+  playerControlsIdleTimer = null;
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage || !stage.classList.contains("is-overlay") || !state.player.playing) return;
+  if (playerControlsPinned(stage)) {
+    schedulePlayerControlsHide();
     return;
   }
-  ["mousemove", "mousedown", "touchstart", "touchmove"].forEach((eventName) => {
-    workbench.addEventListener(eventName, showFullscreenPlayerControls, { passive: true });
-  });
-  syncFullscreenControlVisibility();
+  hidePlayerControls(stage);
 }
 
-function syncFullscreenControlVisibility() {
-  if (isPlayerWorkbenchFullscreen()) {
-    showFullscreenPlayerControls();
+function hidePlayerControls(stage) {
+  clearPlayerControlsTimer();
+  playerControlsHidden = true;
+  stage.classList.add("is-controls-idle");
+}
+
+// The overlay bar stays up while scrubbing, hovering the bar/playlist, showing an
+// error, or while a control has keyboard focus.
+function playerControlsPinned(stage) {
+  if (playerScrubbing) return true;
+  if (stage.querySelector(".player-console:hover, .player-folder-rail:hover, .player-error")) return true;
+  const active = document.activeElement;
+  return Boolean(playerKeyboardModality && active && stage.contains(active) && active.closest(".player-console, .player-folder-rail"));
+}
+
+function syncPlayerControlsVisibility() {
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage || !stage.classList.contains("is-overlay")) {
+    clearPlayerControlsTimer();
+    playerControlsHidden = false;
     return;
   }
-  clearFullscreenControlsTimer();
-  document.querySelector("[data-player-workbench]")?.classList.remove("is-controls-idle");
+  if (!playerControlsHidden) schedulePlayerControlsHide();
 }
 
-function showFullscreenPlayerControls() {
-  const workbench = document.querySelector("[data-player-workbench]");
-  if (!workbench || !isPlayerWorkbenchFullscreen()) return;
-  workbench.classList.remove("is-controls-idle");
-  clearFullscreenControlsTimer();
-  playerControlsIdleTimer = window.setTimeout(() => {
-    if (isPlayerWorkbenchFullscreen()) {
-      document.querySelector("[data-player-workbench]")?.classList.add("is-controls-idle");
-    }
-  }, playerControlsIdleMs);
-}
-
-function clearFullscreenControlsTimer() {
+function clearPlayerControlsTimer() {
   if (!playerControlsIdleTimer) return;
   window.clearTimeout(playerControlsIdleTimer);
   playerControlsIdleTimer = null;
 }
 
-function isPlayerWorkbenchFullscreen() {
-  const workbench = document.querySelector("[data-player-workbench]");
-  const fullscreenElement = getFullscreenElement();
-  return Boolean(
-    workbench &&
-    fullscreenElement &&
-    (fullscreenElement === workbench || workbench.contains(fullscreenElement) || fullscreenElement.contains(workbench))
-  );
-}
-
 function seekMainPlayer(seconds) {
   const video = document.getElementById("mainPlayerVideo");
-  const target = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const duration = state.player.duration || (video && Number.isFinite(video.duration) ? video.duration : 0);
+  let target = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  if (duration) target = Math.min(target, duration);
   state.player.currentTime = target;
   if (video) {
     video.currentTime = target;
@@ -2722,6 +3202,12 @@ function seekMainPlayer(seconds) {
   } else {
     render();
   }
+}
+
+function seekMainPlayerBy(delta) {
+  const video = document.getElementById("mainPlayerVideo");
+  const now = video && video.readyState > 0 ? video.currentTime : state.player.currentTime;
+  seekMainPlayer(now + delta);
 }
 
 function emptyFolderState() {
@@ -2837,49 +3323,27 @@ function applyFolderScan(result = {}) {
 }
 
 async function loadVideoPath(pathValue, options = {}) {
-  if (!pathValue) return;
+  if (!pathValue) return state.player.sourceToken;
   const sourceToken = setVideoPath(pathValue, options);
-  if (typeof options.afterSourceSet === "function") {
-    await options.afterSourceSet(sourceToken);
-  }
-  if (options.updatePlayerElement) syncMainPlayerVideoElement(sourceToken);
   try {
     const url = await desktop.toFileUrl(pathValue);
-    if (sourceToken !== state.player.sourceToken) return;
+    if (sourceToken !== state.player.sourceToken) return sourceToken;
     if (url) state.player.videoUrl = url;
   } catch {
-    if (sourceToken !== state.player.sourceToken) return;
+    if (sourceToken !== state.player.sourceToken) return sourceToken;
     state.player.videoUrl = localPathToFileUrl(pathValue);
   }
-  if (options.updatePlayerElement) syncMainPlayerVideoElement(sourceToken, { autoplay: state.player.playing });
 
-  let subtitleLoaded = false;
-  if (options.subtitlePath) {
-    subtitleLoaded = await loadSubtitlePath(options.subtitlePath, sourceToken);
-  }
-  if (subtitleLoaded) return;
+  if (options.subtitlePath && await loadSubtitlePath(options.subtitlePath, sourceToken)) return sourceToken;
 
   try {
     const matchingSubtitle = await desktop.findMatchingSubtitle(pathValue);
-    if (sourceToken !== state.player.sourceToken) return;
-    if (matchingSubtitle) {
-      subtitleLoaded = await loadSubtitlePath(matchingSubtitle, sourceToken);
-      if (!subtitleLoaded) {
-        state.player.srtPath = "";
-        state.player.cues = sampleCues;
-        state.player.activeCueIndex = -1;
-      }
-    } else {
-      state.player.srtPath = "";
-      state.player.cues = sampleCues;
-      state.player.activeCueIndex = -1;
-    }
+    if (sourceToken !== state.player.sourceToken) return sourceToken;
+    if (matchingSubtitle) await loadSubtitlePath(matchingSubtitle, sourceToken);
   } catch {
-    if (sourceToken !== state.player.sourceToken) return;
-    state.player.srtPath = "";
-    state.player.cues = sampleCues;
-    state.player.activeCueIndex = -1;
+    // No sidecar subtitle: the video simply plays without captions (never demo text).
   }
+  return sourceToken;
 }
 
 async function loadSubtitlePath(pathValue, sourceToken = state.player.sourceToken) {
@@ -2892,11 +3356,17 @@ async function loadSubtitlePath(pathValue, sourceToken = state.player.sourceToke
   }
   if (sourceToken !== state.player.sourceToken) return false;
   const cues = parseSrt(text);
-  state.player.srtPath = cues.length ? pathValue : "";
-  state.player.cues = cues.length ? cues : sampleCues;
-  state.player.currentTime = 0;
+  if (!cues.length) {
+    // Keep whatever track is already loaded and tell the user why nothing changed.
+    state.player.subtitleNotice = `Couldn't read any subtitle cues from ${pathBaseName(pathValue)}. Check that it is a UTF-8 SRT or WebVTT file.`;
+    return false;
+  }
+  state.player.srtPath = pathValue;
+  state.player.cues = cues;
+  state.player.subtitleNotice = "";
   state.player.activeCueIndex = -1;
-  return cues.length > 0;
+  // Do not touch currentTime: loading captions mid-video must not restart playback.
+  return true;
 }
 
 function setVideoPath(pathValue, options = {}) {
@@ -2922,6 +3392,11 @@ function setVideoPath(pathValue, options = {}) {
   state.player.duration = 0;
   state.player.playing = false;
   state.player.activeCueIndex = -1;
+  // Drop the previous video's captions/errors so they never flash over the new file.
+  state.player.srtPath = "";
+  state.player.cues = [];
+  state.player.subtitleNotice = "";
+  state.player.mediaError = null;
   state.player.folderContext = options.folderContext || null;
   return state.player.sourceToken;
 }
@@ -2930,48 +3405,96 @@ function hasRealSubtitleTrack() {
   return Boolean(state.player.srtPath && state.player.cues.length);
 }
 
+function isCueActive(cue, seconds) {
+  const time = Number(seconds) || 0;
+  return time >= cue.start && time < cue.end;
+}
+
 function activeSubtitleText(seconds) {
   if (!state.player.subtitleOn) return "";
-  const cue = findActiveCue(seconds);
-  if (!cue) return "";
-  return cue.text;
+  // Overlapping cues (two speakers, signs + dialogue) are shown together.
+  return findActiveCues(seconds).map((cue) => cue.text).join("\n");
 }
 
-function findActiveCue(seconds) {
-  const time = Number(seconds) || 0;
-  return state.player.cues.find((cue) => time >= cue.start && time <= cue.end) || null;
+function findActiveCues(seconds) {
+  return state.player.cues.filter((cue) => isCueActive(cue, seconds));
 }
 
+// Line-based SRT/WebVTT parser: tolerates a BOM, CRLF/CR line endings, whitespace-only
+// "blank" lines, missing index lines, missing blank lines between cues, VTT headers,
+// NOTE/STYLE blocks, cue settings and inline markup.
 function parseSrt(text) {
-  const normalized = String(text || "")
+  const lines = String(text || "")
     .replace(/^\uFEFF/, "")
-    .replace(/\r/g, "")
-    .replace(/^WEBVTT[^\n]*\n+/i, "");
+    .replace(/\u0000/g, "")
+    .split(/\r\n|\r|\n/);
+  const cues = [];
+  let current = null;
+  let closed = false;
 
-  return normalized
-    .split(/\n{2,}/)
-    .map((block) => {
-      const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
-      const timeIndex = lines.findIndex((line) => line.includes("-->"));
-      if (timeIndex < 0) return null;
-      const [startRaw, endRaw] = lines[timeIndex].split("-->").map((part) => part.trim().split(/\s+/)[0]);
-      const start = parseSrtTime(startRaw);
-      const end = parseSrtTime(endRaw);
-      const cueText = lines.slice(timeIndex + 1).join("\n");
-      if (!Number.isFinite(start) || !Number.isFinite(end) || !cueText) return null;
-      return { start, end, text: cueText };
-    })
+  const finish = () => {
+    if (!current) return;
+    const cueText = cleanCueText(current.lines.join("\n"));
+    if (cueText && current.end > current.start) cues.push({ start: current.start, end: current.end, text: cueText });
+    current = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const timing = parseCueTiming(line);
+    if (timing) {
+      // No blank line before this cue: the previous text's last line is its index.
+      if (current && !closed && /^\d+$/.test(current.lines[current.lines.length - 1] || "")) current.lines.pop();
+      finish();
+      current = { ...timing, lines: [] };
+      closed = false;
+      continue;
+    }
+    if (!current || closed) continue;
+    if (!line) {
+      if (current.lines.length) closed = true;
+      continue;
+    }
+    current.lines.push(line);
+  }
+  finish();
+  return cues.sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function parseCueTiming(line) {
+  if (!line.includes("-->")) return null;
+  const [left, right = ""] = line.split("-->");
+  const start = parseSrtTime(left.trim().split(/\s+/).pop());
+  const end = parseSrtTime(right.trim().split(/\s+/)[0]);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { start, end };
+}
+
+function cleanCueText(text) {
+  return String(text || "")
+    .replace(/\{\\[^}]*\}/g, "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/\\N/g, "\n")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lrm;|&rlm;/gi, "")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#0?39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .split("\n")
+    .map((line) => line.trim())
     .filter(Boolean)
-    .sort((a, b) => a.start - b.start);
+    .join("\n");
 }
 
 function parseSrtTime(value) {
-  const match = String(value || "").match(/(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})/);
+  const match = String(value || "").trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:[,.](\d{1,3}))?$/);
   if (!match) return Number.NaN;
   const hours = Number(match[1] || 0);
   const minutes = Number(match[2] || 0);
   const seconds = Number(match[3] || 0);
-  const millis = Number(match[4].padEnd(3, "0"));
+  const millis = Number((match[4] || "0").padEnd(3, "0"));
   return hours * 3600 + minutes * 60 + seconds + millis / 1000;
 }
 
@@ -2986,7 +3509,7 @@ function formatClock(seconds) {
 }
 
 function formatHoverClock(seconds) {
-  return `${formatClock(seconds)}s`;
+  return formatClock(seconds);
 }
 
 function resolutionLabelFromSize(width, height) {
@@ -3073,7 +3596,8 @@ function isSubtitlePath(pathValue) {
 }
 
 function isVideoPath(pathValue) {
-  return ["mp4", "m4v", "mov", "mkv", "webm", "avi"].includes(pathExtension(pathValue));
+  // Accept every container the folder scanner lists; unsupported codecs get a clear error state.
+  return ["mp4", "m4v", "mov", "mkv", "webm", "ogv", "avi", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg", "3gp"].includes(pathExtension(pathValue));
 }
 
 function parseMovieTitle(fileName) {
@@ -3215,4 +3739,5 @@ function initAirPlayPairingBridge() {
 
 initDownloadBridge();
 initAirPlayPairingBridge();
+loadPlayerPrefs();
 render();

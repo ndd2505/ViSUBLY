@@ -13,6 +13,11 @@ design-download
 downdload-and-subtitle-video-app/
 # Downloader engine build (scripts/build-downloader.ps1)
 dist-engine/
+# Third-party binaries fetched at build time (scripts/fetch-ffmpeg.ps1, scripts/build-upscaler.ps1)
+vendor/
+# .NET build output of tools/upscaler
+tools/upscaler/bin/
+tools/upscaler/obj/
 .venv-build/
 __pycache__/
 *.pyc

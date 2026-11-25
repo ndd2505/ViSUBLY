@@ -29,6 +29,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # visubly-upscaler (tools/upscaler) is a .NET 10 single-file app.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Install dependencies
         run: npm ci
 
@@ -39,9 +44,13 @@ jobs:
           node scripts/test-extension-streams.mjs
           node scripts/test-remote-pairing.js
           node scripts/test-video-enhance.js
+          node scripts/test-upscale-presets.js
 
       - name: Build installer and portable app
         shell: pwsh
+        env:
+          # fetch-ffmpeg.ps1 reads the BtbN release through the GitHub API (avoids the anonymous rate limit).
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           npm run package:win:ci *>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {

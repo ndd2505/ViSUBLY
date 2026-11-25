@@ -7,6 +7,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const airplayServer = require("./airplay-server");
 const videoEnhance = require("./video-enhance");
+const { resolveFfmpegPath, resolveFfprobePath, resolveUpscalerPath } = require("./ffmpeg-path");
+const { setupUpscale } = require("./upscale-ipc");
 
 const projectRoot = path.resolve(__dirname, "..", "..");
 // build/icon.* is shipped inside app.asar (see package.json build.files), so this works packaged and in dev.
@@ -244,6 +246,8 @@ function createWindow() {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: "deny" };
   });
+  // Closing while a video is being upscaled asks first (upscale-ipc.js).
+  if (upscale) upscale.attachWindow(mainWindow);
   mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
 }
@@ -395,6 +399,24 @@ app.on("before-quit", markEnhanceLaunchStable);
 // Settings are loaded by now (single-instance branch above) and the app is not ready yet.
 if (gotSingleInstanceLock) planVideoEnhanceLaunch();
 
+// "Nâng cấp video" tab (src/main/upscale-*.js). screen / powerMonitor only work after app ready: wrap them.
+const upscale = gotSingleInstanceLock
+  ? setupUpscale({
+      ipcMain, dialog, shell, Notification, powerSaveBlocker, app,
+      screen: { getPrimaryDisplay: () => require("electron").screen.getPrimaryDisplay() },
+      powerMonitor: { isOnBatteryPower: () => require("electron").powerMonitor.isOnBatteryPower() },
+      tempDir: runtimePaths.temp,
+      userDataDir: runtimePaths.userData,
+      ffmpegPath,
+      ffprobePath: resolveFfprobePath(),
+      upscalerPath: resolveUpscalerPath(),
+      gpuSummary: () => (enhanceState.support ? { gpu: enhanceState.support.gpu, driver: enhanceState.support.driver } : {}),
+      getDownloadDir: () => settings.downloadDir,
+      getMainWindow: () => mainWindow,
+      sendToRenderer
+    })
+  : null;
+
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
     createWindow();
@@ -421,6 +443,7 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   appQuitting = true;
+  if (upscale) upscale.shutdown();
   stopAirplayPowerBlocker("App is quitting.");
   stopCaptureBridge();
   if (downloadStateFlushTimer) {
@@ -1857,18 +1880,6 @@ function spawnEngine(args, stdio) {
       TMP: engineTempDir
     }
   });
-}
-
-function resolveFfmpegPath() {
-  try {
-    let binary = require("@ffmpeg-installer/ffmpeg").path;
-    if (binary.includes("app.asar") && !binary.includes("app.asar.unpacked")) {
-      binary = binary.replace("app.asar", "app.asar.unpacked");
-    }
-    return binary;
-  } catch {
-    return "";
-  }
 }
 
 function pushFfmpegArg(args) {

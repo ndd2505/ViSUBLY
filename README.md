@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.1-D7FF61?labelColor=1A1620">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.2.0-D7FF61?labelColor=1A1620">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-1A1620">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-1A1620">
   <img alt="Chrome extension" src="https://img.shields.io/badge/Chrome-MV3%20extension-1A1620">
@@ -32,6 +32,7 @@
 - **One-click capture from Chrome.** No DevTools or "Copy as cURL" needed. The extension finds the video on the page, lists its qualities with estimated sizes, and sends it to the app.
 - **Download manager.** Paste a URL or a cURL command, run up to 3 downloads at once, see speed and ETA, and get readable error messages. The downloader and ffmpeg are bundled, so you don't need to install Python.
 - **Sharper playback on RTX GPUs.** NVIDIA RTX Video Super Resolution upscales low-resolution video live while it plays. Nothing is processed in advance and no new file is created. If the GPU doesn't support it, the video plays at its original quality, and you can turn it off in Settings.
+- **Upscale low-res videos into new files.** The **Nâng cấp video** (Upscale video) tab turns a 360p / 480p video into a 720p–4K copy with RTX Video Super Resolution or GPU filters. It picks the best setup for your PC automatically, shows live GPU / CPU / disk stats, and lets you test a short clip with a before/after slider first.
 - **Player built for subtitles.** SRT and VTT files (UTF‑8, UTF‑16 and Windows‑1258) load automatically, and the folder becomes a playlist. Theater and fullscreen modes have an auto-hiding control bar, and there are keyboard shortcuts.
 - **Open with ViSUBLY.** Set it as the default app for `.mp4 .m4v .mkv .webm .mov` and double-click a file to play it.
 - **Drag and drop.** Drop folders onto the window to browse them in **Thư viện** (Library); several folders are merged into one library. Drop a video to play it, or a subtitle file to load it.
@@ -102,6 +103,32 @@
 | `Shift` + `N` / `P` | Next / previous video in the folder |
 | `Esc` | Leave fullscreen, then theater |
 
+### Upscale videos (Nâng cấp video)
+
+One video at a time. The original file is never touched: the new copy is saved next to it as `name_1080p.mp4`, with the audio and any matching subtitle files (`name.srt`, `name.vi.srt`, …).
+
+- **Levels** (**Mức nâng cấp**): **Tự động** (Automatic, default), **Nhanh** (Fast), **Cân bằng** (Balanced), **Đẹp nhất** (Best). Each shows whether it suits this PC: **Phù hợp với máy** (fits), **Nặng** (heavy: it runs, but the PC gets hot) or **Quá sức máy** (too much for this PC; you are warned before starting).
+- **Automatic** checks the GPU once and runs a 3-second benchmark. The check covers whether RTX Video is really on, which hardware encoder works, and Vulkan. It then picks the best level **and** output resolution that stays comfortable for this PC. On an RTX 3060 with a 480p video, that is denoise → RTX Video → sharpen at 1080p, about 2× real time. **Đẹp nhất** adds a stronger NLMeans denoise on the CPU: better on noisy videos, about real-time speed.
+- **Technologies:**
+
+  | Technology | Runs on | Notes |
+  |---|---|---|
+  | RTX Video Super Resolution | NVIDIA GeForce RTX 20 or newer | Same driver feature as the player. The quality level comes from the NVIDIA App. |
+  | Intel AI Super Resolution | Intel Arc / Iris Xe | Experimental. |
+  | AMD FSR video upscaling | AMD Radeon | Experimental. |
+  | FFmpeg filters | Any PC | Denoise, libplacebo upscaling (Vulkan), CAS sharpening. Also the automatic fallback. |
+  | ONNX AI, Real-CUGAN, RIFE (60 fps), AI deblocking | — | Shown as **Có ở bản cập nhật sau** (coming in 1.3.0). |
+
+  Anything your PC can't run is greyed out; click it to see why.
+- **Thử & so sánh** (Test & compare): runs only when you click it. It processes a 5, 10 or 20-second clip with up to three setups. Then it shows a before/after slider, three still frames, the measured speed, and the estimated time and file size for the whole video.
+- **Live device panel:** GPU load, graphics memory, temperature and power (NVIDIA), CPU, RAM, battery, and the free space on each drive.
+- **Safety:**
+  - It pauses by itself if the GPU passes 85 °C, and resumes below 75 °C.
+  - It pauses if the output drive drops under 5 GB free.
+  - If the GPU path fails, it restarts with FFmpeg filters and tells you why.
+  - Windows doesn't go to sleep while a video is being upscaled, and the taskbar shows the progress.
+- **Closing the app** while a video is being upscaled asks first: **Tiếp tục nâng cấp** (keep going) or **Dừng và thoát** (stop and quit; the partial file is deleted).
+
 ### Drag and drop
 
 Drop items anywhere in the window:
@@ -167,13 +194,16 @@ These parts are visible in the app as **Sắp có** ("Coming soon") or are plann
 - **macOS build and a native iPhone app.** The web remote works today.
 - **Chrome Web Store release** of the extension, which currently installs with *Load unpacked*.
 - **Code signing and auto-update**, which will remove the SmartScreen warning.
-- **Exact duration and size for MP4 links**, by bundling ffprobe.
+- **Exact duration and size for MP4 links.** ffprobe is now bundled; the downloader still has to use it.
+- **More upscaling technologies (1.3.0):** ONNX Runtime AI (any DirectX 12 GPU), RIFE 60 fps, and vs-mlrt + TensorRT (DPIR deblocking, Real-CUGAN). They will download on demand.
+- **Upscale several videos in a queue, plus advanced upscaling settings.**
 
 ## Limitations
 
 - **DRM-protected streams** (Netflix, Disney+ and similar) are not supported, and won't be.
 - Some sites only expose `blob:` URLs and can't be captured. Links that are signed or expire quickly may need to be grabbed again.
 - The built-in player uses Chromium codecs. AVI, WMV and HEVC files, and AC3 audio, may need another player through **Open with…**.
+- **Upscaling on Intel and AMD GPUs** has not been tested on real hardware yet, so it is marked experimental. If it fails, ViSUBLY falls back to FFmpeg filters.
 - **Windows only** for now. The installer is not code-signed yet, so Windows may show *"Windows protected your PC"*: click **More info → Run anyway**.
 
 ---
@@ -196,13 +226,14 @@ App data lives in `%APPDATA%\Visubly Studio` (settings, download queue, paired d
 
 ## Build from source
 
-Requirements: Windows 10/11, **Node.js 20+**, and **Python 3.10+** (only to build the bundled downloader).
+Requirements: Windows 10/11, **Node.js 20+**, **Python 3.10+** (to build the bundled downloader) and the **.NET 10 SDK** (to build `visubly-upscaler.exe`).
 
 ```powershell
 npm install
 npm run start           # run in development
 npm run check           # quick app checks
-npm run package:win     # downloader exe (PyInstaller) + NSIS installer + portable build in dist\
+npm run build:vendor    # FFmpeg 8.1 into vendor\ffmpeg + visubly-upscaler.exe into vendor\upscaler (npm run start needs them too)
+npm run package:win     # downloader exe (PyInstaller) + vendor tools + NSIS installer + portable build in dist\
 ```
 
 **Releases** are built by GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)). Pushing a tag such as `v1.0.2` runs the tests, builds the installer and portable app, and publishes them with `SHA256SUMS.txt` to GitHub Releases:
@@ -219,6 +250,7 @@ node scripts/test-capture-bridge.js       # Chrome ↔ app bridge (pairing, auth
 node scripts/test-extension-streams.mjs   # extension stream grouping
 node scripts/test-remote-pairing.js       # iPhone Remote pairing, trusted devices, WebSocket auth
 node scripts/test-video-enhance.js        # GPU detection + crash guard for live video enhancement
+node scripts/test-upscale-presets.js      # upscale tab: capabilities, auto choice, plans, estimates
 ```
 
 ## Project structure
@@ -234,6 +266,11 @@ docs/                 Handoff notes (docs/HANDOFF.md) and README media
 ```
 
 Developer notes on architecture, IPC and the bridge APIs, and the backlog are in [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+## Bundled third-party software
+
+- **FFmpeg 8.1** (GPL v3 build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds), fetched by `scripts/fetch-ffmpeg.ps1`; source at [ffmpeg.org](https://ffmpeg.org/download.html)). Its license ships as `resources/ffmpeg/FFMPEG-LICENSE.txt`.
+- **Vortice.Windows** (MIT) and the **.NET runtime** (MIT), inside `visubly-upscaler.exe`.
 
 ## Responsible use
 

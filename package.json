@@ -1,7 +1,7 @@
 {
   "name": "visubly-desktop",
   "productName": "Visubly Studio",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Desktop UI shell for Visubly video download and Vietnamese subtitle workflows.",
   "main": "src/main/main.js",
   "private": true,
@@ -12,9 +12,12 @@
     "dev": "electron .",
     "check": "node scripts/check-app.js",
     "build:engine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-downloader.ps1",
-    "package:win": "npm run build:engine && electron-builder --win",
+    "fetch:ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-ffmpeg.ps1",
+    "build:upscaler": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-upscaler.ps1",
+    "build:vendor": "npm run fetch:ffmpeg && npm run build:upscaler",
+    "package:win": "npm run build:engine && npm run build:vendor && electron-builder --win",
     "package:mac": "electron-builder --mac dmg",
-    "package:win:ci": "npm run build:engine && electron-builder --win --publish never"
+    "package:win:ci": "npm run build:engine && npm run build:vendor && electron-builder --win --publish never"
   },
   "devDependencies": {
     "electron": "^31.7.7",
@@ -29,7 +32,8 @@
       "src/**/*",
       "build/icon.ico",
       "build/icon.png",
-      "package.json"
+      "package.json",
+      "!**/node_modules/@ffmpeg-installer/win32-*/**"
     ],
     "extraResources": [
       {
@@ -64,6 +68,14 @@
         {
           "from": "dist-engine/visubly-downloader.exe",
           "to": "engine/visubly-downloader.exe"
+        },
+        {
+          "from": "vendor/ffmpeg",
+          "to": "ffmpeg"
+        },
+        {
+          "from": "vendor/upscaler",
+          "to": "upscaler"
         }
       ],
       "signAndEditExecutable": false,

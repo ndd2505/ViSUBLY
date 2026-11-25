@@ -1,3 +1,12 @@
+## What's new in 1.2.0
+
+- **Nâng cấp video (Upscale video) tab.** Turn a 360p / 480p video into a sharper 720p–4K copy, one video at a time.
+  - Uses RTX Video Super Resolution on NVIDIA RTX cards, and GPU filters on any PC.
+  - Picks the best setup for your PC automatically and shows live GPU / CPU / disk stats.
+  - Lets you test a short clip with a before/after slider first.
+  - Asks before closing while a video is being upscaled.
+- Bundles **FFmpeg 8.1** (also used by the downloader and the iPhone Remote).
+
 ## Install (Windows 10/11)
 
 1. Download **`ViSUBLY-Setup-x.y.z.exe`** below and run it. If you cloned the repo, double-clicking **`Install-ViSUBLY.cmd`** does the same: it downloads and checks the latest installer, then runs it.

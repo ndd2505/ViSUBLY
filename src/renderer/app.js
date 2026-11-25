@@ -82,6 +82,7 @@ const screenTitles = {
   download: "Tải xuống",
   folder: "Thư viện",
   player: "Trình phát",
+  upscale: "Nâng cấp video",
   settings: "Cài đặt"
 };
 const systemDarkQuery = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
@@ -195,6 +196,10 @@ const iconPaths = {
   library: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
   player: '<path d="M7 5l12 7-12 7z"/>',
+  sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16v4M17 18h4"/>',
+  compare: '<path d="M12 3v18"/><path d="M4 7h5v10H4z"/><path d="M15 7h5v10h-5z"/>',
+  gpu: '<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/>',
+  warn: '<path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/>',
   play: '<path d="M8 5v14l11-7z"/>',
   subtitleAi: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 10h10M7 14h4M13 14h4"/>',
   sliders: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
@@ -246,7 +251,10 @@ function setScreen(screen) {
   } else {
     cancelFolderRender();
   }
+  const leavingUpscale = state.screen === "upscale" && screen !== "upscale";
   state.screen = screen;
+  if (leavingUpscale && typeof upscaleLeave === "function") upscaleLeave();
+  if (screen === "upscale" && typeof upscaleEnter === "function") upscaleEnter();
   if (screen === "download") refreshDiskSpace();
   if (screen === "settings") {
     state.pairing.confirmRevoke = false;
@@ -279,6 +287,9 @@ function render(options = {}) {
   const keptVideo = takeReusableMainPlayerVideo();
   reuseMainPlayerVideo = Boolean(keptVideo);
   const dialogOpen = Boolean(modalKey());
+  // The same dialog is still open (e.g. download progress re-renders the screen behind it):
+  // don't replay its entrance animation, or it flashes on every tick.
+  const sameDialog = dialogOpen && modalKey() === lastRenderedModalKey;
   let html = "";
   try {
     html = `
@@ -290,6 +301,7 @@ function render(options = {}) {
       </div>
       ${renderCaptureDialog()}
       ${renderRemoteModal()}
+      ${typeof renderUpscaleModals === "function" ? renderUpscaleModals() : ""}
       ${state.intro ? renderIntro() : ""}
     </div>
   `;
@@ -297,6 +309,7 @@ function render(options = {}) {
     reuseMainPlayerVideo = false;
   }
   root.innerHTML = html;
+  if (sameDialog) root.querySelectorAll(".dialog-overlay").forEach((el) => el.classList.add("is-steady"));
   if (keptVideo) root.querySelector("[data-main-video-slot]")?.replaceWith(keptVideo);
   lastRenderedScreen = state.screen;
   lastRenderedModalKey = modalKey();
@@ -351,6 +364,7 @@ function modalKey() {
   if (capture) return `capture:${capture.captureId}`;
   if (state.remote.pairingActive) return `pair:${state.remote.pairingRequestId || state.remote.pairingPin}`;
   if (state.remote.qrUrl || state.remote.loading) return "qr";
+  if (typeof upscaleModalKey === "function") return upscaleModalKey();
   return "";
 }
 
@@ -454,6 +468,7 @@ function renderSidebar() {
         ${navItem("download", "Tải xuống", "download", pending)}
         ${navItem("folder", "Thư viện", "library")}
         ${navItem("player", "Trình phát", "player")}
+        ${typeof renderUpscaleNavItem === "function" ? renderUpscaleNavItem() : ""}
         <button type="button" class="nav-item is-soon" disabled aria-disabled="true">
           ${icon("subtitleAi", { size: 20, stroke: 2 })}
           <span>Phụ đề AI</span>
@@ -500,6 +515,7 @@ function renderScreen() {
   if (state.screen === "player") return renderPlayerStudio();
   if (state.screen === "folder") return renderFolderPlayer();
   if (state.screen === "settings") return renderSettings();
+  if (state.screen === "upscale" && typeof renderUpscale === "function") return renderUpscale();
   return renderHome();
 }
 
@@ -3327,6 +3343,12 @@ async function handleDroppedPaths(paths) {
   const files = kinds.filter((k) => k.kind === "file").map((k) => k.path);
   const playable = files.filter((p) => isVideoPath(p) || isSubtitlePath(p));
   const skipped = files.length - playable.length;
+
+  // On the upscale tab a dropped video becomes the video to upscale instead of playing it.
+  if (state.screen === "upscale" && typeof upscaleOnDrop === "function") {
+    const video = files.find((p) => isVideoPath(p));
+    if (video) return upscaleOnDrop(video, files.length + folders.length);
+  }
 
   if (folders.length) {
     await openDroppedFolders(folders);

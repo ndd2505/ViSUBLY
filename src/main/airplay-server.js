@@ -37,11 +37,9 @@ function deviceNameFromUserAgent(ua = '') {
     return 'Thiết bị';
 }
 const ffmpeg = require('fluent-ffmpeg');
-let ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-if (ffmpegPath.includes('app.asar')) {
-    ffmpegPath = ffmpegPath.replace('app.asar', 'app.asar.unpacked');
-}
-ffmpeg.setFfmpegPath(ffmpegPath);
+const { resolveFfmpegPath } = require('./ffmpeg-path');
+const ffmpegPath = resolveFfmpegPath();
+if (ffmpegPath) ffmpeg.setFfmpegPath(ffmpegPath);
 
 const Bonjour = require('bonjour-service');
 

@@ -6,6 +6,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    # Pushing a ci/* branch runs the same build (artifacts only, no Release) for diagnosis.
+    branches: ["ci/**"]
   workflow_dispatch:
 
 permissions:
@@ -38,7 +40,15 @@ jobs:
           node scripts/test-remote-pairing.js
 
       - name: Build installer and portable app
-        run: npm run package:win:ci
+        shell: pwsh
+        run: |
+          npm run package:win:ci *>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            # Surface the tail of the log as an annotation (readable on the run page / API).
+            $tail = (Get-Content build.log -Tail 60 | ForEach-Object { $_ -replace '%', '%25' -replace "`r", '' }) -join '%0A'
+            Write-Output "::error title=Build failed::$tail"
+            exit 1
+          }
 
       - name: Checksums
         shell: pwsh

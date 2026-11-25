@@ -10,10 +10,15 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-D7FF61?labelColor=1A1620">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.1-D7FF61?labelColor=1A1620">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-1A1620">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-1A1620">
   <img alt="Chrome extension" src="https://img.shields.io/badge/Chrome-MV3%20extension-1A1620">
+</p>
+
+<p align="center">
+  <a href="https://github.com/ndd2505/ViSUBLY/releases/latest"><b>Download for Windows</b></a>
+  &nbsp;·&nbsp; or clone the repo and double-click <code>Install-ViSUBLY.cmd</code>
 </p>
 
 <p align="center">
@@ -28,6 +33,7 @@
 - **Download manager.** Paste a URL or a cURL command, run up to 3 downloads at once, see speed and ETA, and get readable error messages. The downloader and ffmpeg are bundled, so you don't need to install Python.
 - **Player built for subtitles.** SRT and VTT files (UTF‑8, UTF‑16 and Windows‑1258) load automatically, and the folder becomes a playlist. Theater and fullscreen modes have an auto-hiding control bar, and there are keyboard shortcuts.
 - **Open with ViSUBLY.** Set it as the default app for `.mp4 .m4v .mkv .webm .mov` and double-click a file to play it.
+- **Drag and drop.** Drop folders onto the window to browse them in **Thư viện** (Library); several folders are merged into one library. Drop a video to play it, or a subtitle file to load it.
 - **Watch on iPhone.** Pair once by scanning a QR code or tapping **Cho phép** ("Allow") on the PC. After that the phone reconnects on its own.
 - **Dark and light themes.** Dark is the default. You can choose **Tối** (Dark), **Sáng** (Light) or **Theo Windows** (follow Windows).
 
@@ -87,6 +93,14 @@
 | `T` | Theater mode |
 | `Shift` + `N` / `P` | Next / previous video in the folder |
 | `Esc` | Leave fullscreen, then theater |
+
+### Drag and drop
+
+Drop items anywhere in the window:
+
+- **Folders** open in **Thư viện** (Library), and subfolders are scanned too. Dropping several folders merges them into one library, grouped by folder.
+- **Videos** play right away, with the rest of their folder as the playlist.
+- **`.srt` or `.vtt` files** load onto the video that is playing.
 
 ### Open videos straight from Windows
 
@@ -158,7 +172,11 @@ These parts are visible in the app as **Sắp có** ("Coming soon") or are plann
 
 ## Install
 
-1. **Get the installer.** Build it (see below) or download `Visubly Studio Setup 1.0.0.exe` from Releases once one is published. Run it, choose a folder, and Desktop and Start Menu shortcuts are created. A portable `.exe` is also produced.
+1. **Get the installer.** Use one of these:
+   - Download **`ViSUBLY-Setup-x.y.z.exe`** from the [latest release](https://github.com/ndd2505/ViSUBLY/releases/latest) and run it.
+   - In a clone of this repo, **double-click `Install-ViSUBLY.cmd`**. It downloads the latest installer, checks its SHA256 checksum and runs it.
+
+   Choose a folder and the installer creates Desktop and Start Menu shortcuts. If you'd rather not install, use `ViSUBLY-Portable-x.y.z.exe`.
 2. **Install the Chrome extension.**
    1. In ViSUBLY, open **Cài đặt → Kết nối Chrome → Mở thư mục extension** (Settings → Connect Chrome → Open extension folder).
    2. In Chrome, open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select that folder.
@@ -177,6 +195,13 @@ npm install
 npm run start           # run in development
 npm run check           # quick app checks
 npm run package:win     # downloader exe (PyInstaller) + NSIS installer + portable build in dist\
+```
+
+**Releases** are built by GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)). Pushing a tag such as `v1.0.2` runs the tests, builds the installer and portable app, and publishes them with `SHA256SUMS.txt` to GitHub Releases:
+
+```powershell
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 Tests:

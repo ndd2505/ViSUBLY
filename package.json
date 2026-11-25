@@ -1,7 +1,7 @@
 {
   "name": "visubly-desktop",
   "productName": "Visubly Studio",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Desktop UI shell for Visubly video download and Vietnamese subtitle workflows.",
   "main": "src/main/main.js",
   "private": true,
@@ -13,7 +13,8 @@
     "check": "node scripts/check-app.js",
     "build:engine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-downloader.ps1",
     "package:win": "npm run build:engine && electron-builder --win",
-    "package:mac": "electron-builder --mac dmg"
+    "package:mac": "electron-builder --mac dmg",
+    "package:win:ci": "npm run build:engine && electron-builder --win --publish never"
   },
   "devDependencies": {
     "electron": "^31.7.7",
@@ -85,13 +86,13 @@
         "en_US",
         "vi_VN"
       ],
-      "artifactName": "${productName} Setup ${version}.${ext}",
+      "artifactName": "ViSUBLY-Setup-${version}.${ext}",
       "installerSidebar": "build/installerSidebar.bmp",
       "uninstallerSidebar": "build/installerSidebar.bmp",
       "installerHeader": "build/installerHeader.bmp"
     },
     "portable": {
-      "artifactName": "${productName} ${version} Portable.${ext}"
+      "artifactName": "ViSUBLY-Portable-${version}.${ext}"
     },
     "mac": {
       "target": "dmg",

@@ -1,6 +1,6 @@
 # ViSUBLY — Ghi chú bàn giao (kết thúc Giai đoạn 1 · v1.0)
 
-> Cập nhật: 2026-11-25 · Nhánh: `release/v1.0` (chưa gộp vào `main`) · App: **Visubly Studio 1.0.0** · Extension: **ViSUBLY Grabber 1.1.2**
+> Cập nhật: 2026-11-25 · Nhánh chính: `main` (đã gộp `release/v1.0`) · App: **Visubly Studio 1.0.0** · Extension: **ViSUBLY Grabber 1.1.2**
 
 Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) để nắm nhanh trạng thái và làm tiếp tính năng mới.
 

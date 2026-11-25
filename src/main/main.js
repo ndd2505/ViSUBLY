@@ -232,6 +232,15 @@ function createWindow() {
 
   // A fresh renderer pulls pending files again (app:takeOpenFiles) once its handlers exist.
   openFilesRendererReady = false;
+  // The window only ever shows the app page: a file/link dropped somewhere the renderer didn't
+  // handle must not navigate it away (that replaced the whole UI with the dropped file).
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (url !== mainWindow.webContents.getURL()) event.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
   mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
 }
@@ -569,6 +578,69 @@ ipcMain.handle("media:scanVideoFolder", async (_event, folderPath, options = {})
   airplayServer.setFolder(result);
   return result;
 });
+
+// Several folders dropped at once: scan each (recursively) and merge into one library.
+ipcMain.handle("media:scanVideoFolders", async (_event, folderPaths = []) => {
+  const roots = [...new Set((Array.isArray(folderPaths) ? folderPaths : []).map((p) => String(p || "")).filter(Boolean))].slice(0, 20);
+  if (!roots.length) throw new Error("Chưa có thư mục nào.");
+  const scans = [];
+  const failed = [];
+  for (const root of roots) {
+    try {
+      scans.push(await scanVideoFolder(root));
+    } catch (error) {
+      failed.push({ path: root, error: error.message });
+    }
+  }
+  if (!scans.length) throw new Error(failed[0]?.error || "Không quét được thư mục.");
+  const merged = mergeFolderScans(scans);
+  airplayServer.setFolder(merged);
+  return { ...merged, failed };
+});
+
+// Drag & drop: tell the renderer which dropped paths are folders and which are files.
+ipcMain.handle("file:kinds", async (_event, paths = []) => {
+  const list = Array.isArray(paths) ? paths.slice(0, 200) : [];
+  return Promise.all(list.map(async (p) => {
+    try {
+      const stat = await fs.promises.stat(String(p));
+      return { path: String(p), kind: stat.isDirectory() ? "folder" : stat.isFile() ? "file" : "other" };
+    } catch {
+      return { path: String(p), kind: "missing" };
+    }
+  }));
+});
+
+function mergeFolderScans(scans) {
+  if (scans.length === 1) return { ...scans[0], paths: [scans[0].path] };
+  const videos = [];
+  let truncated = false;
+  for (const scan of scans) {
+    for (const video of scan.videos) {
+      if (videos.length >= maxFolderVideos) {
+        truncated = true;
+        break;
+      }
+      // Prefix with the dropped folder's name so the library groups by root; ids must stay unique.
+      videos.push({
+        ...video,
+        id: `folder-video-${videos.length}`,
+        folder: video.folder ? path.join(scan.name, video.folder) : scan.name,
+        relativePath: path.join(scan.name, video.relativePath)
+      });
+    }
+  }
+  return {
+    path: scans[0].path,
+    paths: scans.map((scan) => scan.path),
+    name: `${scans.length} thư mục`,
+    videos,
+    subtitleCount: scans.reduce((sum, scan) => sum + (scan.subtitleCount || 0), 0),
+    skippedFolders: scans.reduce((sum, scan) => sum + (scan.skippedFolders || 0), 0),
+    truncated: truncated || scans.some((scan) => scan.truncated),
+    scannedAt: new Date().toISOString()
+  };
+}
 
 // --- AirPlay API ---
 ipcMain.handle("airplay:start", async () => {

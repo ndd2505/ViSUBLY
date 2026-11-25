@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 // Returns an unsubscribe function, like the existing on* helpers.
 const subscribe = (channel) => (callback) => {
@@ -63,6 +63,16 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
   openInSystemPlayer: (filePath) => ipcRenderer.invoke("media:openInSystemPlayer", filePath),
   toFileUrl: (filePath) => ipcRenderer.invoke("media:toFileUrl", filePath),
   scanVideoFolder: (folderPath, options) => ipcRenderer.invoke("media:scanVideoFolder", folderPath, options),
+  scanVideoFolders: (folderPaths) => ipcRenderer.invoke("media:scanVideoFolders", folderPaths),
+  // Dropped File -> absolute path (File.path is gone in newer Electron).
+  getPathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file) || "";
+    } catch {
+      return "";
+    }
+  },
+  fileKinds: (paths) => ipcRenderer.invoke("file:kinds", paths),
   findMatchingSubtitle: (videoPath) => ipcRenderer.invoke("media:findMatchingSubtitle", videoPath),
   airplay: {
     start: () => ipcRenderer.invoke("airplay:start"),

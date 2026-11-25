@@ -1497,8 +1497,8 @@ function renderFolderPlayer() {
       ${!hasFolder && !f.scanning ? `
         <div class="folder-empty empty">
           <span class="play-dot">${icon("folder")}</span>
-          <h3 class="h3">Chọn một thư mục</h3>
-          <div class="muted">ViSUBLY sẽ quét các file video trong thư mục và giữ danh sách này cho tới khi bạn đóng app, đóng thư mục hoặc chọn thư mục khác.</div>
+          <h3 class="h3">Kéo thả thư mục vào đây</h3>
+          <div class="muted">Hoặc bấm Chọn thư mục. ViSUBLY quét các video trong thư mục (cả thư mục con); thả nhiều thư mục để gộp thành một thư viện.</div>
           <div class="empty-actions">${btn("Chọn thư mục", "choose-video-folder", "primary", "folder")}</div>
         </div>
       ` : ""}
@@ -1956,33 +1956,7 @@ function attachPlayerStage() {
   const playerDrop = stage.querySelector("[data-player-drop]");
   if (!playerDrop) return;
 
-  playerDrop.ondragover = (event) => {
-    event.preventDefault();
-    playerDrop.classList.add("dragging");
-  };
-  playerDrop.ondragleave = (event) => {
-    if (!playerDrop.contains(event.relatedTarget)) playerDrop.classList.remove("dragging");
-  };
-  playerDrop.ondrop = async (event) => {
-    event.preventDefault();
-    playerDrop.classList.remove("dragging");
-    const file = event.dataTransfer.files?.[0];
-    if (!file) return;
-
-    const filePath = file.path || file.name;
-    if (isSubtitlePath(filePath)) {
-      await loadSubtitlePath(filePath);
-      render();
-      return;
-    }
-
-    if (isVideoPath(filePath)) {
-      const token = await loadVideoPath(filePath);
-      if (token !== state.player.sourceToken) return;
-      state.player.playing = true;
-      render();
-    }
-  };
+  // Drops on the player are handled by the window-wide drop handler (initDropBridge).
 
   const ignoreFrameClick = (event) => Boolean(event.target.closest("button, input, a, [data-player-folder-rail], .player-error"));
   // Single click toggles playback, double click toggles fullscreen (the two
@@ -3170,6 +3144,117 @@ async function openFolderVideo(index, fallbackPath = "") {
   return setScreen("player");
 }
 
+// ---------- Drag & drop anywhere in the window ----------
+// Folders -> Thư viện (merged if several), videos -> play, .srt/.vtt -> captions.
+let dropDepth = 0;
+let dropOverlay = null;
+let dropHideTimer = null;
+
+// dragover keeps firing while a drag is over the window; if it stops (Esc, drag cancelled,
+// a missed dragleave) hide the overlay anyway so it can never get stuck.
+function armDropWatchdog() {
+  clearTimeout(dropHideTimer);
+  dropHideTimer = setTimeout(() => {
+    dropDepth = 0;
+    setDropActive(false);
+  }, 1000);
+}
+
+function dragHasFiles(event) {
+  return Array.from(event.dataTransfer?.types || []).includes("Files");
+}
+
+function setDropActive(active) {
+  if (!dropOverlay) return;
+  if (active) {
+    dropOverlay.querySelector("[data-drop-text]").textContent = state.screen === "folder"
+      ? "Thả thư mục để mở trong Thư viện"
+      : "Thả thư mục, video hoặc phụ đề để mở";
+  }
+  document.body.classList.toggle("is-dropping", active);
+}
+
+function initDropBridge() {
+  dropOverlay = document.createElement("div");
+  dropOverlay.className = "drop-overlay";
+  dropOverlay.setAttribute("aria-hidden", "true");
+  dropOverlay.innerHTML = `<div class="drop-overlay-card">${icon("folder", { size: 30, stroke: 2 })}<strong data-drop-text></strong><span>Thư mục · .mp4 .mkv .webm .mov · .srt .vtt</span></div>`;
+  document.body.appendChild(dropOverlay);
+
+  document.addEventListener("dragenter", (event) => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    dropDepth += 1;
+    setDropActive(true);
+    armDropWatchdog();
+  });
+  document.addEventListener("dragover", (event) => {
+    if (!dragHasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    if (!document.body.classList.contains("is-dropping")) setDropActive(true);
+    armDropWatchdog();
+  });
+  document.addEventListener("dragleave", (event) => {
+    if (!dragHasFiles(event)) return;
+    dropDepth = Math.max(0, dropDepth - 1);
+    if (!dropDepth) setDropActive(false);
+  });
+  document.addEventListener("drop", (event) => {
+    // Never let Chromium open the dropped item in place of the app.
+    event.preventDefault();
+    clearTimeout(dropHideTimer);
+    dropDepth = 0;
+    setDropActive(false);
+    if (!dragHasFiles(event)) return;
+    // Paths must be read synchronously, before the DataTransfer is cleared.
+    const paths = Array.from(event.dataTransfer.files || [])
+      .map((file) => (typeof desktop.getPathForFile === "function" ? desktop.getPathForFile(file) : file.path) || "")
+      .filter(Boolean);
+    handleDroppedPaths(paths).catch(() => showToast("Không mở được mục vừa thả"));
+  });
+}
+
+async function handleDroppedPaths(paths) {
+  if (!paths.length) return;
+  const kinds = typeof desktop.fileKinds === "function"
+    ? await desktop.fileKinds(paths)
+    : paths.map((p) => ({ path: p, kind: pathExtension(p) ? "file" : "folder" }));
+  const folders = kinds.filter((k) => k.kind === "folder").map((k) => k.path);
+  const files = kinds.filter((k) => k.kind === "file").map((k) => k.path);
+  const playable = files.filter((p) => isVideoPath(p) || isSubtitlePath(p));
+  const skipped = files.length - playable.length;
+
+  if (folders.length) {
+    await openDroppedFolders(folders);
+    if (files.length) showToast(`Đã mở ${folders.length} thư mục; bỏ qua ${files.length} file lẻ`);
+    return;
+  }
+  if (playable.length) {
+    enqueueOpenFiles(playable);
+    if (skipped) showToast(`Đã bỏ qua ${skipped} file không phải video hoặc phụ đề`);
+    return;
+  }
+  showToast("ViSUBLY chưa mở được loại file này. Hãy thả thư mục, video hoặc file phụ đề.");
+}
+
+async function openDroppedFolders(folders) {
+  dismissIntro();
+  state.folder = { ...emptyFolderState(), path: folders[0], scanning: true };
+  setScreen("folder");
+  try {
+    const result = folders.length > 1 && desktop.scanVideoFolders
+      ? await desktop.scanVideoFolders(folders)
+      : await desktop.scanVideoFolder(folders[0]);
+    applyFolderScan(result);
+    if (Array.isArray(result.failed) && result.failed.length) showToast(`Không quét được ${result.failed.length} thư mục`);
+    else if (!state.folder.videos.length) showToast("Không tìm thấy video nào trong thư mục này");
+  } catch (error) {
+    state.folder = { ...state.folder, scanning: false, error: error?.message || "Không quét được thư mục này." };
+  }
+  render();
+}
+
 // ---------- Files opened from Windows (default app / "Open with") ----------
 function pathDirName(pathValue) {
   const value = String(pathValue || "");
@@ -3683,6 +3768,7 @@ function seekMainPlayerBy(delta) {
 function emptyFolderState() {
   return {
     path: "",
+    paths: [],
     name: "",
     videos: [],
     visibleLimit: folderPageSize,
@@ -3720,7 +3806,10 @@ async function rescanVideoFolder() {
   render();
 
   try {
-    const result = await desktop.scanVideoFolder(state.folder.path);
+    const roots = Array.isArray(state.folder.paths) ? state.folder.paths : [];
+    const result = roots.length > 1 && desktop.scanVideoFolders
+      ? await desktop.scanVideoFolders(roots)
+      : await desktop.scanVideoFolder(state.folder.path);
     applyFolderScan(result);
   } catch (error) {
     state.folder = { ...state.folder, scanning: false, error: error?.message || "Không quét lại được thư mục này." };
@@ -3780,6 +3869,8 @@ function applyFolderScan(result = {}) {
 
   state.folder = {
     path: String(result.path || ""),
+    // Roots of a merged library (several dropped folders); rescan scans them all again.
+    paths: Array.isArray(result.paths) && result.paths.length ? result.paths.map(String) : (result.path ? [String(result.path)] : []),
     name: String(result.name || pathBaseName(result.path) || result.path || ""),
     videos: videos,
     visibleLimit: folderPageSize,
@@ -4157,6 +4248,7 @@ async function bootstrap() {
   initAirPlayPairingBridge();
   render();
   initOpenFilesBridge();
+  initDropBridge();
   if (state.intro) introTimer = window.setTimeout(dismissIntro, introDurationMs);
   await refreshSettings();
   refreshAppInfo();

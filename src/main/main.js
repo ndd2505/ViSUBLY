@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const airplayServer = require("./airplay-server");
+const videoEnhance = require("./video-enhance");
 
 const projectRoot = path.resolve(__dirname, "..", "..");
 // build/icon.* is shipped inside app.asar (see package.json build.files), so this works packaged and in dev.
@@ -79,7 +80,9 @@ const defaultSettings = Object.freeze({
   ignoreShortVideosSec: 120,
   theme: "dark",
   // Start the iPhone Remote server with the app once at least one phone is trusted.
-  remoteAutoStart: true
+  remoteAutoStart: true,
+  // Real-time GPU video super resolution when the device supports it (see video-enhance.js).
+  videoEnhance: true
 });
 const themeModes = new Set(["dark", "light", "system"]);
 const ignoreShortVideoChoices = new Set([0, 30, 60, 120, 300]);
@@ -292,9 +295,114 @@ function logMain(level, message) {
 
 if (process.platform === "win32") app.setAppUserModelId("app.visubly.studio");
 
+// ---------- Real-time video enhancement (GPU video super resolution) ----------
+const enhanceGuardPath = path.join(runtimePaths.userData, "gpu-guard.json");
+const enhanceState = {
+  launchActive: false,     // Chromium features enabled for this run
+  guard: { startupPending: false, disabledReason: "" },
+  support: null,           // detectEnhanceSupport() result, filled after app ready
+  stableTimer: null
+};
+
+// Must run before app "ready": Chromium reads feature switches at startup.
+function planVideoEnhanceLaunch() {
+  const plan = videoEnhance.planLaunch({ settingOn: settings.videoEnhance !== false, guard: videoEnhance.readGuard(enhanceGuardPath) });
+  if (plan.disabledNow) {
+    settings = { ...settings, videoEnhance: false };
+    writeSettingsFile(settings);
+    logMain("warn", "Video enhancement turned off: the previous launch did not finish starting with it on.");
+  }
+  enhanceState.launchActive = plan.enhanceOnLaunch;
+  enhanceState.guard = plan.guard;
+  videoEnhance.writeGuard(enhanceGuardPath, enhanceState.guard);
+  if (enhanceState.launchActive) app.commandLine.appendSwitch("enable-features", videoEnhance.FEATURES_ON.join(","));
+  else app.commandLine.appendSwitch("disable-features", videoEnhance.FEATURES_OFF.join(","));
+}
+
+function markEnhanceLaunchStable() {
+  if (!enhanceState.guard.startupPending) return;
+  enhanceState.guard = { ...enhanceState.guard, startupPending: false };
+  videoEnhance.writeGuard(enhanceGuardPath, enhanceState.guard);
+}
+
+async function detectVideoEnhanceSupport() {
+  try {
+    const gpuInfo = await app.getGPUInfo("complete");
+    enhanceState.support = videoEnhance.detectEnhanceSupport({ platform: process.platform, gpuInfo, featureStatus: app.getGPUFeatureStatus() });
+  } catch (error) {
+    enhanceState.support = { supported: false, tech: null, techLabel: "", reason: `Không đọc được thông tin card đồ họa (${error.message}).` };
+  }
+  logMain("info", `Video enhancement: ${enhanceState.support.supported ? enhanceState.support.techLabel : "unsupported"} (${enhanceState.support.gpu || "unknown GPU"}).`);
+  sendToRenderer("video:enhance-changed", videoEnhanceStatus());
+}
+
+function videoEnhanceStatus() {
+  const support = enhanceState.support || { supported: false, pending: true, reason: "Đang kiểm tra card đồ họa…" };
+  const setting = settings.videoEnhance !== false;
+  return {
+    setting,
+    launchActive: enhanceState.launchActive,
+    supported: Boolean(support.supported),
+    pending: Boolean(support.pending),
+    effective: setting && enhanceState.launchActive && Boolean(support.supported),
+    needsRestart: setting && !enhanceState.launchActive,
+    tech: support.tech || null,
+    techLabel: support.techLabel || "",
+    shortLabel: support.shortLabel || "",
+    gpu: support.gpu || "",
+    driver: support.driver || null,
+    reason: support.reason || "",
+    hint: support.hint || "",
+    disabledReason: enhanceState.guard.disabledReason || "",
+    disabledText: videoEnhance.DISABLED_REASON_TEXT[enhanceState.guard.disabledReason] || ""
+  };
+}
+
+async function setVideoEnhance(on, reason = "") {
+  if (on) enhanceState.guard = { ...enhanceState.guard, disabledReason: "" };
+  else if (reason) enhanceState.guard = { ...enhanceState.guard, disabledReason: reason };
+  videoEnhance.writeGuard(enhanceGuardPath, enhanceState.guard);
+  await updateSettings({ videoEnhance: Boolean(on) });
+  const status = videoEnhanceStatus();
+  sendToRenderer("video:enhance-changed", status);
+  return status;
+}
+
+ipcMain.handle("video:getEnhanceStatus", () => videoEnhanceStatus());
+ipcMain.handle("video:setEnhance", (_event, on) => setVideoEnhance(Boolean(on)));
+// The player saw sustained dropped frames while enhancing: turn it off (the renderer stops it at once).
+ipcMain.handle("video:reportStutter", async (_event, info = {}) => {
+  if (settings.videoEnhance === false) return videoEnhanceStatus();
+  logMain("warn", `Video enhancement turned off after stutter (dropped ${Math.round(Number(info.dropRatio || 0) * 100)}%).`);
+  return setVideoEnhance(false, "stutter");
+});
+ipcMain.handle("app:relaunch", () => {
+  app.relaunch();
+  app.quit();
+});
+
+app.on("child-process-gone", (_event, details) => {
+  if (details.type !== "GPU" || details.reason === "clean-exit") return;
+  logMain("warn", `GPU process gone (${details.reason}, exit ${details.exitCode}).`);
+  if (enhanceState.launchActive && settings.videoEnhance !== false) {
+    setVideoEnhance(false, "gpu-crash").catch(() => {});
+  }
+});
+
+// A normal quit is a stable run too, even if it happened in the first seconds.
+app.on("before-quit", markEnhanceLaunchStable);
+
+// Settings are loaded by now (single-instance branch above) and the app is not ready yet.
+if (gotSingleInstanceLock) planVideoEnhanceLaunch();
+
 if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
     createWindow();
+    detectVideoEnhanceSupport();
+    // Running for a while with the renderer up = this launch with enhancement on is stable.
+    mainWindow.webContents.once("did-finish-load", () => {
+      enhanceState.stableTimer = setTimeout(markEnhanceLaunchStable, 20000);
+    });
     startCaptureBridge();
     if (settings.remoteAutoStart && airplayServer.hasDevices()) {
       airplayServer.start().catch((error) => logMain("warn", `Remote auto-start failed: ${error.message}`));
@@ -1922,6 +2030,7 @@ function sanitizeSettings(input = {}, base = defaultSettings) {
   if (ignoreShortVideoChoices.has(Number(input.ignoreShortVideosSec))) next.ignoreShortVideosSec = Number(input.ignoreShortVideosSec);
   if (themeModes.has(input.theme)) next.theme = input.theme;
   if (typeof input.remoteAutoStart === "boolean") next.remoteAutoStart = input.remoteAutoStart;
+  if (typeof input.videoEnhance === "boolean") next.videoEnhance = input.videoEnhance;
   return next;
 }
 

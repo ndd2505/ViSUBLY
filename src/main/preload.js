@@ -94,6 +94,13 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
   },
   download: downloadApi,
   settings: settingsApi,
+  video: {
+    getEnhanceStatus: () => ipcRenderer.invoke("video:getEnhanceStatus"),
+    setEnhance: (on) => ipcRenderer.invoke("video:setEnhance", on),
+    reportStutter: (info) => ipcRenderer.invoke("video:reportStutter", info),
+    onEnhanceChanged: subscribe("video:enhance-changed")
+  },
+  relaunch: () => ipcRenderer.invoke("app:relaunch"),
   app: {
     getInfo: () => ipcRenderer.invoke("app:getInfo"),
     diskSpace: () => ipcRenderer.invoke("app:diskSpace"),

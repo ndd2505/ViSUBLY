@@ -38,6 +38,7 @@ jobs:
           node scripts/test-capture-bridge.js
           node scripts/test-extension-streams.mjs
           node scripts/test-remote-pairing.js
+          node scripts/test-video-enhance.js
 
       - name: Build installer and portable app
         shell: pwsh

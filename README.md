@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.2-D7FF61?labelColor=1A1620">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-D7FF61?labelColor=1A1620">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-1A1620">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-1A1620">
   <img alt="Chrome extension" src="https://img.shields.io/badge/Chrome-MV3%20extension-1A1620">
@@ -31,6 +31,7 @@
 
 - **One-click capture from Chrome.** No DevTools or "Copy as cURL" needed. The extension finds the video on the page, lists its qualities with estimated sizes, and sends it to the app.
 - **Download manager.** Paste a URL or a cURL command, run up to 3 downloads at once, see speed and ETA, and get readable error messages. The downloader and ffmpeg are bundled, so you don't need to install Python.
+- **Sharper playback on RTX GPUs.** NVIDIA RTX Video Super Resolution upscales low-resolution video live while it plays. Nothing is processed in advance and no new file is created. If the GPU doesn't support it, the video plays at its original quality, and you can turn it off in Settings.
 - **Player built for subtitles.** SRT and VTT files (UTF‑8, UTF‑16 and Windows‑1258) load automatically, and the folder becomes a playlist. Theater and fullscreen modes have an auto-hiding control bar, and there are keyboard shortcuts.
 - **Open with ViSUBLY.** Set it as the default app for `.mp4 .m4v .mkv .webm .mov` and double-click a file to play it.
 - **Drag and drop.** Drop folders onto the window to browse them in **Thư viện** (Library); several folders are merged into one library. Drop a video to play it, or a subtitle file to load it.
@@ -82,6 +83,13 @@
 - **Folder playlist** with previous and next buttons and auto-advance to the next episode.
 - **Theater and fullscreen** modes put the video on black, never cropped. The overlay control bar auto-hides after 2.5 s, and subtitles move up while it is visible.
 - Formats the built-in player can't decode (AVI, HEVC…) show a clear message with an **Open with…** button.
+- **Live video enhancement** (setting **Nâng chất lượng video**, on by default):
+  - **NVIDIA RTX 20-series or newer** uses RTX Video Super Resolution. Turn on *RTX Video Enhancement → Super Resolution* in the NVIDIA App.
+  - **Intel Arc / Iris Xe** uses Intel Video Super Resolution (experimental).
+  - It kicks in whenever the video is shown larger than its resolution: a big window, theater mode or fullscreen. The player then shows a **"Nâng nét RTX"** ("RTX sharpening") badge.
+  - Before enabling, ViSUBLY checks the GPU and its driver. On any other hardware, the video plays at its original quality.
+  - Turning it off takes effect immediately.
+  - If it causes trouble, it switches itself off and tells you why. That covers a crash at startup, a GPU process crash, or sustained dropped frames.
 
 | Key | Action |
 |---|---|
@@ -210,6 +218,7 @@ Tests:
 node scripts/test-capture-bridge.js       # Chrome ↔ app bridge (pairing, auth, probe)
 node scripts/test-extension-streams.mjs   # extension stream grouping
 node scripts/test-remote-pairing.js       # iPhone Remote pairing, trusted devices, WebSocket auth
+node scripts/test-video-enhance.js        # GPU detection + crash guard for live video enhancement
 ```
 
 ## Project structure

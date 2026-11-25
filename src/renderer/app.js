@@ -159,7 +159,9 @@ const state = {
     running: false,
     awake: false,
     awakeReason: ""
-  }
+  },
+  // Real-time GPU video super resolution status from the main process (video:getEnhanceStatus).
+  enhance: null
 };
 
 let folderThumbTimer = null;
@@ -877,6 +879,7 @@ function renderSettings() {
               ${segButton("set-theme", "system", "Theo Windows", mode === "system")}
             </div>
           </section>
+          ${renderEnhanceSettings()}
 
           <section class="card settings-card">
             <h2 class="h2">Tải xuống</h2>
@@ -916,6 +919,99 @@ function renderSettings() {
       </div>
     </section>
   `;
+}
+
+function renderEnhanceSettings() {
+  const e = state.enhance;
+  if (!e) return "";
+  const on = e.setting;
+  let status;
+  if (e.pending) status = "Đang kiểm tra card đồ họa…";
+  else if (!e.supported) status = e.reason || "Máy này chưa hỗ trợ, nên video được phát ở chất lượng gốc.";
+  else if (!on) status = "Đang tắt: video được phát ở chất lượng gốc.";
+  else if (e.needsRestart) status = "Sẽ bật sau khi khởi động lại ViSUBLY.";
+  else status = `Đang hoạt động: ${e.techLabel}. Video được nâng nét khi hiển thị lớn hơn độ phân giải gốc (cửa sổ lớn, theater, toàn màn hình).`;
+  return `
+    <section class="card settings-card">
+      <div class="setting-row">
+        <div class="setting-text">
+          <h2 class="h2">Nâng chất lượng video</h2>
+          <span class="setting-hint">Card đồ họa nâng nét ngay khi phát — không xử lý trước, không tạo file mới.</span>
+        </div>
+        <button type="button" class="switch ${on ? "is-on" : ""}" role="switch" aria-checked="${on}" aria-label="Nâng chất lượng video" data-action="toggle-video-enhance"><span class="switch-knob"></span></button>
+      </div>
+      <div class="enhance-status ${e.effective ? "is-active" : ""}">
+        <span class="enhance-dot" aria-hidden="true"></span>
+        <span>${escapeHtml(status)}</span>
+      </div>
+      ${e.disabledText ? `<div class="note is-warning">${escapeHtml(e.disabledText)}${on ? "" : " Bạn có thể bật lại nếu muốn thử tiếp."}</div>` : ""}
+      ${e.gpu ? kvRow("Card đồ họa", `<span class="mono-text">${escapeHtml(e.gpu)}${e.driver ? ` · driver ${escapeHtml(String(e.driver))}` : ""}</span>`) : ""}
+      ${e.supported && e.hint ? `<span class="setting-hint">${escapeHtml(e.hint)}</span>` : ""}
+      ${e.needsRestart ? `<div class="setting-row is-end">${btn("Khởi động lại ngay", "app-relaunch", "primary")}</div>` : ""}
+    </section>
+  `;
+}
+
+function applyEnhanceStatus(status, { announce = false } = {}) {
+  const previous = state.enhance;
+  state.enhance = status || null;
+  if (announce && status?.disabledText && previous?.setting && !status.setting) showToast(status.disabledText);
+  // The stage class decides overlay eligibility; render() patches it in place during fullscreen.
+  render({ preserveScroll: true });
+}
+
+async function initEnhanceBridge() {
+  if (!desktop.video?.getEnhanceStatus) return;
+  desktop.video.onEnhanceChanged?.((status) => applyEnhanceStatus(status, { announce: true }));
+  try {
+    applyEnhanceStatus(await desktop.video.getEnhanceStatus());
+  } catch {
+    // Optional feature: the player works the same without it.
+  }
+  startStutterWatchdog();
+}
+
+async function toggleVideoEnhance() {
+  if (!desktop.video?.setEnhance || !state.enhance) return;
+  const next = !state.enhance.setting;
+  try {
+    applyEnhanceStatus(await desktop.video.setEnhance(next));
+    if (next && state.enhance?.needsRestart) showToast("Khởi động lại ViSUBLY để bật nâng chất lượng");
+  } catch {
+    showToast("Không đổi được cài đặt nâng chất lượng");
+  }
+}
+
+// Watch for sustained dropped frames while enhancing; if the GPU can't keep up, turn it off.
+let stutterTimer = null;
+const stutterSample = { video: null, dropped: 0, total: 0, strikes: 0 };
+function startStutterWatchdog() {
+  clearInterval(stutterTimer);
+  stutterTimer = setInterval(() => {
+    const video = document.getElementById("mainPlayerVideo");
+    if (!state.enhance?.effective || !video || video.paused || typeof video.getVideoPlaybackQuality !== "function") {
+      stutterSample.strikes = 0;
+      return;
+    }
+    const q = video.getVideoPlaybackQuality();
+    if (stutterSample.video !== video) {
+      Object.assign(stutterSample, { video, dropped: q.droppedVideoFrames, total: q.totalVideoFrames, strikes: 0 });
+      return;
+    }
+    const total = q.totalVideoFrames - stutterSample.total;
+    const dropped = q.droppedVideoFrames - stutterSample.dropped;
+    stutterSample.dropped = q.droppedVideoFrames;
+    stutterSample.total = q.totalVideoFrames;
+    if (total < 60) return; // not enough frames to judge (seek, buffering, short clip)
+    const ratio = dropped / total;
+    stutterSample.strikes = ratio > 0.2 ? stutterSample.strikes + 1 : ratio < 0.05 ? 0 : stutterSample.strikes;
+    if (stutterSample.strikes >= 3) {
+      stutterSample.strikes = 0;
+      // Main replies with the new status and also broadcasts it; whichever arrives first announces it
+      // (applyEnhanceStatus only toasts on the on -> off transition, so it is never shown twice).
+      desktop.video?.reportStutter?.({ dropRatio: ratio }).then((status) => applyEnhanceStatus(status, { announce: true })).catch(() => {});
+    }
+  }, 5000);
 }
 
 function renderRemoteSettings() {
@@ -1196,12 +1292,17 @@ function renderPlayerStudio() {
 }
 
 function playerStageClasses(m) {
+  const enhance = state.enhance;
   return [
     "player-stage",
     m.overlay ? "is-overlay" : "",
     m.fullscreen ? "is-fullscreen" : "",
     // Re-renders must not pop the hidden overlay bar back up mid-playback.
-    m.overlay && playerControlsHidden && m.p.playing ? "is-controls-idle" : ""
+    m.overlay && playerControlsHidden && m.p.playing ? "is-controls-idle" : "",
+    // GPU super resolution only applies to an overlay-eligible video: square corners allow it,
+    // a 1px rounded clip blocks it at once (used when it was switched off during this run).
+    enhance?.effective ? "is-enhanced" : "",
+    enhance?.launchActive && !enhance?.setting ? "is-enhance-blocked" : ""
   ].filter(Boolean).join(" ");
 }
 
@@ -1252,7 +1353,7 @@ function renderPlayerFrameLayer(m) {
 
   return `
     <div class="player-frame-layer" data-player-layer>
-      ${m.hasVideo ? `<div class="player-frame-title" title="${escapeAttr(m.videoName)}"><span>${escapeHtml(titleLabel)}</span><strong>${escapeHtml(m.videoName)}</strong></div>` : ""}
+      ${m.hasVideo ? `<div class="player-frame-title" title="${escapeAttr(m.videoName)}"><span>${escapeHtml(titleLabel)}${state.enhance?.effective ? ` · <em class="enhance-chip" title="${escapeAttr(state.enhance.techLabel)}">Nâng nét ${escapeHtml(state.enhance.shortLabel || "")}</em>` : ""}</span><strong>${escapeHtml(m.videoName)}</strong></div>` : ""}
       ${m.hasSubtitles && p.subtitleOn ? `<div class="${overlayClasses}" style="${overlayStyle}"><span class="main-subtitle-text">${escapeHtml(subtitleText)}</span></div>` : ""}
       ${m.hasVideo && p.mediaError ? renderPlayerMediaError(m) : ""}
       ${m.showFolderRail ? renderPlayerFolderRail(m.folderIndex) : ""}
@@ -1688,6 +1789,8 @@ document.addEventListener("click", async (event) => {
     return undefined;
   }
   if (action === "close-remote") return closeRemoteModal();
+  if (action === "toggle-video-enhance") return toggleVideoEnhance();
+  if (action === "app-relaunch") return desktop.relaunch?.();
   if (action === "remote-allow") return respondRemotePairing(true);
   if (action === "remote-deny") return respondRemotePairing(false);
   if (action === "toggle-remote-autostart") return updateSettings({ remoteAutoStart: !(state.settings?.remoteAutoStart !== false) });
@@ -4249,6 +4352,7 @@ async function bootstrap() {
   render();
   initOpenFilesBridge();
   initDropBridge();
+  initEnhanceBridge();
   if (state.intro) introTimer = window.setTimeout(dismissIntro, introDurationMs);
   await refreshSettings();
   refreshAppInfo();

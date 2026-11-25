@@ -1,6 +1,6 @@
 # ViSUBLY — Ghi chú bàn giao (kết thúc Giai đoạn 1 · v1.0)
 
-> Cập nhật: 2026-11-25 · Nhánh chính: `main` · App: **Visubly Studio 1.0.2** · Extension: **ViSUBLY Grabber 1.1.2** · Release: GitHub Actions khi push tag `v*`
+> Cập nhật: 2026-11-25 · Nhánh chính: `main` · App: **Visubly Studio 1.1.0** · Extension: **ViSUBLY Grabber 1.1.2** · Release: GitHub Actions khi push tag `v*`
 
 Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) để nắm nhanh trạng thái và làm tiếp tính năng mới.
 
@@ -23,6 +23,7 @@ Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) �
 - Bắt link từ Chrome giống IDM: extension phát hiện luồng → gửi sang app qua cổng localhost có ghép nối mã 6 số → hộp thoại "Tải video này?".
 - Gom luồng theo video, đọc độ phân giải + thời lượng + dung lượng ước tính, ẩn video ngắn (mặc định < 2 phút, chỉnh trong Cài đặt).
 - Trình phát: phát file/thư mục, phụ đề SRT/VTT (tự nhận UTF-8/UTF-16/Windows-1258), theater/toàn màn hình với thanh điều khiển nổi tự ẩn, phím tắt.
+- **Nâng chất lượng khi phát** (`src/main/video-enhance.js` + main.js + Cài đặt, mặc định BẬT): dùng VSR của GPU qua Chromium (`NvidiaVpSuperResolution`, `IntelVpSuperResolution`), không xử lý trước. Đã đo trên RTX 3060: chỉ chạy khi video lên **hardware overlay** — bo góc (14px + overflow hidden) ở khung video chặn overlay → khi bật thì `.player-stage.is-enhanced` bỏ bo góc (VSR chạy cả cửa sổ/theater/toàn màn hình khi video phóng to); khi tắt giữa chừng thì `.is-enhance-blocked` bo góc 2px cả `<video>` → tắt ngay không cần khởi động lại. Cờ Chromium chỉ đặt lúc khởi động (`planVideoEnhanceLaunch`, trước app ready): bật → `enable-features`, tắt → `disable-features` (gồm `NvidiaVpTrueHDR`). Nhận diện: `app.getGPUInfo('complete')` + `getGPUFeatureStatus()` → RTX + driver ≥ 531.18 / Intel Arc-Xe; còn lại phát gốc. An toàn: `gpu-guard.json` (`startupPending` — lần mở trước chưa ổn định thì tự tắt; ổn định sau 20 s hoặc khi thoát bình thường), `child-process-gone` GPU → tắt, renderer watchdog rớt khung > 20% trong 15 s → tắt; mọi lần tự tắt đều có lý do hiển thị (`disabledReason`). IPC `video:getEnhanceStatus|setEnhance|reportStutter`, sự kiện `video:enhance-changed`, `app:relaunch`. **Đo/kiểm thử cần chạy ngoài sandbox** (sandbox Claude Code làm Chromium rơi về software rendering): A/B bằng `nvidia-smi` (xung nhịp ~210 MHz khi không VSR, ~700–850 MHz + ~+7–9 W khi có).
 - Kéo thả toàn cửa sổ (`initDropBridge` trong app.js): thư mục → Thư viện (quét đệ quy; nhiều thư mục gộp qua IPC `media:scanVideoFolders`, id đánh lại, nhóm theo tên thư mục gốc; quét lại giữ đủ các gốc `state.folder.paths`), video → phát như Open with, `.srt/.vtt` → nạp phụ đề, loại khác → thông báo. Đường dẫn lấy bằng `webUtils.getPathForFile`, phân loại file/thư mục bằng IPC `file:kinds`. Lớp phủ "Thả để mở" có watchdog 1 s (tự tắt nếu drag bị huỷ). Main chặn `will-navigate`/cửa sổ mới (trước đây thả file ra ngoài khung trình phát làm cửa sổ chuyển sang file đó). Không nhớ thư mục khi mở lại app (người dùng không muốn).
 - Phát hành: `.github/workflows/release.yml` (windows-latest: npm ci → tests → `npm run package:win:ci` → SHA256SUMS → GitHub Release khi push tag `v*`; chạy tay = chỉ artifact). Tên file: `ViSUBLY-Setup-<ver>.exe`, `ViSUBLY-Portable-<ver>.exe`. `Install-ViSUBLY.cmd` (gốc repo) → `scripts/install-windows.ps1`: lấy release mới nhất qua GitHub API, kiểm tra SHA256, chạy bộ cài (`-DownloadOnly` để thử).
 - Mở video trực tiếp từ Windows (Open with / app mặc định): bộ cài đăng ký `.mp4 .m4v .mkv .webm .mov`; app nhận đường dẫn lúc khởi động và khi đang chạy (single-instance), tự lấy các video cùng thư mục (không quét thư mục con) để bấm trước/sau; chọn nhiều file → thành playlist; mở `.srt/.vtt` → nạp vào video đang phát. Nút "Mở bằng trình phát khác" dùng hộp thoại Open with của Windows (tránh mở lại chính ViSUBLY).
@@ -92,6 +93,7 @@ npm.cmd run check                 # kiểm tra nhanh renderer/main
 node scripts/test-capture-bridge.js
 node scripts/test-extension-streams.mjs
 node scripts/test-remote-pairing.js      # ghép nối iPhone (cổng 3599, thư mục tạm)
+node scripts/test-video-enhance.js       # nhận diện GPU + crash guard cho nâng chất lượng
 npm.cmd run package:win           # = build:engine (PyInstaller, cần Python ≥3.10 → .venv-build) + electron-builder
 ```
 Kết quả: `dist\ViSUBLY-Setup-<ver>.exe` (~100 MB), `dist\ViSUBLY-Portable-<ver>.exe`, `dist\win-unpacked\`. Bản phát hành chính thức do GitHub Actions build khi push tag.

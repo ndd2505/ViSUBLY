@@ -773,6 +773,61 @@ img {
   color: var(--danger);
 }
 
+.note.is-warning {
+  border-style: solid;
+  border-color: var(--warn);
+  color: var(--text);
+}
+
+/* ---------- Video enhancement (GPU super resolution) ---------- */
+.enhance-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.enhance-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: var(--muted);
+}
+
+.enhance-status.is-active {
+  color: var(--text);
+}
+
+.enhance-status.is-active .enhance-dot {
+  background: var(--mint);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--mint) 22%, transparent);
+}
+
+.enhance-chip {
+  color: #d7ff61;
+  font-style: normal;
+}
+
+/* Chromium applies NVIDIA/Intel video super resolution only to videos it can place on a hardware
+   overlay, and a rounded clip on the video's ancestors prevents that (measured: 360p video in
+   theater mode stayed at idle GPU clocks until the 14px radius was removed). So: square corners
+   while enhancing; a 1px rounded clip switches it off instantly after the user turns it off. */
+.player-stage.is-enhanced,
+.player-stage.is-enhanced .player-frame {
+  border-radius: 0 !important;
+}
+
+.player-stage.is-enhance-blocked,
+.player-stage.is-enhance-blocked .player-frame,
+.player-stage.is-enhance-blocked .main-player-video {
+  border-radius: 2px !important;
+  overflow: hidden !important;
+}
+
 .empty {
   padding: 24px;
   border: 1.5px dashed var(--line);

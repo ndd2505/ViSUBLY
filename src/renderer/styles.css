@@ -2295,12 +2295,13 @@ body.is-dropping .drop-overlay {
   padding: 6px 12px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 10px;
-  background: rgba(8, 6, 12, 0.72);
+  /* Solid tint, no backdrop-filter: a blurred backdrop over the picture keeps the video off the
+     hardware overlay, which switches GPU super resolution (RTX VSR) off while the chip shows. */
+  background: rgba(8, 6, 12, 0.84);
   color: var(--on-stage);
   display: inline-grid;
   align-content: center;
   gap: 1px;
-  backdrop-filter: blur(10px);
   pointer-events: none;
 }
 

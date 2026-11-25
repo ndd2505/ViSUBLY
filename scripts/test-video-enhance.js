@@ -63,6 +63,16 @@ check("corrupt guard file reads as clean", ve.readGuard(file).startupPending ===
 fs.rmSync(dir, { recursive: true, force: true });
 check("feature switches", ve.FEATURES_ON.includes("NvidiaVpSuperResolution") && ve.FEATURES_OFF.includes("NvidiaVpTrueHDR"));
 
+// Player CSS must keep the video overlay-eligible: a backdrop-filter / blend mode on anything drawn
+// over the picture makes Chromium composite the video itself, which switches RTX VSR off (measured).
+const css = fs.readFileSync(path.join(__dirname, "..", "src", "renderer", "styles.css"), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+const blockers = [];
+for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+  const selector = match[1].trim();
+  if (/player|subtitle|enhance/.test(selector) && /(^|;|\s)(-webkit-)?(backdrop-filter|mix-blend-mode)\s*:/.test(match[2])) blockers.push(selector.replace(/\s+/g, " "));
+}
+check("no backdrop-filter / mix-blend-mode over the player (keeps RTX VSR on)", blockers.length === 0, blockers.join(" | "));
+
 console.log(results.join("\n"));
 const failed = results.filter((r) => r.startsWith("FAIL")).length;
 console.log(failed ? `${failed} FAILED` : `ALL PASSED (${results.length})`);

@@ -14,3 +14,4 @@ Electron desktop app (Windows first, Mac/iPhone later) for grabbing videos (HLS/
 - Don't delete or move pushed git tags; if a release tag's build fails, fix it and release the next patch version.
 - `D:\Projects\Extracting Video` is read-only source; the engine copy lives in `engine/downloader/`.
 - Keep the renderer's `<video>` element alive across re-renders (see HANDOFF §3).
+- Nothing drawn over the video may use `backdrop-filter` or `mix-blend-mode`: it switches RTX Video Super Resolution off (HANDOFF, live enhancement).

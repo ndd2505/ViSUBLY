@@ -19,6 +19,17 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+# Hashing and unzipping use .NET directly: when Windows PowerShell 5.1 is started from PowerShell 7
+# (GitHub Actions "shell: pwsh" -> npm -> powershell), it inherits PS7's module path and the
+# script-based cmdlets Get-FileHash / Expand-Archive are missing.
+function Get-Sha256([string]$path) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $stream = [System.IO.File]::OpenRead($path)
+  try { return ([System.BitConverter]::ToString($sha.ComputeHash($stream)) -replace "-", "").ToLowerInvariant() }
+  finally { $stream.Dispose(); $sha.Dispose() }
+}
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
 $root = Split-Path -Parent $PSScriptRoot
 $dest = Join-Path $root "vendor\ffmpeg"
 $cache = Join-Path $root "vendor\cache"
@@ -54,11 +65,11 @@ $expected = $Matches[1]
 
 New-Item -ItemType Directory -Force $cache | Out-Null
 $zip = Join-Path $cache $asset.name
-if (-not (Test-Path $zip) -or ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $expected)) {
+if (-not (Test-Path $zip) -or ((Get-Sha256 $zip) -ne $expected)) {
   Write-Host "Downloading $($asset.name) ($([math]::Round($asset.size / 1MB, 1)) MB)..."
   Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -UseBasicParsing -Headers @{ "User-Agent" = "ViSUBLY-build" }
 }
-$actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+$actual = Get-Sha256 $zip
 if ($actual -ne $expected) {
   Remove-Item $zip -Force
   throw "SHA-256 mismatch for $($asset.name): expected $expected, got $actual."
@@ -66,7 +77,7 @@ if ($actual -ne $expected) {
 
 $extract = Join-Path $cache "ffmpeg-extract"
 if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
-Expand-Archive -Path $zip -DestinationPath $extract
+[System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $extract)
 $top = Get-ChildItem $extract -Directory | Select-Object -First 1
 $bin = Join-Path $top.FullName "bin"
 

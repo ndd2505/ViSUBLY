@@ -1,6 +1,6 @@
 # ViSUBLY — Ghi chú bàn giao (kết thúc Giai đoạn 1 · v1.0)
 
-> Cập nhật: 2026-11-25 · Nhánh chính: `main` · App: **Visubly Studio 1.2.0** · Extension: **ViSUBLY Grabber 1.1.2** · Release: GitHub Actions khi push tag `v*`
+> Cập nhật: 2026-11-25 · Nhánh chính: `main` · App: **Visubly Studio 1.2.1** · Extension: **ViSUBLY Grabber 1.1.2** · Release: GitHub Actions khi push tag `v*`
 
 Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) để nắm nhanh trạng thái và làm tiếp tính năng mới.
 

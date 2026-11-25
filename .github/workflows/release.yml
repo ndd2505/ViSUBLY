@@ -52,6 +52,9 @@ jobs:
           # fetch-ffmpeg.ps1 reads the BtbN release through the GitHub API (avoids the anonymous rate limit).
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          # npm scripts start Windows PowerShell 5.1; don't let it inherit PowerShell 7's module path
+          # (that hides script cmdlets such as Get-FileHash / Expand-Archive).
+          $env:PSModulePath = [Environment]::GetEnvironmentVariable('PSModulePath', 'Machine')
           npm run package:win:ci *>&1 | Tee-Object -FilePath build.log
           if ($LASTEXITCODE -ne 0) {
             # Surface the tail of the log as an annotation (readable on the run page / API).

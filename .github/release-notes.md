@@ -1,4 +1,4 @@
-## What's new in 1.2.0
+## What's new in 1.2 (1.2.1)
 
 - **Nâng cấp video (Upscale video) tab.** Turn a 360p / 480p video into a sharper 720p–4K copy, one video at a time.
   - Uses RTX Video Super Resolution on NVIDIA RTX cards, and GPU filters on any PC.

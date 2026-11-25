@@ -11,3 +11,11 @@ Thumbs.db
 .design-handoff/
 design-download
 downdload-and-subtitle-video-app/
+# Downloader engine build (scripts/build-downloader.ps1)
+dist-engine/
+.venv-build/
+__pycache__/
+*.pyc
+scripts/readme-media/demo/
+scripts/readme-media/frames/
+scripts/readme-media/phone-profile/

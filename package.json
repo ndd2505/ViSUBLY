@@ -1,6 +1,7 @@
 {
   "name": "visubly-desktop",
-  "version": "0.1.0",
+  "productName": "Visubly Studio",
+  "version": "1.0.0",
   "description": "Desktop UI shell for Visubly video download and Vietnamese subtitle workflows.",
   "main": "src/main/main.js",
   "private": true,
@@ -10,7 +11,8 @@
     "start": "electron .",
     "dev": "electron .",
     "check": "node scripts/check-app.js",
-    "package:win": "electron-builder --win nsis",
+    "build:engine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-downloader.ps1",
+    "package:win": "npm run build:engine && electron-builder --win",
     "package:mac": "electron-builder --mac dmg"
   },
   "devDependencies": {
@@ -20,29 +22,96 @@
   "build": {
     "appId": "app.visubly.studio",
     "productName": "Visubly Studio",
+    "copyright": "© 2026 Visubly",
+    "afterPack": "scripts/after-pack.js",
     "files": [
       "src/**/*",
-      "package.json",
-      "node_modules/**/*"
+      "build/icon.ico",
+      "build/icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "browser-extension/chrome",
+        "to": "browser-extension/chrome"
+      }
     ],
     "asarUnpack": [
-      "**/node_modules/@ffmpeg-installer/ffmpeg/**/*"
+      "**/node_modules/@ffmpeg-installer/**/*"
     ],
     "directories": {
-      "output": "dist"
+      "output": "dist",
+      "buildResources": "build"
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": [
-        "nsis",
-        "portable"
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "dist-engine/visubly-downloader.exe",
+          "to": "engine/visubly-downloader.exe"
+        }
       ],
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false
     },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Visubly Studio",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "multiLanguageInstaller": true,
+      "installerLanguages": [
+        "en_US",
+        "vi_VN"
+      ],
+      "artifactName": "${productName} Setup ${version}.${ext}",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "uninstallerSidebar": "build/installerSidebar.bmp",
+      "installerHeader": "build/installerHeader.bmp"
+    },
+    "portable": {
+      "artifactName": "${productName} ${version} Portable.${ext}"
+    },
     "mac": {
       "target": "dmg",
       "category": "public.app-category.video"
-    }
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "mp4",
+          "m4v",
+          "mkv",
+          "webm",
+          "mov"
+        ],
+        "name": "ViSUBLY.Video",
+        "description": "Video",
+        "role": "Viewer",
+        "icon": "icon"
+      }
+    ]
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",

@@ -1,204 +1,122 @@
 "use strict";
 
-const localDownloadFallback = { items: [], parallelItems: 2, localWorkers: 8 };
+const noopSubscribe = () => () => {};
+const desktopOnly = async () => ({ ok: false, error: "Tính năng này chỉ có trong ứng dụng ViSUBLY." });
 
+// Plain-browser fallback (no Electron preload): every screen still renders and
+// actions report that they need the desktop app. No fake data.
 const desktop = window.visublyDesktop || {
   platform: navigator.platform.toLowerCase().includes("mac") ? "darwin" : "win32",
+  boot: { theme: "dark", resolvedTheme: "dark", version: "" },
   minimize: () => {},
   toggleMaximize: () => {},
   close: () => {},
   selectVideo: async () => null,
   selectVideoFolder: async () => null,
   selectSubtitle: async () => null,
-  readTextFile: async () => "",
+  readSubtitleText: async () => "",
+  checkFiles: async () => ({}),
+  openInSystemPlayer: desktopOnly,
   toFileUrl: async (filePath) => localPathToFileUrl(filePath),
   scanVideoFolder: async () => null,
   findMatchingSubtitle: async () => null,
-  download: {
-    getState: async () => localDownloadFallback,
-    prepareItem: async (payload) => ({
-      ok: true,
-      item: {
-        id: `local-${Date.now()}`,
-        name: payload.name || suggestNameFromCurl(payload.source),
-        sourceText: payload.source,
-        url: payload.source,
-        selectedUrl: payload.source,
-        quality: payload.quality || "1080",
-        selectedQuality: qualityToResolution(payload.quality || "1080"),
-        output: `E:\\${payload.name || "video"}.mp4`,
-        host: extractHost(payload.source),
-        status: "queued",
-        phase: "queued",
-        progress: 0,
-        logs: ["Local browser fallback item."]
-      }
-    }),
-    enqueueItems: async (items) => {
-      localDownloadFallback.items.push(...items);
-      return { ok: true, items, state: localDownloadFallback };
+  airplay: {
+    start: async () => {
+      throw new Error("Remote chỉ chạy trong ứng dụng ViSUBLY.");
     },
-    startQueue: async () => {
-      localDownloadFallback.items.forEach((item) => {
-        if (item.status === "queued") {
-          item.status = "active";
-          item.phase = "ffmpeg_download";
-          item.progress = Math.max(item.progress || 0, 12);
-          item.logs = [...(item.logs || []), "Local preview started."];
-        }
-      });
-      return { ok: true, state: localDownloadFallback };
-    },
-    cancelItem: async (itemId) => {
-      const item = localDownloadFallback.items.find((entry) => entry.id === itemId);
-      if (item) item.status = "canceled";
-      return { ok: true, state: localDownloadFallback };
-    },
-    retryItem: async (itemId) => {
-      const item = localDownloadFallback.items.find((entry) => entry.id === itemId);
-      if (item) {
-        item.status = "queued";
-        item.progress = 0;
-      }
-      return { ok: true, state: localDownloadFallback };
-    },
-    removeItem: async (itemId) => {
-      localDownloadFallback.items = localDownloadFallback.items.filter((entry) => entry.id !== itemId);
-      return { ok: true, state: localDownloadFallback };
-    },
-    clearCompleted: async () => {
-      localDownloadFallback.items = localDownloadFallback.items.filter((item) => !["done", "failed", "canceled"].includes(item.status));
-      return { ok: true, state: localDownloadFallback };
-    },
-    onEvent: () => () => {},
-    onState: () => () => {}
+    stop: async () => ({ ok: true }),
+    info: async () => null,
+    onPairingRequested: noopSubscribe,
+    onPairingSuccess: noopSubscribe,
+    onPowerState: noopSubscribe
   },
-  integrations: {
-    startDownloadBatch: async (items) => ({ ok: true, items }),
-    generateSubtitle: async (payload) => ({ ok: true, payload })
+  download: {
+    getState: async () => ({ items: [], parallelItems: 2, downloadDir: "" }),
+    enqueueItems: desktopOnly,
+    startQueue: desktopOnly,
+    cancelItem: desktopOnly,
+    retryItem: desktopOnly,
+    removeItem: desktopOnly,
+    clearCompleted: desktopOnly,
+    openOutput: desktopOnly,
+    revealOutput: desktopOnly,
+    openDownloadDir: desktopOnly,
+    onEvent: noopSubscribe,
+    onState: noopSubscribe
+  },
+  settings: {
+    get: async () => null,
+    update: async () => null,
+    selectDownloadDir: async () => ({ canceled: true }),
+    onChange: noopSubscribe
+  },
+  app: {
+    getInfo: async () => null,
+    diskSpace: async () => null,
+    openExtensionFolder: desktopOnly
+  },
+  capture: {
+    onIncoming: noopSubscribe,
+    confirm: desktopOnly,
+    dismiss: async () => ({ ok: true }),
+    prepareManual: desktopOnly,
+    createPairingCode: desktopOnly,
+    info: async () => null,
+    revokeAll: desktopOnly
   }
 };
 
 const root = document.getElementById("app-root");
 const folderPageSize = 120;
-const playerControlsIdleMs = 8000;
-
-const qualities = [
-  { id: "2160", label: "2160p", note: "4K · HEVC · 3.4 GB" },
-  { id: "1440", label: "1440p", note: "QHD · 1.9 GB" },
-  { id: "1080", label: "1080p", note: "FHD · H.264 · 980 MB" },
-  { id: "720", label: "720p", note: "HD · 520 MB" },
-  { id: "480", label: "480p", note: "SD · 240 MB" },
-  { id: "audio", label: "Audio", note: "m4a · 14 MB" }
-];
-
-const sampleCurl = `curl 'https://cdn.streamhub.net/v/8a3ef/master.m3u8'
-  -H 'Referer: https://watch.streamhub.net/'
-  -H 'User-Agent: Mozilla/5.0'
-  --cookie 'sid=NVe...'`;
-
-const flaggedSegments = [
-  {
-    id: "00:14:22",
-    source: "Don't get your knickers in a twist, mate.",
-    claude: "Đừng có nóng tính thế, anh bạn.",
-    chatgpt: "Bình tĩnh nào ông tướng, làm gì căng vậy.",
-    hint: "ChatGPT keeps the teasing tone instead of making it stern."
-  },
-  {
-    id: "00:18:09",
-    source: "This has all gone pear-shaped, hasn't it?",
-    claude: "Mọi thứ đang đi chệch hướng cả rồi, đúng không?",
-    chatgpt: "Mọi thứ rối tinh rối mù hết rồi, phải không?",
-    hint: "The second option reads more natural in spoken Vietnamese."
-  },
-  {
-    id: "00:27:46",
-    source: "Right, I'm off to the loo.",
-    claude: "Được rồi, tôi đi vệ sinh đây.",
-    chatgpt: "Thôi, tao đi cái đã.",
-    hint: "Casual register matters because the speaker is joking with a friend."
-  },
-  {
-    id: "00:31:04",
-    source: "He's barking up the wrong tree.",
-    claude: "Cậu ấy đang đánh giá sai vấn đề.",
-    chatgpt: "Cậu ấy đang bắt nhầm hướng rồi.",
-    hint: "ChatGPT preserves the idiom as a conversational image."
-  },
-  {
-    id: "00:36:18",
-    source: "Easy as pie.",
-    claude: "Thế là xong, dễ như ăn bánh.",
-    chatgpt: "Xong xuôi rồi đó, dễ như húp cháo!",
-    hint: "Both are localized. The second sounds more like dialogue."
-  }
-];
-
-const sampleSrt = `1
-00:00:02,000 --> 00:00:06,200
-Bình tĩnh nào ông tướng, làm gì căng vậy.
-
-2
-00:00:07,400 --> 00:00:11,600
-Mọi thứ rối tinh rối mù hết rồi, phải không?
-
-3
-00:00:13,000 --> 00:00:17,500
-Thôi, tao đi cái đã.
-
-4
-00:00:19,000 --> 00:00:23,400
-Cậu ấy đang bắt nhầm hướng rồi.
-
-5
-00:00:25,000 --> 00:00:30,400
-Xong xuôi rồi đó, dễ như húp cháo!`;
-
-const sampleCues = parseSrt(sampleSrt);
+const playerControlsIdleMs = 2500;
+const playerPrefsKey = "visubly.player.prefs";
+const recentKey = "visubly.recent.v1";
+const introKey = "visubly.intro.seenVersion";
+const maxRecentEntries = 12;
+const recentSaveIntervalMs = 5000;
+const chromePollMs = 4000;
+const introDurationMs = 1200;
+const activeStatuses = new Set(["active", "preparing", "muxing"]);
+const screenTitles = {
+  home: "Trang chủ",
+  download: "Tải xuống",
+  folder: "Thư viện",
+  player: "Trình phát",
+  settings: "Cài đặt"
+};
+const systemDarkQuery = typeof window.matchMedia === "function" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
 
 const state = {
   screen: "home",
-  intro: true,
+  intro: false,
+  theme: { mode: "dark", resolved: "dark" },
+  info: null,
+  settings: null,
+  chrome: { known: false, running: false, pairedClients: 0, error: "" },
+  disk: null,
   download: {
-    phase: "input",
-    step: 0,
-    curl: "",
-    name: "",
-    quality: "1080",
     items: [],
-    active: -1,
-    preparing: false,
-    prepareError: "",
-    terminalItemId: "",
-    parallelItems: 2
+    parallelItems: 2,
+    downloadDir: "",
+    filter: "all",
+    expandedLogId: "",
+    actionError: ""
   },
-  subtitle: {
-    videoPath: "D:\\Movies\\Inside_No9_S08E04.mkv",
-    fileName: "Inside_No9_S08E04.mkv",
-    movieTitle: "Inside No.9 · S08E04",
-    movieEdited: false,
-    cast: ["Reece Shearsmith", "Steve Pemberton"],
-    castDraft: "",
-    processing: {
-      running: false,
-      values: [0, 0, 0, 0, 0],
-      done: false
-    }
-  },
-  approvals: {
-    cursor: 0,
-    decisions: Array(flaggedSegments.length).fill(null),
-    customText: ""
-  },
+  paste: { home: "", download: "", busy: "", error: "", errorFor: "" },
+  capture: { queue: [], handled: 0, name: "", quality: "", busy: false, error: "" },
+  pairing: { code: "", expiresAt: 0, loading: false, error: "", confirmRevoke: false, notice: "" },
+  recent: [],
   player: {
     videoPath: "",
     videoUrl: "",
     displayName: "",
     srtPath: "",
-    cues: sampleCues,
+    cues: [],
+    subtitleNotice: "",
+    mediaError: null,
     sourceToken: 0,
     currentTime: 0,
+    resumeAt: 0,
     duration: 0,
     playing: false,
     theater: false,
@@ -208,10 +126,11 @@ const state = {
     lastVolume: 0.8,
     activeCueIndex: -1,
     subtitleOn: true,
+    folderContext: null,
     style: {
       fontSize: 19,
       bottom: 58,
-      background: true,
+      background: false,
       outline: true
     }
   },
@@ -225,7 +144,8 @@ const state = {
     error: "",
     scannedAt: "",
     skippedFolders: 0,
-    truncated: false
+    truncated: false,
+    pendingScrollPath: ""
   },
   remote: {
     qrUrl: null,
@@ -233,66 +153,89 @@ const state = {
     loading: false,
     pairingPin: null,
     pairingActive: false,
+    pairingRequestId: "",
+    pairingDevice: "",
+    devices: [],
+    running: false,
     awake: false,
     awakeReason: ""
-  },
-  playerMode: "vi"
+  }
 };
 
-let downloadTimer = null;
-let processingTimer = null;
 let folderThumbTimer = null;
 let folderRenderTimer = null;
+let downloadRenderTimer = null;
 let playerControlsIdleTimer = null;
+let playerControlsHidden = false;
+let playerScrubbing = false;
+let playerScrubFrame = 0;
+let playerScrubPendingTime = null;
+let playerKeyboardModality = false;
+let playerLastPointer = { x: -1, y: -1 };
+let playerFolderCenteredPath = "";
+let reuseMainPlayerVideo = false;
+let lastRenderedScreen = "";
+let lastRenderedModalKey = "";
 let folderThumbActive = 0;
 let folderThumbQueue = [];
 const maxFolderThumbLoads = 1;
+let introTimer = null;
+let pairingTimer = null;
+let chromePollTimer = null;
+let toastTimer = null;
+let lastRecentSaveAt = 0;
+let dialogFocusedFor = "";
+let dialogReturnFocus = "";
 
-function icon(name) {
-  const paths = {
-    home: '<path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z"/>',
-    download: '<path d="M12 3v11"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
-    sub: '<path d="M4 5h16v10H8l-4 4z"/><path d="M8 9h8"/><path d="M8 12h5"/>',
-    play: '<path d="M8 5v14l11-7z"/>',
-    video: '<path d="M4 6h11v12H4z"/><path d="m15 10 5-3v10l-5-3z"/>',
-    globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c3 3.2 3 14.8 0 18"/><path d="M12 3c-3 3.2-3 14.8 0 18"/>',
-    settings: '<path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/><path d="M4 12h2"/><path d="M18 12h2"/><path d="M12 4v2"/><path d="M12 18v2"/>',
-    search: '<circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/>',
-    bell: '<path d="M6 9a6 6 0 0 1 12 0c0 7 3 7 3 9H3c0-2 3-2 3-9"/><path d="M10 21h4"/>',
-    arrowR: '<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>',
-    arrowL: '<path d="M19 12H5"/><path d="m11 6-6 6 6 6"/>',
-    plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
-    x: '<path d="M6 6l12 12"/><path d="M18 6 6 18"/>',
-    check: '<path d="m5 13 4 4L19 7"/>',
-    brain: '<path d="M9 4a4 4 0 0 0-4 4v8a4 4 0 0 0 4 4"/><path d="M15 4a4 4 0 0 1 4 4v8a4 4 0 0 1-4 4"/><path d="M9 4c2 1 4 1 6 0"/><path d="M9 20c2-1 4-1 6 0"/>',
-    folder: '<path d="M3 6h7l2 2h9v10H3z"/>',
-    edit: '<path d="M4 20h4l11-11-4-4L4 16z"/><path d="m14 6 4 4"/>',
-    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l4 2"/>',
-    volume: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 9.5a4 4 0 0 1 0 5"/><path d="M18 7a8 8 0 0 1 0 10"/>',
-    volumeOff: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="m16 9 5 5"/><path d="m21 9-5 5"/>',
-    captions: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 12h4"/><path d="M13 12h4"/><path d="M7 15h7"/>',
-    theater: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 6v12"/><path d="M17 6v12"/><path d="M7 10h10"/><path d="M7 14h10"/>',
-    fullscreen: '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
-    fullscreenExit: '<path d="M9 3v4a2 2 0 0 1-2 2H3"/><path d="M15 3v4a2 2 0 0 0 2 2h4"/><path d="M9 21v-4a2 2 0 0 0-2-2H3"/><path d="M15 21v-4a2 2 0 0 1 2-2h4"/>',
-    minus: '<path d="M5 12h14"/>'
-  };
-  return `<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.home}</svg>`;
+const iconPaths = {
+  home: '<path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+  download: '<path d="M12 4v11M7 10l5 5 5-5M4 20h16"/>',
+  library: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  player: '<path d="M7 5l12 7-12 7z"/>',
+  play: '<path d="M8 5v14l11-7z"/>',
+  subtitleAi: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 10h10M7 14h4M13 14h4"/>',
+  sliders: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+  phone: '<rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/>',
+  link: '<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/>',
+  video: '<path d="M4 6h11v12H4z"/><path d="m15 10 5-3v10l-5-3z"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/>',
+  retry: '<path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5v4.6h4.6"/>',
+  arrowL: '<path d="M19 12H5"/><path d="m11 6-6 6 6 6"/>',
+  plus: '<path d="M12 5v14"/><path d="M5 12h14"/>',
+  minus: '<path d="M5 12h14"/>',
+  x: '<path d="M6 6l12 12"/><path d="M18 6 6 18"/>',
+  check: '<path d="m5 13 4 4L19 7"/>',
+  volume: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 9.5a4 4 0 0 1 0 5"/><path d="M18 7a8 8 0 0 1 0 10"/>',
+  volumeOff: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="m16 9 5 5"/><path d="m21 9-5 5"/>',
+  captions: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 12h4"/><path d="M13 12h4"/><path d="M7 15h7"/>',
+  theater: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M7 6v12"/><path d="M17 6v12"/><path d="M7 10h10"/><path d="M7 14h10"/>',
+  fullscreen: '<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>',
+  fullscreenExit: '<path d="M9 3v4a2 2 0 0 1-2 2H3"/><path d="M15 3v4a2 2 0 0 0 2 2h4"/><path d="M9 21v-4a2 2 0 0 0-2-2H3"/><path d="M15 21v-4a2 2 0 0 1 2-2h4"/>',
+  pause: '<rect x="6.5" y="5" width="3.5" height="14" rx="1"/><rect x="14" y="5" width="3.5" height="14" rx="1"/>',
+  rewind: '<path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3.5 4.5v4.6h4.6"/>',
+  forward: '<path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4.5v4.6h-4.6"/>',
+  skipPrev: '<path d="M6 5v14"/><path d="M19 5 9 12l10 7z"/>',
+  skipNext: '<path d="M18 5v14"/><path d="M5 5l10 7-10 7z"/>'
+};
+
+function icon(name, options = {}) {
+  const size = options.size || 18;
+  const stroke = options.stroke || 2.2;
+  return `<svg aria-hidden="true" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round">${iconPaths[name] || iconPaths.home}</svg>`;
 }
 
-function logo() {
-  return `<div class="logo"><span class="logo-mark">Vi${starSvg("logo-star")}</span><span class="logo-word">subly</span></div>`;
-}
-
-function starSvg(className = "") {
-  return `<svg class="${className}" viewBox="0 0 24 24" aria-hidden="true"><polygon points="12,1.5 14.85,8.95 22.85,9.4 16.6,14.4 18.7,22.2 12,17.85 5.3,22.2 7.4,14.4 1.15,9.4 9.15,8.95" fill="var(--vi-star)" stroke="var(--ink)" stroke-width="1.4" stroke-linejoin="round"/></svg>`;
+function playGlyph(size = 18) {
+  return `<svg aria-hidden="true" width="${size}" height="${size}" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5l11 7-11 7z"/></svg>`;
 }
 
 function btn(label, action, classes = "", iconName = "", attrs = "") {
   const iconHtml = iconName ? icon(iconName) : "";
-  return `<button class="btn ${classes}" data-action="${action}" ${attrs}>${iconHtml}<span>${label}</span></button>`;
+  return `<button type="button" class="btn ${classes}" data-action="${action}" ${attrs}>${iconHtml}<span>${label}</span></button>`;
 }
 
 function setScreen(screen) {
+  if (!screenTitles[screen]) return;
   if (state.screen === "player" && screen !== "player") suspendMainPlayerForNavigation();
   if (screen === "folder" && !state.folder.visibleLimit) state.folder.visibleLimit = folderPageSize;
   if (screen === "folder") {
@@ -302,68 +245,157 @@ function setScreen(screen) {
     cancelFolderRender();
   }
   state.screen = screen;
+  if (screen === "download") refreshDiskSpace();
+  if (screen === "settings") {
+    state.pairing.confirmRevoke = false;
+    refreshAppInfo();
+    ensurePairingCode();
+  }
+  if (screen === "home") refreshRecent();
   render();
 }
 
-function titleForScreen() {
-  return {
-    home: "Visubly",
-    download: "Visubly · Download",
-    subtitle: "Visubly · Subtitle",
-    processing: "Visubly · Working",
-    approve: "Visubly · Approve",
-    player: "Visubly · Player",
-    folder: "Visubly · Folder",
-    library: "Visubly · Library",
-    settings: "Visubly · Settings"
-  }[state.screen] || "Visubly";
+function updateDocumentTitle() {
+  const title = `ViSUBLY · ${screenTitles[state.screen] || screenTitles.home}`;
+  if (document.title !== title) document.title = title;
 }
 
-function render() {
-  root.innerHTML = `
+function render(options = {}) {
+  updateDocumentTitle();
+  // While the player stage is fullscreen, replacing root.innerHTML would remove the
+  // fullscreen element and kick the user out of fullscreen. Patch the stage instead.
+  if (renderPlayerWhileFullscreen()) return;
+
+  const sameScreen = state.screen === lastRenderedScreen;
+  const samePlayerScreen = sameScreen && state.screen === "player";
+  const preserveScroll = options.preserveScroll ?? sameScreen;
+  const scrollSnapshot = preserveScroll ? captureScrollSnapshot() : [];
+  const focusSnapshot = captureFocus();
+  const folderListMemory = samePlayerScreen ? capturePlayerFolderListScroll() : null;
+  // Keep the playing <video> element alive across re-renders: re-inserting it in the
+  // same task keeps decoding/playback going instead of reloading the file.
+  const keptVideo = takeReusableMainPlayerVideo();
+  reuseMainPlayerVideo = Boolean(keptVideo);
+  const dialogOpen = Boolean(modalKey());
+  let html = "";
+  try {
+    html = `
     <div class="shell">
       ${renderTitlebar()}
-      <div class="app">
+      <div class="app" ${dialogOpen ? "inert" : ""}>
         ${renderSidebar()}
         <main class="main">${renderScreen()}</main>
       </div>
-      ${state.intro ? renderIntro() : ""}
+      ${renderCaptureDialog()}
       ${renderRemoteModal()}
+      ${state.intro ? renderIntro() : ""}
     </div>
   `;
-  attachDynamicHandlers();
+  } finally {
+    reuseMainPlayerVideo = false;
+  }
+  root.innerHTML = html;
+  if (keptVideo) root.querySelector("[data-main-video-slot]")?.replaceWith(keptVideo);
+  lastRenderedScreen = state.screen;
+  lastRenderedModalKey = modalKey();
+  attachDynamicHandlers({ folderListMemory });
+  if (scrollSnapshot.length) restoreScrollSnapshot(scrollSnapshot, { immediate: sameScreen });
+  restoreFocus(focusSnapshot);
 }
 
-function renderRemoteModal() {
-  if (state.remote.pairingActive && state.remote.pairingPin) {
-    return `
-      <div class="modal-overlay" style="display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.8);position:fixed;inset:0;z-index:9999;">
-        <div style="background:var(--paper);padding:40px;border-radius:16px;text-align:center;color:var(--ink);box-shadow:0 10px 40px rgba(0,0,0,0.5);border:var(--line)">
-          <div style="font-size:48px;margin-bottom:20px">📱</div>
-          <h2 class="h2" style="margin-bottom:10px">Yêu cầu ghép nối</h2>
-          <p style="margin-bottom:20px;color:var(--ink-soft)">Nhập mã PIN sau trên điện thoại của bạn:</p>
-          <div style="font-size:56px;font-weight:900;letter-spacing:10px;background:#eee;padding:20px;border-radius:12px;border:var(--line);margin-bottom:30px;font-family:monospace">${state.remote.pairingPin}</div>
-          ${btn("Đóng", "close-remote", "ghost")}
-        </div>
-      </div>
-    `;
+// Full re-renders replace every node, so remember which control had focus (and the caret).
+function captureFocus() {
+  const element = document.activeElement;
+  if (!element || element === document.body || !root.contains(element)) return null;
+  if (element.closest("[data-player-stage]")) return null;
+  const selector = focusSelector(element);
+  if (!selector) return null;
+  const snapshot = { selector };
+  if (typeof element.selectionStart === "number") {
+    snapshot.start = element.selectionStart;
+    snapshot.end = element.selectionEnd;
   }
+  return snapshot;
+}
 
-  if (!state.remote.qrUrl && !state.remote.loading) return "";
-  return `
-    <div class="modal-overlay" style="display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.8);position:fixed;inset:0;z-index:9999;">
-      <div style="background:var(--paper);padding:30px;border-radius:16px;text-align:center;color:var(--ink);box-shadow:0 10px 40px rgba(0,0,0,0.5)">
-        <h2 class="h2" style="margin-bottom:10px">Visubly Remote</h2>
-        <p style="margin-bottom:20px;color:var(--ink)">Lấy điện thoại quét mã QR này để điều khiển.</p>
-        ${state.remote.loading ? '<div style="width:250px;height:250px;display:flex;align-items:center;justify-content:center;background:#eee;border-radius:8px">Đang bật...</div>' : `<img src="${state.remote.qrUrl}" alt="QR" width="250" height="250" style="border-radius:8px" />`}
-        <p class="muted mono" style="margin-top:14px">${state.remote.awake ? "Stream keep-awake is active; the display can still sleep." : "PC streaming stays awake while the display may turn off."}</p>
-        <div style="margin-top:20px; display:flex; gap:10px; justify-content:center;">
-          ${btn("Copy Link Test", "copy-remote-link", "primary")}
-          ${btn("Đóng", "close-remote", "ghost")}
-        </div>
-      </div>
-    </div>
-  `;
+function focusSelector(element) {
+  if (!element || element === document.body) return "";
+  if (element.id) return `#${CSS.escape(element.id)}`;
+  const parts = [];
+  for (const attr of ["data-screen", "data-action", "data-id", "data-value", "data-path"]) {
+    const value = element.getAttribute(attr);
+    if (value !== null) parts.push(`[${attr}="${CSS.escape(value)}"]`);
+  }
+  return parts.join("");
+}
+
+function restoreFocus(snapshot) {
+  if (!snapshot) return;
+  const next = root.querySelector(snapshot.selector);
+  if (!next || next === document.activeElement || next.disabled) return;
+  if (next.closest("[inert]")) return;
+  next.focus({ preventScroll: true });
+  if (typeof snapshot.start === "number" && typeof next.setSelectionRange === "function") {
+    try {
+      next.setSelectionRange(snapshot.start, snapshot.end);
+    } catch {
+      // Some input types do not support selection ranges.
+    }
+  }
+}
+
+function modalKey() {
+  const capture = state.capture.queue[0];
+  if (capture) return `capture:${capture.captureId}`;
+  if (state.remote.pairingActive) return `pair:${state.remote.pairingRequestId || state.remote.pairingPin}`;
+  if (state.remote.qrUrl || state.remote.loading) return "qr";
+  return "";
+}
+
+function takeReusableMainPlayerVideo() {
+  if (state.screen !== "player" || !state.player.videoUrl) return null;
+  const video = document.getElementById("mainPlayerVideo");
+  if (!video) return null;
+  if (video.dataset.sourceToken !== String(state.player.sourceToken)) return null;
+  if (video.dataset.videoUrl !== state.player.videoUrl) return null;
+  return video;
+}
+
+function renderPlayerWhileFullscreen() {
+  if (state.screen !== "player" || !isPlayerStageFullscreen()) return false;
+  const key = modalKey();
+  if (key && key !== lastRenderedModalKey) {
+    // A dialog (capture, pairing PIN, QR) must be visible: leave fullscreen, the
+    // fullscreenchange handler then runs the full render.
+    exitDocumentFullscreen().catch(() => {});
+  }
+  patchPlayerStage();
+  return true;
+}
+
+function captureScrollSnapshot() {
+  const selectors = [".main", ".screen", ".player-transcript", ".folder-screen", ".dl-log"];
+  return selectors
+    .map((selector) => {
+      const element = document.querySelector(selector);
+      if (!element) return null;
+      return { selector, left: element.scrollLeft, top: element.scrollTop };
+    })
+    .filter(Boolean);
+}
+
+function restoreScrollSnapshot(snapshot, options = {}) {
+  const apply = () => {
+    snapshot.forEach(({ selector, left, top }) => {
+      const element = document.querySelector(selector);
+      if (!element) return;
+      element.scrollLeft = left;
+      element.scrollTop = top;
+    });
+  };
+  // Same-screen renders restore synchronously so the page never flashes to the top.
+  if (options.immediate) apply();
+  window.requestAnimationFrame(apply);
 }
 
 function scheduleFolderRender() {
@@ -385,20 +417,20 @@ function cancelFolderRender() {
 function renderTitlebar() {
   const isMac = desktop.platform === "darwin";
   return `
-    <header class="titlebar">
+    <header class="titlebar ${isMac ? "is-mac" : ""}">
       ${isMac ? `
         <div class="traffic-controls">
-          <button class="traffic-dot red" data-action="close" title="Close" aria-label="Close"></button>
-          <button class="traffic-dot yellow" data-action="minimize" title="Minimize" aria-label="Minimize"></button>
-          <button class="traffic-dot green" data-action="maximize" title="Maximize" aria-label="Maximize"></button>
+          <button type="button" class="traffic-dot red" data-action="close" aria-label="Đóng"></button>
+          <button type="button" class="traffic-dot yellow" data-action="minimize" aria-label="Thu nhỏ"></button>
+          <button type="button" class="traffic-dot green" data-action="maximize" aria-label="Phóng to"></button>
         </div>
-      ` : `<div></div>`}
-      <div class="titlebar-title">${titleForScreen()}</div>
-      ${isMac ? `<div></div>` : `
+      ` : ""}
+      <span class="titlebar-title">ViSUBLY · ${escapeHtml(screenTitles[state.screen] || screenTitles.home)}</span>
+      ${isMac ? "" : `
         <div class="window-controls">
-          <button class="window-btn" data-action="minimize" title="Minimize">─</button>
-          <button class="window-btn" data-action="maximize" title="Maximize">□</button>
-          <button class="window-btn close" data-action="close" title="Close">×</button>
+          <button type="button" class="window-btn" data-action="minimize" aria-label="Thu nhỏ" title="Thu nhỏ"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1 6h10" stroke="currentColor" stroke-width="1.2"/></svg></button>
+          <button type="button" class="window-btn" data-action="maximize" aria-label="Phóng to" title="Phóng to"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
+          <button type="button" class="window-btn close" data-action="close" aria-label="Đóng" title="Đóng"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 1.5l9 9M10.5 1.5l-9 9" stroke="currentColor" stroke-width="1.2"/></svg></button>
         </div>
       `}
     </header>
@@ -406,719 +438,752 @@ function renderTitlebar() {
 }
 
 function renderSidebar() {
-  const d = state.download.items.filter((item) => item.status !== "done").length;
-  const nav = [
-    ["home", "Home", "home", ""],
-    ["download", "Download", "download", d ? String(d) : ""],
-    ["subtitle", "Subtitle", "sub", ""],
-    ["player", "Player", "play", ""]
-  ];
-  const library = [
-    ["folder", "Folder", "folder", state.folder.videos.length ? String(state.folder.videos.length) : ""],
-    ["library", "My videos", "video", ""],
-    ["settings", "Settings", "settings", ""]
-  ];
-
+  const pending = state.download.items.filter((item) => item.status === "queued" || activeStatuses.has(item.status)).length;
+  const version = state.info?.version || desktop.boot?.version || "";
   return `
-    <aside class="sidebar">
+    <aside class="sidebar" data-sidebar>
       <div class="brand">
-        ${logo()}
-        <span class="version-pill">v0.18</span>
+        <img class="brand-logo" src="./assets/brand/visubly-logo-small.svg" width="32" height="32" alt="">
+        <span class="brand-word">ViSUBLY</span>
+        ${version ? `<span class="version-pill" title="Phiên bản ${escapeAttr(version)}">${escapeHtml(version)}</span>` : ""}
       </div>
-      <div class="nav-label">Main</div>
-      ${nav.map(([screen, label, iconName, count]) => navItem(screen, label, iconName, count)).join("")}
-      <div class="nav-label">Library</div>
-      ${library.map(([screen, label, iconName, count]) => navItem(screen, label, iconName, count)).join("")}
-      <div class="model-card">
-        <div class="mini-row">
-          <span class="status-dot"></span>
-          <span class="mono">MODEL · LOCAL</span>
-        </div>
-        <div style="font-weight:900;margin-top:8px">247 videos learned</div>
-        <div class="progress-track" style="margin-top:8px"><div class="progress-fill" style="width:63%"></div></div>
-        <div class="mono muted" style="margin-top:6px">63% to v0.19</div>
-      </div>
+      <nav class="nav" aria-label="Điều hướng">
+        ${navItem("home", "Trang chủ", "home")}
+        ${navItem("download", "Tải xuống", "download", pending)}
+        ${navItem("folder", "Thư viện", "library")}
+        ${navItem("player", "Trình phát", "player")}
+        <button type="button" class="nav-item is-soon" disabled aria-disabled="true">
+          ${icon("subtitleAi", { size: 20, stroke: 2 })}
+          <span>Phụ đề AI</span>
+          <span class="soon-badge">Sắp có</span>
+        </button>
+        <div class="nav-divider" role="separator"></div>
+        ${navItem("settings", "Cài đặt", "sliders")}
+      </nav>
+      ${renderChromeCard()}
     </aside>
   `;
 }
 
-function navItem(screen, label, iconName, count) {
-  const active = state.screen === screen || (screen === "subtitle" && ["subtitle", "processing", "approve"].includes(state.screen));
+function navItem(screen, label, iconName, count = 0) {
+  const active = state.screen === screen;
   return `
-    <button class="nav-item ${active ? "active" : ""}" data-screen="${screen}">
-      ${icon(iconName)}
+    <button type="button" class="nav-item ${active ? "active" : ""}" data-screen="${screen}" ${active ? 'aria-current="page"' : ""}>
+      ${icon(iconName, { size: 20, stroke: 2 })}
       <span>${label}</span>
-      ${count ? `<span class="count">${count}</span>` : ""}
+      ${count ? `<span class="nav-count" aria-label="${count} video đang chờ">${count}</span>` : ""}
     </button>
+  `;
+}
+
+function chromeConnected() {
+  return Boolean(state.chrome.running && state.chrome.pairedClients > 0);
+}
+
+function renderChromeCard() {
+  const connected = chromeConnected();
+  return `
+    <div class="side-card" data-chrome-card>
+      <div class="side-card-status"><span class="status-dot ${connected ? "is-ok" : "is-off"}"></span>${connected ? "Chrome đã kết nối" : "Chưa kết nối Chrome"}</div>
+      <div class="side-card-text">${connected
+        ? "Bấm “Tải bằng ViSUBLY” ngay trên video đang xem."
+        : `Ghép nối tiện ích Chrome trong <button type="button" class="text-link" data-screen="settings">Cài đặt</button> để tải video bằng một nút bấm.`}</div>
+      <button type="button" class="btn secondary side-card-btn" data-action="start-remote">${icon("phone", { size: 16, stroke: 2 })}<span>Remote iPhone</span></button>
+    </div>
   `;
 }
 
 function renderScreen() {
-  if (state.screen === "home") return renderHome();
   if (state.screen === "download") return renderDownload();
-  if (state.screen === "subtitle") return renderSubtitle();
-  if (state.screen === "processing") return renderProcessing();
-  if (state.screen === "approve") return renderApprove();
   if (state.screen === "player") return renderPlayerStudio();
   if (state.screen === "folder") return renderFolderPlayer();
-  if (state.screen === "library") return renderLibrary();
   if (state.screen === "settings") return renderSettings();
   return renderHome();
 }
 
+// ---------- Home ----------
 function renderHome() {
+  const counts = downloadCounts();
+  const active = state.download.items.filter((item) => activeStatuses.has(item.status)).slice(0, 2);
+  const recent = state.recent.slice(0, 3);
   return `
-    <section class="screen">
-      <div class="top-row">
-        <div>
-          <div class="eyebrow">Good afternoon, Minh</div>
-          <h1 class="h1">What are we <span style="color:var(--coral);font-style:italic">watching</span> today?</h1>
-        </div>
-        <div style="display:flex;gap:8px">
-          ${btn("Bật Remote", "start-remote", "primary", "globe")}
-          ${btn("Search", "noop", "ghost", "search")}
-          ${btn("", "noop", "icon", "bell", "aria-label='Notifications'")}
-        </div>
+    <section class="screen home-screen">
+      <header class="page-head">
+        <div class="eyebrow">GRAB · SUB · WATCH</div>
+        <h1 class="h1 display">Hôm nay xem gì?</h1>
+      </header>
+      ${renderPasteBar("home")}
+      <div class="stat-grid">
+        ${statCard("Đang tải", counts.active)}
+        ${statCard("Trong hàng đợi", counts.queued)}
+        ${statCard("Xong hôm nay", counts.doneToday)}
       </div>
-
-      <div class="grid-2">
-        <button class="tile coral" data-screen="download">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start">
-            <span class="icon-box">${icon("download")}</span>
-            <span class="chip" style="background:var(--paper)">01 · GRAB</span>
+      <div class="home-grid">
+        <section class="card home-card">
+          <div class="card-head">
+            <h2 class="h2">Đang tải</h2>
+            <button type="button" class="text-link" data-screen="download">Xem tất cả</button>
           </div>
-          <div>
-            <h2 class="h2">Download from cURL</h2>
-            <p class="tile-copy">Paste cURL commands one at a time. Visubly parses qualities and runs the queue item by item.</p>
+          ${active.length
+            ? active.map(renderHomeDownload).join("")
+            : `<p class="empty-text">${counts.queued ? `Không có video nào đang tải. ${counts.queued} video đang chờ trong hàng đợi.` : "Không có video nào đang tải. Dán link ở trên để bắt đầu."}</p>`}
+        </section>
+        <section class="card home-card">
+          <div class="card-head">
+            <h2 class="h2">Xem tiếp</h2>
+            <button type="button" class="text-link" data-screen="folder">Mở thư viện</button>
           </div>
-          <div class="mini-row" style="margin-top:auto;justify-content:space-between">
-            <span class="mono">2 in queue · 1 finished today</span>
-            <span class="btn ghost">Start batch ${icon("arrowR")}</span>
-          </div>
-        </button>
-
-        <button class="tile violet" data-screen="subtitle">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start">
-            <span class="icon-box">${icon("sub")}</span>
-            <span class="chip" style="background:var(--paper);color:var(--ink)">02 · SUB</span>
-          </div>
-          <div>
-            <h2 class="h2">Subtitle to tiếng Việt</h2>
-            <p class="tile-copy">Drop a video, confirm the movie title and cast names, then review only the lines that need human taste.</p>
-          </div>
-          <div class="mini-row" style="margin-top:auto;justify-content:space-between">
-            <span class="mono">247 videos translated · v0.18</span>
-            <span class="btn ghost">Open studio ${icon("arrowR")}</span>
-          </div>
-        </button>
+          ${recent.length
+            ? `<div class="recent-list">${recent.map(renderRecentRow).join("")}</div>`
+            : `<p class="empty-text">Chưa có video nào. Video bạn mở trong Trình phát sẽ hiện ở đây để xem tiếp.</p>`}
+        </section>
       </div>
+      ${renderSoonCard("Phụ đề tiếng Việt bằng AI", "Đang hoàn thiện. Trong lúc chờ, bạn vẫn nạp được file .srt ở Trình phát.", true)}
+    </section>
+  `;
+}
 
-      <div class="stat-strip">
-        <div class="stat-row">
-          <div class="stat-icon">${icon("brain")}</div>
-          <div style="flex:1">
-            <h3 class="h3">Your local model is learning</h3>
-            <div class="muted" style="font-size:13px;margin-top:4px">Every approve, ChatGPT pick, and custom rewrite updates a private glossary on this machine.</div>
-          </div>
-          <div class="stat-badges">
-            ${stat("Accuracy", "87%", "var(--lime)")}
-            ${stat("Phrases", "12.4K", "var(--rose)")}
-            ${stat("Videos", "247", "var(--mint)")}
-          </div>
-        </div>
-      </div>
+function statCard(label, value) {
+  return `<div class="card stat-card"><span class="stat-label">${label}</span><span class="stat-value">${value}</span></div>`;
+}
 
-      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
-        <h3 class="h3">Recent</h3>
-        <span class="mono muted">LAST 7 DAYS</span>
-      </div>
-      <div class="grid-3">
-        ${recent("Inside No.9 · S08E04", "EN → VI · 41 min", "Done", "var(--lime)", "player")}
-        ${recent("Le Mans 24h Highlight", "EN → VI · needs approval", "Needs you", "var(--coral)", "approve")}
-        ${recent("Conan_OVA_2024.mkv", "JP → VI · queued", "Queued", "var(--paper)", "download")}
+function renderSoonCard(title, text, withIcon) {
+  return `
+    <section class="soon-card">
+      ${withIcon ? `<span class="soon-icon">${icon("subtitleAi", { size: 22, stroke: 2 })}</span>` : ""}
+      <div class="soon-copy">
+        <div class="soon-title"><strong>${title}</strong><span class="soon-badge">Sắp có</span></div>
+        <span>${text}</span>
       </div>
     </section>
   `;
 }
 
-function stat(label, value, color) {
-  return `<div class="stat-box" style="background:${color}"><div class="mono muted">${label}</div><div style="font-weight:900;font-size:20px">${value}</div></div>`;
-}
-
-function renderMediaThumb(label, clipStart = 0, clipEnd = 6, classes = "") {
-  const cue = state.player.cues.find((item) => item.start >= clipStart) || state.player.cues[0];
-  const subtitle = cue?.text || "Hover preview";
-  if (!state.player.videoUrl) {
-    return `
-      <div class="thumb ${classes}">
-        <span class="play-dot">${icon("play")}</span>
-        <div class="mini-subtitle">${escapeHtml(subtitle)}</div>
-      </div>
-    `;
-  }
-
+function renderHomeDownload(item) {
+  const muxing = item.status === "muxing";
+  const preparing = item.status === "preparing";
+  const percent = progressPercent(item);
+  const right = muxing
+    ? `<span class="row-status is-warn">Đang ghép MP4</span>`
+    : preparing
+      ? `<span class="row-status">Đang kiểm tra link</span>`
+      : `<span class="row-status">${percent}%</span>`;
+  const sub = muxing ? [qualityText(item), "gần xong"] : [qualityText(item), item.speed, etaLong(item.eta)];
   return `
-    <div class="mini-player ${classes}" data-clip-start="${clipStart}" data-clip-end="${clipEnd}" aria-label="${escapeAttr(label)} hover preview">
-      <video src="${escapeAttr(state.player.videoUrl)}" muted playsinline preload="metadata"></video>
-      <span class="mini-play-dot">${icon("play")}</span>
-      <div class="mini-subtitle">${escapeHtml(subtitle)}</div>
+    <div class="home-dl">
+      <div class="home-dl-top"><strong title="${escapeAttr(item.name)}">${escapeHtml(item.name)}</strong>${right}</div>
+      ${progressBar(muxing ? 100 : percent, muxing ? "is-warn" : "")}
+      <div class="home-dl-sub">${escapeHtml(sub.filter(Boolean).join(" · ") || "Đang tải")}</div>
     </div>
   `;
 }
 
-function recent(title, sub, status, color, screen) {
-  const clipStart = screen === "approve" ? 7 : screen === "download" ? 14 : 0;
+function renderRecentRow(entry) {
+  const duration = Number(entry.duration) || 0;
+  const position = Number(entry.position) || 0;
+  const watched = position > 5;
+  const finished = duration > 0 && position >= duration - 10;
+  const sub = finished
+    ? `Đã xem hết · ${formatClock(duration)}`
+    : watched
+      ? `Đã xem ${formatClock(position)} / ${formatClock(duration)}`
+      : `Chưa xem · ${formatClock(duration)}`;
+  const percent = duration ? Math.min(100, (position / duration) * 100) : 0;
   return `
-    <button class="recent-card" data-screen="${screen}">
-      ${renderMediaThumb(title, clipStart, clipStart + 6)}
-      <div class="mini-row" style="justify-content:space-between;margin-top:10px;gap:12px">
-        <div style="min-width:0;text-align:left">
-          <div style="font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${title}</div>
-          <div class="mono muted">${sub}</div>
-        </div>
-        <span class="badge" style="background:${color}">${status}</span>
-      </div>
+    <button type="button" class="recent-row" data-action="open-recent" data-path="${escapeAttr(entry.path)}" title="${escapeAttr(entry.path)}">
+      <span class="thumb recent-thumb">${playGlyph(18)}${watched ? `<span class="recent-progress" style="width:${percent.toFixed(1)}%"></span>` : ""}</span>
+      <span class="recent-text"><strong>${escapeHtml(stripVideoExtension(entry.name || pathBaseName(entry.path)))}</strong><span>${escapeHtml(sub)}</span></span>
     </button>
   `;
 }
 
+function renderPasteBar(where) {
+  const isHome = where === "home";
+  const id = isHome ? "homePaste" : "dlPaste";
+  const busy = state.paste.busy === where;
+  const error = state.paste.errorFor === where ? state.paste.error : "";
+  const label = busy
+    ? `<span class="spinner" aria-hidden="true"></span><span>Đang đọc link…</span>`
+    : isHome
+      ? `${icon("download")}<span>Tải video</span>`
+      : `<span>Thêm</span>`;
+  return `
+    <div class="paste-wrap">
+      <form class="paste-bar ${isHome ? "is-large" : ""}" data-paste-form="${where}" novalidate>
+        <label for="${id}" class="paste-field">
+          ${icon("link")}
+          <span class="sr-only">Link video hoặc lệnh cURL</span>
+          <input id="${id}" type="text" data-bind="paste.${where}" value="${escapeAttr(state.paste[where])}" placeholder="${isHome ? "Dán link video (.m3u8, .mp4) hoặc lệnh cURL…" : "Dán link video hoặc lệnh cURL rồi nhấn Enter"}" autocomplete="off" spellcheck="false" ${busy ? 'readonly aria-busy="true"' : ""}>
+        </label>
+        <button type="submit" class="btn primary paste-submit" ${busy ? "disabled" : ""}>${label}</button>
+      </form>
+      ${error
+        ? `<div class="inline-error" role="alert">${escapeHtml(error)}</div>`
+        : isHome
+          ? `<div class="paste-hint">Trên Chrome, bấm <strong>Tải bằng ViSUBLY</strong> ngay trên video, không cần copy link.</div>`
+          : ""}
+    </div>
+  `;
+}
+
+function progressBar(percent, classes = "") {
+  const value = Math.max(0, Math.min(100, Number(percent) || 0));
+  return `<div class="progress ${classes}" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(value)}"><div class="progress-fill" style="width:${value}%"></div></div>`;
+}
+
+// ---------- Downloads ----------
 function renderDownload() {
-  return state.download.phase === "running" ? renderDownloadRunning() : renderDownloadWizard();
+  const d = state.download;
+  const counts = downloadCounts();
+  const filters = [
+    ["all", "Tất cả", counts.all],
+    ["active", "Đang tải", counts.active],
+    ["queued", "Hàng đợi", counts.queued],
+    ["done", "Xong", counts.done],
+    ["failed", "Lỗi", counts.failed]
+  ];
+  const items = filteredDownloadItems();
+  const dir = currentDownloadDir();
+  const parallel = state.settings?.maxParallelDownloads || d.parallelItems || 2;
+  const idleQueue = counts.queued > 0 && counts.active === 0;
+  return `
+    <section class="screen downloads-screen">
+      <header class="page-head is-row">
+        <div class="page-titles">
+          <h1 class="h1">Tải xuống</h1>
+          <p class="page-sub" title="${escapeAttr(dir)}">${dir ? `Lưu vào ${escapeHtml(dir)} · ` : ""}tải tối đa ${parallel} video cùng lúc</p>
+        </div>
+        <div class="head-actions">
+          ${idleQueue ? `<button type="button" class="btn primary" data-action="start-queue">${icon("download")}<span>Tải hàng đợi</span></button>` : ""}
+          <button type="button" class="btn outline" data-action="open-download-dir">${icon("library", { size: 16, stroke: 2 })}<span>Mở thư mục</span></button>
+          <button type="button" class="btn outline" data-action="clear-finished-downloads" ${counts.done ? "" : "disabled"}>Xóa mục đã xong</button>
+        </div>
+      </header>
+      ${renderPasteBar("download")}
+      ${d.actionError ? `<div class="inline-error" role="alert">${escapeHtml(d.actionError)}</div>` : ""}
+      <div class="filter-pills" role="group" aria-label="Lọc danh sách tải">
+        ${filters.map(([key, label, count]) => `<button type="button" class="pill ${d.filter === key ? "is-on" : ""}" data-action="filter-downloads" data-value="${key}" aria-pressed="${d.filter === key}">${label} · ${count}</button>`).join("")}
+      </div>
+      <div class="card dl-list">
+        <div class="dl-list-inner">
+          ${items.length ? items.map((item) => renderDownloadRow(item)).join("") : renderDownloadEmpty(counts)}
+        </div>
+      </div>
+      ${renderDownloadFooter()}
+    </section>
+  `;
 }
 
-function renderDownloadWizard() {
-  const step = state.download.step;
-  const queuedCount = state.download.items.filter((item) => item.status === "queued").length;
+function renderDownloadEmpty(counts) {
+  const text = counts.all
+    ? "Không có mục nào trong nhóm này."
+    : "Chưa có video nào. Dán link ở trên, hoặc bấm Tải bằng ViSUBLY trên Chrome.";
+  return `<div class="dl-empty">${icon("download", { size: 22, stroke: 2 })}<span>${text}</span></div>`;
+}
+
+function renderDownloadRow(item) {
+  const status = item.status;
+  const isActive = activeStatuses.has(status);
+  const isQueued = status === "queued";
+  const isDone = status === "done";
+  const isFailed = status === "failed";
+  const isCanceled = status === "canceled";
+  const percent = progressPercent(item);
+  const failure = isFailed ? describeItemFailure(item) : null;
+  let statusText = "";
+  let statusClass = "";
+  if (status === "muxing") {
+    statusText = "Đang ghép thành MP4…";
+    statusClass = "is-warn";
+  } else if (status === "preparing") {
+    statusText = "Đang kiểm tra link…";
+  } else if (status === "active") {
+    statusText = [`${percent}%`, item.speed, etaShort(item.eta)].filter(Boolean).join(" · ");
+  } else if (isQueued) {
+    statusText = `Chờ · vị trí ${queuePosition(item)}`;
+  } else if (isDone) {
+    statusText = item.finishedAt ? `Xong · ${formatTimeOfDay(item.finishedAt)}` : "Xong";
+    statusClass = "is-ok";
+  } else if (isFailed) {
+    statusText = failure.code;
+    statusClass = "is-danger";
+  } else if (isCanceled) {
+    statusText = "Đã hủy";
+  }
+
+  const metaParts = isDone
+    ? [pathBaseName(item.output), qualityText(item), sizeText(item)]
+    : [item.host, qualityText(item), sizeText(item)];
+  const meta = isFailed
+    ? `<span class="row-meta is-danger">${escapeHtml(failure.message)}</span>`
+    : `<span class="row-meta" title="${escapeAttr(isDone ? item.output || "" : item.pageUrl || item.url || "")}">${escapeHtml(metaParts.filter(Boolean).join(" · "))}</span>`;
+  const bar = isActive ? progressBar(status === "muxing" ? 100 : percent, status === "muxing" ? "is-warn" : "") : isQueued ? progressBar(0) : "";
+  const logOpen = state.download.expandedLogId === item.id;
+
+  let actions = "";
+  if (isActive || isQueued) {
+    actions = `<button type="button" class="icon-btn" data-action="cancel-download" data-id="${escapeAttr(item.id)}" aria-label="Hủy" title="Hủy">${icon("x", { size: 16 })}</button>`;
+  } else if (isDone) {
+    actions = `
+      <button type="button" class="btn primary" data-action="play-download" data-id="${escapeAttr(item.id)}">${playGlyph(14)}<span>Xem</span></button>
+      <button type="button" class="icon-btn" data-action="reveal-download-output" data-id="${escapeAttr(item.id)}" aria-label="Mở thư mục chứa file" title="Mở thư mục chứa file">${icon("folder", { size: 16, stroke: 2 })}</button>
+    `;
+  } else if (isFailed || isCanceled) {
+    actions = `
+      <button type="button" class="btn secondary" data-action="retry-download" data-id="${escapeAttr(item.id)}">Thử lại</button>
+      <button type="button" class="btn ghost" data-action="toggle-download-log" data-id="${escapeAttr(item.id)}" aria-expanded="${logOpen}">${logOpen ? "Ẩn log" : "Xem log"}</button>
+      <button type="button" class="icon-btn ghost" data-action="remove-download" data-id="${escapeAttr(item.id)}" aria-label="Xóa khỏi danh sách" title="Xóa khỏi danh sách">${icon("x", { size: 16 })}</button>
+    `;
+  }
+
+  const logs = Array.isArray(item.logs) ? item.logs : [];
   return `
-    <section class="screen tight">
-      ${screenHeader("01 · GRAB", "Download · Batch builder", `${state.download.items.length} in batch`, "home")}
-      <div class="body-grid">
-        <div class="wizard-main">
-          ${renderStepper(step, ["Paste cURL", "Name it", "Pick quality", "Review"])}
-          ${renderWizardStep()}
+    <div class="dl-row ${logOpen ? "has-log" : ""}" data-download-row="${escapeAttr(item.id)}">
+      <div class="dl-row-main">
+        <span class="thumb dl-thumb ${isDone ? "is-done" : ""}">${isDone ? playGlyph(20) : `<span class="type-badge">${escapeHtml(typeLabel(item.type))}</span>`}</span>
+        <div class="dl-info">
+          <div class="dl-top"><strong title="${escapeAttr(item.name)}">${escapeHtml(item.name)}</strong><span class="row-status ${statusClass}">${escapeHtml(statusText)}</span></div>
+          ${bar}
+          ${meta}
         </div>
-        <aside class="side-panel">
-          <div class="mini-row" style="justify-content:space-between">
-            <h3 class="h3">Batch queue</h3>
-            <span class="badge" style="background:var(--lime)">${state.download.items.length}</span>
+        <div class="dl-actions">${actions}</div>
+      </div>
+      ${logOpen ? `<pre class="dl-log" tabindex="0" aria-label="Log tải của ${escapeAttr(item.name)}">${escapeHtml([item.error ? `Lỗi: ${item.error}` : "", ...logs].filter(Boolean).join("\n") || "Chưa có log.")}</pre>` : ""}
+    </div>
+  `;
+}
+
+function renderDownloadFooter() {
+  const connected = chromeConnected();
+  const info = state.info;
+  let engine = `<span>Đang kiểm tra trình tải…</span>`;
+  if (info) {
+    if (!info.engine?.ok) engine = `<span class="is-danger" title="${escapeAttr(info.engine?.error || "")}">Trình tải chưa sẵn sàng</span>`;
+    else if (!info.ffmpeg?.ok) engine = `<span class="is-danger">Thiếu ffmpeg</span>`;
+    else engine = `<span>Trình tải sẵn sàng</span>`;
+  }
+  const disk = state.disk?.ok ? `<span>Còn trống ${escapeHtml(formatBytes(state.disk.free) || "0 B")} trên ${escapeHtml(state.disk.root)}</span>` : "";
+  return `
+    <footer class="dl-footer">
+      <span class="footer-status"><span class="status-dot ${connected ? "is-ok" : "is-off"}"></span>${connected ? "Chrome đã kết nối" : "Chưa kết nối Chrome"}</span>
+      ${engine}
+      ${disk}
+    </footer>
+  `;
+}
+
+// ---------- "Tải video này?" dialog ----------
+function renderCaptureDialog() {
+  const capture = state.capture.queue[0];
+  if (!capture) return "";
+  const c = state.capture;
+  const total = c.handled + c.queue.length;
+  const variants = sortedVariants(capture.variants);
+  const fromChrome = capture.origin !== "manual";
+  const failure = capture.error ? describeFailure(capture.error) : null;
+  const dir = currentDownloadDir();
+  const duration = captureDuration(capture);
+  const sourceMeta = [
+    capture.host,
+    typeLabel(capture.type),
+    capture.isLive ? "Trực tiếp" : duration ? formatClock(duration) : "",
+    variants.length ? `${variants.length} chất lượng` : ""
+  ].filter(Boolean).join(" · ");
+  return `
+    <div class="dialog-overlay">
+      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="capTitle" data-capture-dialog>
+        <div class="dialog-head">
+          <div class="dialog-titles">
+            <div class="dialog-tags">
+              <span class="tag-accent">${fromChrome ? "TỪ CHROME" : "TỪ LINK DÁN"}</span>
+              ${total > 1 ? `<span class="tag-count" aria-label="Video ${c.handled + 1} trên ${total}">${c.handled + 1}/${total}</span>` : ""}
+            </div>
+            <h2 id="capTitle" class="dialog-title">Tải video này?</h2>
           </div>
-          <div class="queue-list">
-            ${state.download.items.map((item, index) => `
-              <div class="queue-item">
-                <div class="mini-row" style="justify-content:space-between">
-                  <strong>${escapeHtml(item.name)}</strong>
-                  <button class="btn ghost icon" data-action="remove-download" data-index="${index}" data-id="${escapeAttr(item.id)}" title="Remove">${icon("x")}</button>
-                </div>
-                <div class="mono muted">${qualityLabel(item.quality)} · ${escapeHtml(item.host || extractHost(item.url) || "parsed host")}</div>
-                <div class="row-progress mini"><div style="width:${Math.round(item.progress || 0)}%"></div></div>
-                <div class="mono muted">${statusLabel(item.status)} · ${phaseLabel(item.phase)}</div>
+          <button type="button" class="icon-btn filled" data-action="capture-skip" aria-label="Đóng" title="Đóng (Esc)">${icon("x", { size: 16 })}</button>
+        </div>
+        <div class="source-card">
+          <span class="thumb source-thumb">${playGlyph(18)}</span>
+          <div class="source-text">
+            <strong title="${escapeAttr(capture.pageUrl || "")}">${escapeHtml(capture.pageTitle || capture.name || "Video")}</strong>
+            <span>${escapeHtml(sourceMeta)}</span>
+          </div>
+        </div>
+        ${failure ? `<div class="note is-danger" role="alert"><strong>${escapeHtml(failure.code)}.</strong> ${escapeHtml(failure.message)} Bạn vẫn có thể bấm Tải để ViSUBLY thử lại.</div>` : ""}
+        <div class="field">
+          <label for="capName">Tên file</label>
+          <input id="capName" class="input" type="text" data-bind="capture.name" value="${escapeAttr(c.name)}" autocomplete="off" spellcheck="false" ${c.busy ? "readonly" : ""}>
+        </div>
+        ${variants.length ? `
+          <fieldset class="quality-field">
+            <legend>Chất lượng</legend>
+            <div class="quality-grid" style="--quality-cols:${Math.min(4, variants.length)}">
+              ${variants.map((variant) => renderQualityChip(variant, variants, duration)).join("")}
+            </div>
+          </fieldset>
+        ` : ""}
+        <div class="save-row">
+          <span class="save-dir">Lưu vào <strong title="${escapeAttr(dir)}">${escapeHtml(dir || "thư mục mặc định")}</strong></span>
+          <button type="button" class="btn outline small" data-action="change-download-dir" ${c.busy ? "disabled" : ""}>Đổi thư mục</button>
+        </div>
+        ${c.error ? `<div class="inline-error" role="alert">${escapeHtml(c.error)}</div>` : ""}
+        <div class="dialog-actions">
+          <button type="button" class="btn ghost" data-action="capture-skip" ${c.busy ? "disabled" : ""}>Bỏ qua</button>
+          <button type="button" class="btn secondary" data-action="capture-queue" ${c.busy ? "disabled" : ""}>Thêm vào hàng đợi</button>
+          <button type="button" class="btn primary" data-action="capture-now" ${c.busy ? "disabled" : ""}>${c.busy ? '<span class="spinner" aria-hidden="true"></span>' : icon("download", { size: 16 })}<span>Tải ngay</span></button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderQualityChip(variant, all, duration) {
+  const key = variantKey(variant);
+  const selected = state.capture.quality === key;
+  const height = Number(variant.height) || 0;
+  const label = height ? `${height}p` : String(variant.resolution || "Gốc");
+  const bandwidth = Number(variant.bandwidth) || 0;
+  const sameHeight = all.filter((other) => (Number(other.height) || 0) === height).length > 1;
+  let sub = String(variant.resolution || "").replace("x", "×");
+  const estBytes = Number(variant.estBytes) || (bandwidth && duration ? (bandwidth * duration) / 8 : 0);
+  if (estBytes) sub = formatApproxBytes(estBytes);
+  else if (sameHeight && bandwidth) sub = `${(bandwidth / 1e6).toFixed(1)} Mbps`;
+  return `
+    <button type="button" class="quality-chip ${selected ? "is-on" : ""}" data-action="pick-quality" data-value="${escapeAttr(key)}" aria-pressed="${selected}">
+      <strong>${escapeHtml(label)}</strong>
+      ${sub && sub !== label ? `<span>${escapeHtml(sub)}</span>` : ""}
+    </button>
+  `;
+}
+
+// ---------- Settings ----------
+function renderSettings() {
+  const s = state.settings || {};
+  const mode = s.theme || state.theme.mode;
+  const info = state.info;
+  const parallel = Number(s.maxParallelDownloads) || state.download.parallelItems || 2;
+  const notify = s.notifyOnComplete !== false;
+  const dir = currentDownloadDir();
+  return `
+    <section class="screen settings-screen">
+      <h1 class="h1">Cài đặt</h1>
+      <div class="settings-grid">
+        <div class="settings-col">
+          <section class="card settings-card">
+            <h2 class="h2">Giao diện</h2>
+            <div class="segmented is-wide" role="group" aria-label="Giao diện">
+              ${segButton("set-theme", "dark", "Tối", mode === "dark")}
+              ${segButton("set-theme", "light", "Sáng", mode === "light")}
+              ${segButton("set-theme", "system", "Theo Windows", mode === "system")}
+            </div>
+          </section>
+
+          <section class="card settings-card">
+            <h2 class="h2">Tải xuống</h2>
+            <div class="setting-row">
+              <div class="setting-text"><span class="setting-label">Thư mục lưu</span><span class="setting-mono" title="${escapeAttr(dir)}">${escapeHtml(dir || "Chưa chọn")}</span></div>
+              <button type="button" class="btn secondary" data-action="change-download-dir">Đổi…</button>
+            </div>
+            <div class="setting-row">
+              <span class="setting-label" id="parallelLabel">Tải cùng lúc</span>
+              <div class="segmented is-compact" role="group" aria-labelledby="parallelLabel">
+                ${[1, 2, 3].map((value) => segButton("set-parallel", String(value), String(value), parallel === value)).join("")}
               </div>
-            `).join("") || `<div class="empty">No items yet.</div>`}
-          </div>
-          <div style="margin-top:18px;display:grid;gap:10px">
-            ${btn("Start downloads", "start-downloads", "primary", "download", queuedCount ? "" : "disabled")}
-            ${btn("Use sample cURL", "use-sample-curl", "", "plus")}
-          </div>
-        </aside>
+            </div>
+            <div class="setting-row">
+              <div class="setting-text"><span class="setting-label">Thông báo khi tải xong</span><span class="setting-hint">Hiện thông báo Windows khi một video tải xong</span></div>
+              <button type="button" class="switch ${notify ? "is-on" : ""}" role="switch" aria-checked="${notify}" aria-label="Thông báo khi tải xong" data-action="toggle-notify"><span class="switch-knob"></span></button>
+            </div>
+          </section>
+
+          <section class="card settings-card is-tight">
+            <h2 class="h2">Giới thiệu</h2>
+            ${kvRow("Phiên bản", `<span class="mono-text">${escapeHtml(info?.version || desktop.boot?.version || "—")}</span>`)}
+            ${kvRow("Dữ liệu app", `<span class="mono-text" title="${escapeAttr(info?.dataDir || "")}">${escapeHtml(info?.dataDir || "—")}</span>`)}
+            ${kvRow("Trình tải video", readinessText(info ? info.engine?.ok : null, info?.engine?.error))}
+            ${kvRow("ffmpeg", readinessText(info ? info.ffmpeg?.ok : null))}
+          </section>
+        </div>
+
+        <div class="settings-col">
+          ${renderChromeSettings()}
+          ${renderRemoteSettings()}
+          <section class="soon-card is-column">
+            <div class="soon-title"><h2 class="h2">Phụ đề AI</h2><span class="soon-badge">Sắp có</span></div>
+            <span>Whisper, Claude và ChatGPT sẽ được cấu hình ở đây.</span>
+          </section>
+        </div>
       </div>
     </section>
   `;
 }
 
-function renderStepper(active, labels) {
-  return `<div class="stepper">${labels.map((label, index) => `
-    <span class="step-pill ${index === active ? "active" : ""} ${index < active ? "done" : ""}">
-      <span class="step-num">${index < active ? "✓" : index + 1}</span>${label}
-    </span>
-  `).join("")}</div>`;
+function renderRemoteSettings() {
+  const remote = state.remote;
+  const autoStart = state.settings?.remoteAutoStart !== false;
+  const devices = Array.isArray(remote.devices) ? remote.devices : [];
+  const deviceRows = devices.map((device) => `
+    <div class="setting-row">
+      <div class="setting-text">
+        <span class="setting-label">${escapeHtml(device.name || "Thiết bị")}</span>
+        <span class="setting-hint">Lần cuối: ${escapeHtml(formatShortDate(device.lastSeen) || "—")}</span>
+      </div>
+      <button type="button" class="btn ghost danger-text" data-action="remote-revoke" data-id="${escapeAttr(device.id)}">Gỡ</button>
+    </div>
+  `).join("");
+  return `
+    <section class="card settings-card">
+      <div class="setting-row">
+        <div class="setting-text">
+          <h2 class="h2">Remote iPhone</h2>
+          <span class="setting-hint">${remote.running ? "Đang bật · điện thoại đã ghép nối tự kết nối qua Wi-Fi." : "Xem video trên điện thoại qua Wi-Fi. Ghép nối một lần bằng QR hoặc bấm Cho phép."}</span>
+        </div>
+        <button type="button" class="btn secondary" data-action="start-remote">${remote.running ? "Hiện mã QR" : "Bật Remote"}</button>
+      </div>
+      <div class="setting-row">
+        <div class="setting-text">
+          <span class="setting-label">Tự bật khi mở ViSUBLY</span>
+          <span class="setting-hint">Khi đã có thiết bị ghép nối, điện thoại vào được mà không cần bật tay.</span>
+        </div>
+        <button type="button" class="switch ${autoStart ? "is-on" : ""}" role="switch" aria-checked="${autoStart}" aria-label="Tự bật Remote khi mở ViSUBLY" data-action="toggle-remote-autostart"><span class="switch-knob"></span></button>
+      </div>
+      ${devices.length ? `<div class="setting-subhead">Thiết bị đã ghép nối (${devices.length})</div>${deviceRows}
+        <div class="setting-row is-end">${btn("Gỡ tất cả", "remote-revoke-all", "ghost danger-text")}</div>`
+        : `<span class="setting-hint">Chưa có thiết bị nào được ghép nối.</span>`}
+    </section>
+  `;
 }
 
-function renderWizardStep() {
-  const d = state.download;
-  if (d.step === 0) {
-    return `
-      <div class="form-panel">
-        <h2 class="h2">Paste cURL</h2>
-        <p class="muted">Paste a plain URL or the full cURL from DevTools. The parser keeps headers and preflights HLS quality before queueing.</p>
-        <div class="field">
-          <label for="curlInput">cURL command</label>
-          <textarea class="textarea" id="curlInput" data-bind="download.curl" placeholder="${escapeAttr(sampleCurl)}">${escapeHtml(d.curl)}</textarea>
-        </div>
-        ${d.prepareError ? `<div class="note danger-note">${escapeHtml(d.prepareError)}</div>` : ""}
-        <div style="display:flex;justify-content:space-between;margin-top:16px">
-          ${btn("Use sample", "use-sample-curl", "", "plus")}
-          ${btn("Next", "download-next", "primary", "arrowR")}
-        </div>
-      </div>
-    `;
+async function refreshRemoteState() {
+  if (!desktop.airplay?.listDevices) return;
+  try {
+    const [devices, info] = await Promise.all([desktop.airplay.listDevices(), desktop.airplay.info()]);
+    state.remote.devices = Array.isArray(devices) ? devices : [];
+    state.remote.running = Boolean(info?.running);
+  } catch {
+    // Remote is optional; keep the last known state.
   }
-  if (d.step === 1) {
-    return `
-      <div class="form-panel">
-        <h2 class="h2">Name the output</h2>
-        <p class="muted">This will become the file name and the default movie title hint in the subtitle flow.</p>
-        <div class="field">
-          <label for="nameInput">Video name</label>
-          <input class="input" id="nameInput" data-bind="download.name" value="${escapeAttr(d.name)}" placeholder="Inside_No9_S08E04">
-        </div>
-        ${d.qualityError ? `<div class="note danger-note" style="margin-top:12px">${escapeHtml(d.qualityError)}</div>` : ""}
-        <div style="display:flex;justify-content:space-between;margin-top:16px">
-          ${btn("Back", "download-back", "", "arrowL")}
-          ${btn(d.loadingQualities ? "Loading..." : "Next", "download-next", "primary", "arrowR", d.loadingQualities ? "disabled" : "")}
-        </div>
-      </div>
-    `;
-  }
-  if (d.step === 2) {
-    const list = d.dynamicQualities || qualities;
-    const isLowQuality = d.maxHeight && d.maxHeight <= 720;
-    
-    return `
-      <div class="form-panel">
-        <h2 class="h2">Pick quality</h2>
-        <p class="muted">The downloader will use this as the preferred HLS resolution. If it is missing, it keeps the highest available stream.</p>
-        
-        ${isLowQuality ? `<div class="note danger-note" style="margin-top:12px; border-color:var(--coral); color:var(--coral)">Warning: Maximum resolution is ${d.maxHeight}p. Do you want to proceed?</div>` : ""}
+  if (state.screen === "settings") render();
+}
 
-        <div class="quality-grid" style="margin-top:16px">
-          ${list.filter((q) => q.id !== "audio").map((q) => `
-            <button class="quality-option ${d.quality === q.id ? "selected" : ""}" data-action="pick-quality" data-quality="${q.id}">
-              <div style="font-weight:900;font-size:18px">${q.label}</div>
-              <div class="mono muted">${q.note}</div>
-            </button>
-          `).join("")}
-        </div>
-        <div style="display:flex;justify-content:space-between;margin-top:16px">
-          <div style="display:flex; gap:10px">
-            ${btn("Back", "download-back", "", "arrowL")}
-            ${isLowQuality ? btn("Hủy", "download-cancel-record", "danger") : ""}
-          </div>
-          ${btn("Next", "download-next", "primary", "arrowR")}
-        </div>
-      </div>
-    `;
+function respondRemotePairing(allow) {
+  const requestId = state.remote.pairingRequestId;
+  state.remote.pairingActive = false;
+  state.remote.pairingPin = null;
+  state.remote.pairingRequestId = "";
+  render();
+  if (requestId && desktop.airplay?.respondPairing) {
+    desktop.airplay.respondPairing(requestId, allow).then(() => {
+      if (allow) showToast("Đã cho phép thiết bị kết nối");
+    }).catch(() => {});
   }
+}
+
+function renderChromeSettings() {
+  const chrome = state.chrome;
+  const pairing = state.pairing;
+  let status;
+  if (!chrome.known) status = `<span class="conn-status">Đang kiểm tra…</span>`;
+  else if (!chrome.running) status = `<span class="conn-status is-danger" title="${escapeAttr(chrome.error || "")}"><span class="status-dot is-danger"></span>Cầu nối chưa chạy</span>`;
+  else if (chrome.pairedClients > 0) status = `<span class="conn-status is-ok"><span class="status-dot is-ok"></span>${chrome.pairedClients} trình duyệt đã ghép nối</span>`;
+  else status = `<span class="conn-status"><span class="status-dot is-off"></span>Chưa ghép nối</span>`;
+
+  const secondsLeft = pairing.code ? Math.max(0, (pairing.expiresAt - Date.now()) / 1000) : 0;
+  let codeBox;
+  if (pairing.loading) {
+    codeBox = `<span class="code-label">Mã ghép nối</span><span class="pair-code is-muted">··· ···</span><span class="code-label">Đang tạo mã…</span>`;
+  } else if (pairing.code && secondsLeft > 0) {
+    codeBox = `<span class="code-label">Mã ghép nối</span><span class="pair-code" aria-label="Mã ghép nối ${escapeAttr(pairing.code.split("").join(" "))}">${escapeHtml(formatPairingCode(pairing.code))}</span><span class="code-label" data-pair-countdown aria-live="off">Hết hạn sau ${formatClock(secondsLeft)}</span>`;
+  } else {
+    codeBox = `<span class="code-label">Mã ghép nối</span><span class="pair-code is-muted">— — —</span><span class="code-label ${pairing.error ? "is-danger" : ""}">${escapeHtml(pairing.error || "Mã đã hết hạn. Bấm Tạo mã mới.")}</span>`;
+  }
+
   return `
-    <div class="form-panel">
-      <h2 class="h2">Review item</h2>
-      <div class="queue-item" style="margin-top:16px">
-        <div class="mini-row" style="justify-content:space-between">
-          <strong>${escapeHtml(d.name || "Inside_No9_S08E04")}</strong>
-          <span class="badge" style="background:var(--lime)">${qualityLabel(d.quality)}</span>
-        </div>
-        <div class="mono muted">${escapeHtml(extractHost(d.curl) || "cdn.streamhub.net")} · ready for queue</div>
+    <section class="card settings-card is-featured">
+      <div class="card-head">
+        <h2 class="h2">Kết nối Chrome</h2>
+        ${status}
       </div>
-      ${d.preparing ? `<div class="note" style="margin-top:12px">Preparing item and checking playlist...</div>` : ""}
-      ${d.prepareError ? `<div class="note danger-note" style="margin-top:12px">${escapeHtml(d.prepareError)}</div>` : ""}
-      <div style="display:flex;justify-content:space-between;margin-top:16px">
-        ${btn("Back", "download-back", "", "arrowL")}
-        ${btn(d.preparing ? "Preparing" : "Add to batch", "add-download-item", "primary", "plus", d.preparing ? "disabled" : "")}
+      <div class="code-box">${codeBox}</div>
+      <ol class="steps">
+        <li>Mở <strong>chrome://extensions</strong>, bật <strong>Developer mode</strong>, bấm <strong>Load unpacked</strong> và chọn thư mục extension.</li>
+        <li>Bấm biểu tượng ViSUBLY trên thanh Chrome, nhập mã ở trên.</li>
+        <li>Mở trang có video, bấm phát rồi bấm <strong>Tải bằng ViSUBLY</strong>.</li>
+      </ol>
+      ${pairing.notice ? `<div class="note" role="status">${escapeHtml(pairing.notice)}</div>` : ""}
+      <div class="btn-row">
+        <button type="button" class="btn primary" data-action="open-extension-folder">Mở thư mục extension</button>
+        <button type="button" class="btn secondary" data-action="new-pairing-code" ${pairing.loading ? "disabled" : ""}>Tạo mã mới</button>
+        ${pairing.confirmRevoke
+          ? `<span class="confirm-inline" role="group" aria-label="Xác nhận hủy ghép nối">
+              <button type="button" class="btn danger" data-action="confirm-revoke">Hủy ghép nối</button>
+              <button type="button" class="btn ghost" data-action="cancel-revoke">Thôi</button>
+            </span>`
+          : `<button type="button" class="btn danger-text" data-action="ask-revoke">Hủy mọi ghép nối</button>`}
+      </div>
+      ${renderShortVideoSetting()}
+    </section>
+  `;
+}
+
+function renderShortVideoSetting() {
+  const stored = Number(state.settings?.ignoreShortVideosSec);
+  const current = Number.isFinite(stored) ? stored : 120;
+  const choices = [[0, "Tắt"], [30, "30 giây"], [60, "1 phút"], [120, "2 phút"], [300, "5 phút"]];
+  return `
+    <div class="setting-stack is-divided">
+      <div class="setting-text">
+        <span class="setting-label" id="shortVideosLabel">Ẩn video ngắn hơn</span>
+        <span class="setting-hint">Bỏ qua video xem trước và quảng cáo ngắn khi bắt link từ Chrome.</span>
+      </div>
+      <div class="segmented is-wide is-five" role="group" aria-labelledby="shortVideosLabel">
+        ${choices.map(([value, label]) => segButton("set-short-videos", String(value), label, current === value)).join("")}
       </div>
     </div>
   `;
 }
 
-function renderDownloadRunning() {
-  const selectedItem = selectedDownloadItem();
+function segButton(action, value, label, pressed) {
+  return `<button type="button" class="seg-btn ${pressed ? "is-on" : ""}" data-action="${action}" data-value="${escapeAttr(value)}" aria-pressed="${pressed}">${escapeHtml(label)}</button>`;
+}
+
+function kvRow(label, valueHtml) {
+  return `<div class="kv-row"><span class="kv-label">${label}</span>${valueHtml}</div>`;
+}
+
+function readinessText(ok, error = "") {
+  if (ok === null || ok === undefined) return `<span class="muted">Đang kiểm tra…</span>`;
+  return ok ? `<span class="is-ok">Sẵn sàng</span>` : `<span class="is-danger" title="${escapeAttr(error || "")}">Chưa sẵn sàng</span>`;
+}
+
+// ---------- Intro + modals ----------
+function renderIntro() {
   return `
-    <section class="screen">
-      <div class="top-row">
-        <div>
-          <div class="eyebrow">01 · GRAB</div>
-          <h1 class="h1">Downloading batch</h1>
-        </div>
-        <div style="display:flex;gap:8px">
-          ${btn("Edit batch", "edit-batch", "", "arrowL")}
-          ${btn("Home", "go-home", "ghost", "home")}
-        </div>
+    <div class="intro" data-intro data-action="dismiss-intro">
+      <div class="intro-inner">
+        <img class="intro-logo" src="./assets/brand/visubly-logo.svg" width="112" height="112" alt="">
+        <div class="intro-word">ViSUBLY</div>
+        <div class="intro-tag">GRAB · SUB · WATCH</div>
       </div>
-      <div class="download-workbench">
-        <div class="running-list">
-        ${state.download.items.map((item, index) => {
-          const status = item.status;
-          const progress = status === "done" ? 100 : Math.round(item.progress || 0);
-          const rowClass = item.id === selectedItem?.id ? "selected" : "";
-          return `
-            <div class="running-row ${rowClass}" data-action="select-download-log" data-id="${escapeAttr(item.id)}">
-              <div class="running-row-main">
-                <span class="step-index">${index + 1}</span>
-                <div style="min-width:0">
-                  <div style="font-weight:900">${escapeHtml(item.name)}</div>
-                  <div class="mono muted">${phaseLabel(item.phase)} · ${escapeHtml(progressMeta(item))}</div>
-                  <div class="mono muted">${qualityLabel(item.quality)} · ${statusLabel(status)}</div>
-                </div>
-                <div style="display:flex;align-items:center;gap:8px">
-                  ${["active", "preparing", "muxing"].includes(status) ? btn("Cancel", "cancel-download", "danger", "x", `data-id="${escapeAttr(item.id)}"`) : ""}
-                  ${["failed", "canceled"].includes(status) ? btn("Retry", "retry-download", "primary", "download", `data-id="${escapeAttr(item.id)}"`) : ""}
-                  ${status === "done" ? `<span class="badge" style="background:var(--lime)">✓ ready</span>${btn("Subtitle this", "subtitle-downloaded", "violet", "sub", `data-index="${index}"`)}` : `<span class="badge" style="background:var(--paper)">${Math.round(progress)}%</span>`}
-                </div>
-              </div>
-              <div class="row-progress"><div style="width:${progress}%"></div></div>
-            </div>
-          `;
-        }).join("") || `<div class="empty">No downloads in this batch.</div>`}
-        </div>
-        ${renderDownloadTerminal(selectedItem)}
-      </div>
-    </section>
+      <div class="intro-skip">Bấm để bỏ qua</div>
+    </div>
   `;
 }
 
-function renderDownloadTerminal(item) {
-  const lines = item?.logs?.length ? item.logs.slice(-80) : ["Queue is ready."];
+function renderRemoteModal() {
+  if (state.capture.queue.length) return "";
+  if (state.remote.pairingActive) {
+    const device = state.remote.pairingDevice || "Một thiết bị";
+    return `
+      <div class="dialog-overlay">
+        <section class="dialog is-narrow is-center" role="dialog" aria-modal="true" aria-labelledby="pairTitle">
+          <span class="dialog-icon">${icon("phone", { size: 26, stroke: 2 })}</span>
+          <h2 id="pairTitle" class="dialog-title">Cho phép kết nối?</h2>
+          <p class="dialog-text"><strong>${escapeHtml(device)}</strong> muốn xem video trên máy tính này qua Wi-Fi. Chỉ cần cho phép một lần, lần sau thiết bị tự kết nối.</p>
+          <div class="dialog-actions is-center">
+            ${btn("Từ chối", "remote-deny", "secondary")}
+            ${btn("Cho phép", "remote-allow", "primary")}
+          </div>
+          ${state.remote.pairingPin ? `<p class="dialog-note">Dùng app ViSUBLY cũ trên điện thoại? Nhập mã <strong class="mono-text">${escapeHtml(state.remote.pairingPin)}</strong></p>` : ""}
+        </section>
+      </div>
+    `;
+  }
+
+  if (!state.remote.qrUrl && !state.remote.loading) return "";
   return `
-    <aside class="download-terminal-panel">
-      <div class="mini-row" style="justify-content:space-between">
-        <h3 class="h3">Terminal</h3>
-        <span class="badge" style="background:var(--paper)">${escapeHtml(item?.status || "idle")}</span>
-      </div>
-      <div class="mono muted" style="margin:4px 0 10px">${escapeHtml(item?.name || "No item selected")}</div>
-      <div class="terminal download-terminal">
-        ${lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("")}
-      </div>
-      ${item?.output ? `<div class="mono muted terminal-output">${escapeHtml(item.output)}</div>` : ""}
-    </aside>
+    <div class="dialog-overlay">
+      <section class="dialog is-narrow is-center" role="dialog" aria-modal="true" aria-labelledby="remoteTitle">
+        <h2 id="remoteTitle" class="dialog-title">Remote iPhone</h2>
+        <p class="dialog-text">Quét mã QR bằng camera iPhone để xem video qua Wi-Fi. Chỉ cần quét một lần — lần sau mở lại trang (hoặc biểu tượng trên màn hình chính) là vào.</p>
+        ${state.remote.loading
+          ? `<div class="qr-box is-loading"><span class="spinner" aria-hidden="true"></span><span>Đang bật…</span></div>`
+          : `<img class="qr-box" src="${escapeAttr(state.remote.qrUrl)}" alt="Mã QR để mở Remote trên điện thoại" width="232" height="232">`}
+        <p class="dialog-note">${state.remote.awake ? "Máy tính đang được giữ thức để phát video; màn hình vẫn có thể tắt." : "Khi phát qua Remote, máy tính được giữ thức; màn hình vẫn có thể tắt."}</p>
+        <div class="dialog-actions is-center">
+          ${state.remote.loading ? "" : btn("Sao chép link", "copy-remote-link", "secondary")}
+          ${btn("Đóng", "close-remote", "primary")}
+        </div>
+      </section>
+    </div>
   `;
 }
 
-function renderSubtitle() {
-  const s = state.subtitle;
-  return `
-    <section class="screen tight">
-      ${screenHeader("02 · SUB", "Subtitle · Set up", "STEP 1 of 2", "home")}
-      <div class="subtitle-layout">
-        <div>
-          <div class="eyebrow">A</div>
-          <h3 class="h3" style="margin-bottom:10px">Drop your video</h3>
-          <div class="drop-zone" id="dropZone">
-            ${renderMediaThumb(s.fileName, 0, 6, "video-card")}
-            <div class="video-meta">
-              <div style="min-width:0">
-                <div style="font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(s.fileName)}</div>
-                <div class="mono muted">41:22 · 1.2 GB · path locked after select</div>
-              </div>
-              ${btn("Choose", "choose-video", "", "folder")}
-            </div>
-          </div>
 
-          <div class="field">
-            <label for="movieTitle">Movie / show title</label>
-            <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px">
-              <input class="input" id="movieTitle" data-bind="subtitle.movieTitle" value="${escapeAttr(s.movieTitle)}">
-              <span class="badge" style="align-self:center;background:${s.movieEdited ? "var(--rose)" : "var(--lime)"}">${s.movieEdited ? "edited" : "auto"}</span>
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <div class="eyebrow">B</div>
-          <h3 class="h3" style="margin-bottom:10px">Who is in it?</h3>
-          <div class="form-panel" style="max-width:none;box-shadow:none">
-            <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px">
-              <input class="input" data-bind="subtitle.castDraft" value="${escapeAttr(s.castDraft)}" placeholder="Actor / actress name">
-              ${btn("Add", "add-cast", "primary", "plus")}
-            </div>
-            <div class="cast-list">
-              ${s.cast.map((name, index) => `
-                <div class="cast-row">
-                  <span class="avatar">${escapeHtml(name[0] || "?")}</span>
-                  <strong>${escapeHtml(name)}</strong>
-                  <button class="btn ghost icon" data-action="remove-cast" data-index="${index}" title="Remove">${icon("x")}</button>
-                </div>
-              `).join("")}
-            </div>
-          </div>
-          <div class="note" style="margin-top:14px">
-            <strong>Visubly will figure out the rest.</strong> Source language is detected automatically. Vietnamese tone stays phổ thông, and the model learns from each approve, ChatGPT pick, or custom fix.
-          </div>
-          <div style="display:flex;justify-content:flex-end;margin-top:18px">
-            ${btn("Generate subtitles", "start-processing", "primary", "arrowR")}
-          </div>
-        </div>
-      </div>
-    </section>
-  `;
-}
-
-function renderProcessing() {
-  const p = state.subtitle.processing;
-  const steps = [
-    ["Research + style guide", "Claude Opus", "Finds title/cast context and writes translation guideline.", "var(--rose)", p.values[0]],
-    ["Audio → source subtitles", "Whisper v3", "Segments speech into source captions.", "var(--paper)", p.values[1]],
-    ["Translate to Vietnamese", "Claude Sonnet", "Translates with the Opus style guide.", "var(--violet)", p.values[2]],
-    ["QC vs scene and character", "Claude Opus", "Fixes context, pacing, and character voice.", "var(--lime)", p.values[3]],
-    ["Native-tone check", "ChatGPT", "Flags lines that sound less natural in spoken Vietnamese.", "var(--mint)", p.values[4]]
-  ];
-  return `
-    <section class="screen tight">
-      ${screenHeader("02 · SUB", "Subtitle · Working on it", "STEP 2 of 2", "subtitle")}
-      <div class="pipeline-layout">
-        <div class="pipeline-list">
-          ${steps.map(([title, model, copy, color, value], index) => `
-            <div class="pipeline-step">
-              <div class="pipeline-head">
-                <span class="step-index">${String(index + 1).padStart(2, "0")}</span>
-                <div>
-                  <h3 class="h3">${title}</h3>
-                  <div class="muted" style="font-size:13px">${copy}</div>
-                </div>
-                <span class="badge" style="background:${color};color:${color === "var(--violet)" ? "var(--paper)" : "var(--ink)"}">${model}</span>
-              </div>
-              <div class="progress-track" style="margin-top:12px"><div class="progress-fill" style="width:${value}%;background:${color === "var(--paper)" ? "var(--coral)" : color}"></div></div>
-              <div class="mono muted" style="margin-top:6px">${Math.round(value)}%</div>
-            </div>
-          `).join("")}
-          <div style="display:flex;justify-content:flex-end">
-            ${p.done ? btn("Review flagged lines", "go-approve", "primary", "arrowR") : btn("Processing", "noop", "ghost", "clock")}
-          </div>
-        </div>
-        <aside class="terminal">
-          ${pipelineLogs(p.values).map((line) => `<div>${line}</div>`).join("")}
-        </aside>
-      </div>
-    </section>
-  `;
-}
-
-function renderApprove() {
-  const a = state.approvals;
-  if (a.cursor >= flaggedSegments.length) return renderApproveDone();
-  const seg = flaggedSegments[a.cursor];
-  const prior = a.decisions[a.cursor];
-  const canBack = a.cursor > 0;
-  const canNext = Boolean(a.decisions[a.cursor + 1]);
-  return `
-    <section class="screen tight">
-      ${screenHeader("03 · REVIEW", "Approve · Native-tone choices", `${a.cursor + 1} of ${flaggedSegments.length}`, "processing")}
-      <div class="approval-layout">
-        <div class="approval-stage">
-          ${canBack ? `<button class="nav-arrow left" data-action="approval-back" title="Back">${icon("arrowL")}</button>` : ""}
-          ${canNext ? `<button class="nav-arrow right" data-action="approval-next" title="Next">${icon("arrowR")}</button>` : ""}
-          <div class="approval-card">
-            ${prior ? `<div class="badge" style="display:inline-block;background:var(--lime);margin-bottom:12px">YOU PICKED · ${decisionLabel(prior.pick)}</div>` : `<div class="badge" style="display:inline-block;background:var(--mint);margin-bottom:12px">ChatGPT vs Claude</div>`}
-            ${renderMediaThumb(seg.source, a.cursor * 6, a.cursor * 6 + 6, "approval-preview")}
-            <div class="mono muted">${seg.id}</div>
-            <h2 class="h2" style="margin-top:6px">${escapeHtml(seg.source)}</h2>
-            <p class="muted">${escapeHtml(seg.hint)}</p>
-            ${prior && prior.pick === "custom" ? `<div class="queue-item" style="background:var(--rose);margin:12px 0"><div class="mono">YOUR EDIT</div><strong>${escapeHtml(prior.text)}</strong></div>` : ""}
-            <div class="choice-grid">
-              ${choice("claude", "Claude option", seg.claude, prior)}
-              ${choice("chatgpt", "ChatGPT option", seg.chatgpt, prior)}
-            </div>
-            <div class="custom-box">
-              <div class="mini-row" style="justify-content:space-between;margin-bottom:8px">
-                <strong>Write your own</strong>
-                <span class="mono muted">trains Sonnet next time</span>
-              </div>
-              <textarea class="textarea" style="min-height:90px" data-bind="approvals.customText" placeholder="Type a better Vietnamese line...">${escapeHtml(a.customText)}</textarea>
-              <div style="display:flex;justify-content:flex-end;margin-top:10px">
-                ${btn("Use my edit", "choose-custom", "primary", "edit")}
-              </div>
-            </div>
-          </div>
-        </div>
-        <aside class="side-panel" style="border-left:var(--line);border-top:0">
-          <div class="mini-row" style="justify-content:space-between">
-            <h3 class="h3">Decisions</h3>
-            <span class="badge" style="background:var(--lime)">${a.decisions.filter(Boolean).length}/${flaggedSegments.length}</span>
-          </div>
-          <div class="queue-list">
-            ${flaggedSegments.map((item, index) => {
-              const d = a.decisions[index];
-              return `<button class="decision-item ${index === a.cursor ? "active" : ""}" data-action="jump-approval" data-index="${index}" ${!d && index > a.cursor ? "disabled" : ""}>
-                <div class="mini-row" style="justify-content:space-between">
-                  <strong>${item.id}</strong>
-                  <span class="badge" style="background:${d ? decisionColor(d.pick) : "var(--paper)"}">${d ? decisionShort(d.pick) : "open"}</span>
-                </div>
-                <div class="mono muted" style="margin-top:5px">${escapeHtml(item.source)}</div>
-              </button>`;
-            }).join("")}
-          </div>
-          <div class="note" style="margin-top:14px;background:var(--bg)">
-            Click Claude, click ChatGPT, or write your own. Back is always available after a decision; Next appears only for cards already reviewed.
-          </div>
-        </aside>
-      </div>
-    </section>
-  `;
-}
-
-function choice(pick, label, text, prior) {
-  const selected = prior && prior.pick === pick;
-  return `
-    <button class="choice ${pick} ${selected ? "selected" : ""}" data-action="choose-approval" data-pick="${pick}">
-      <span class="badge" style="background:${pick === "claude" ? "var(--violet);color:var(--paper)" : "var(--mint)"}">${label}</span>
-      <p style="font-size:20px;font-weight:900;line-height:1.35">${escapeHtml(text)}</p>
-    </button>
-  `;
-}
-
-function renderApproveDone() {
-  const decisions = state.approvals.decisions.filter(Boolean);
-  const c = decisions.filter((d) => d.pick === "claude").length;
-  const g = decisions.filter((d) => d.pick === "chatgpt").length;
-  const e = decisions.filter((d) => d.pick === "custom").length;
-  return `
-    <section class="screen">
-      <div class="form-panel" style="margin:40px auto;max-width:720px;text-align:center">
-        <div style="display:flex;justify-content:center;margin-bottom:18px">${logo()}</div>
-        <h1 class="h1">Subtitle pass complete</h1>
-        <p class="muted">Visubly saved these choices locally so Sonnet can need fewer fixes next time.</p>
-        <div class="grid-3" style="margin:22px 0">
-          ${stat("Claude", String(c), "var(--violet)")}
-          ${stat("ChatGPT", String(g), "var(--mint)")}
-          ${stat("Your edits", String(e), "var(--rose)")}
-        </div>
-        <div style="display:flex;justify-content:center;gap:10px">
-          ${btn("Review decisions", "review-decisions", "", "arrowL")}
-          ${btn("Open player", "open-player", "primary", "play")}
-        </div>
-      </div>
-    </section>
-  `;
-}
-
-function renderPlayer() {
-  const lines = [
-    ["00:14:22", "Bình tĩnh nào ông tướng, làm gì căng vậy."],
-    ["00:18:09", "Mọi thứ rối tinh rối mù hết rồi, phải không?"],
-    ["00:27:46", "Thôi, tao đi cái đã."],
-    ["00:31:04", "Cậu ấy đang bắt nhầm hướng rồi."]
-  ];
-  return `
-    <section class="screen">
-      <div class="top-row">
-        <div>
-          <div class="eyebrow">03 · WATCH</div>
-          <h1 class="h1">Player preview</h1>
-        </div>
-        <div style="display:flex;gap:8px">
-          ${btn("VI", "player-vi", state.playerMode === "vi" ? "lime" : "")}
-          ${btn("EN", "player-en", state.playerMode === "en" ? "lime" : "")}
-        </div>
-      </div>
-      <div class="player-layout">
-        <div class="player-frame">
-          <span class="play-dot">${icon("play")}</span>
-          <div class="subtitle-overlay">${state.playerMode === "vi" ? "Bình tĩnh nào ông tướng, làm gì căng vậy." : "Don't get your knickers in a twist, mate."}</div>
-          <div class="scrubber"><div></div></div>
-        </div>
-        <aside>
-          <h3 class="h3">Transcript</h3>
-          <div class="queue-list">
-            ${lines.map(([time, text]) => `<div class="subtitle-line"><div class="mono muted">${time}</div><strong>${text}</strong></div>`).join("")}
-          </div>
-        </aside>
-      </div>
-    </section>
-  `;
+function playerViewModel() {
+  const p = state.player;
+  const fullscreen = isPlayerStageFullscreen();
+  p.fullscreen = fullscreen;
+  const hasVideo = Boolean(p.videoUrl);
+  const folderIndex = currentFolderVideoIndex();
+  return {
+    p,
+    hasVideo,
+    fullscreen,
+    overlay: hasVideo && (fullscreen || p.theater),
+    hasSubtitles: hasRealSubtitleTrack(),
+    videoName: p.displayName || (p.videoPath ? pathBaseName(p.videoPath) : "Chưa chọn video"),
+    srtName: p.srtPath ? pathBaseName(p.srtPath) : "",
+    folderIndex,
+    folderCount: state.folder.videos.length,
+    showFolderPanel: folderIndex >= 0 && !p.theater && !fullscreen,
+    showFolderRail: folderIndex >= 0
+  };
 }
 
 function renderPlayerStudio() {
-  const p = state.player;
-  const hasSubtitles = hasRealSubtitleTrack();
-  const cues = hasSubtitles ? p.cues : [];
-  const subtitleText = hasSubtitles ? activeSubtitleText(p.currentTime) : "";
-  const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
-  const visibleVolume = p.muted ? 0 : p.volume;
-  const fullscreenActive = isDocumentFullscreen();
-  state.player.fullscreen = fullscreenActive;
-  const videoName = p.displayName || (p.videoPath ? pathBaseName(p.videoPath) : "No MP4 selected");
-  const srtName = p.srtPath ? pathBaseName(p.srtPath) : "";
-  const overlayClasses = [
-    "subtitle-overlay",
-    "visubly-subtitle",
-    p.style.background ? "with-bg" : "",
-    p.style.outline ? "with-outline" : ""
+  const m = playerViewModel();
+  const p = m.p;
+  const cues = m.hasSubtitles ? p.cues : [];
+  const layoutClasses = [
+    "player-layout",
+    m.hasSubtitles && !m.showFolderPanel ? "" : "no-transcript",
+    m.showFolderPanel ? "has-folder-panel" : "",
+    p.theater ? "theater" : ""
   ].filter(Boolean).join(" ");
-  const overlayStyle = `--subtitle-font-size:${p.style.fontSize}px;--subtitle-bottom:${p.style.bottom}px`;
 
   return `
     <section class="screen player-screen ${p.theater ? "is-theater" : ""}">
       <div class="top-row">
-        <div>
-          <div class="eyebrow">03 · WATCH</div>
-          <h1 class="h1">Player studio</h1>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
-          ${btn("Choose MP4", "choose-video", "primary", "folder")}
-          ${btn("Load SRT", "choose-srt", "", "captions")}
-          ${btn("VI", "player-vi", state.playerMode === "vi" ? "lime" : "")}
-          ${btn("EN", "player-en", state.playerMode === "en" ? "lime" : "")}
+        <h1 class="h1">Trình phát</h1>
+        <div class="top-actions">
+          ${m.folderIndex >= 0 ? btn("Về thư viện", "back-to-folder-context", "outline", "arrowL") : ""}
+          ${m.folderIndex >= 0 ? `<span class="player-now-playing" title="${escapeAttr(m.videoName)}"><span>Đang phát</span><strong>${escapeHtml(m.videoName)}</strong></span>` : ""}
+          ${btn("Chọn video", "choose-video", "primary", "folder")}
+          ${btn("Nạp phụ đề", "choose-srt", "secondary", "captions")}
         </div>
       </div>
-      <div class="player-layout ${hasSubtitles ? "" : "no-transcript"} ${p.theater ? "theater" : ""}">
+      <div class="${layoutClasses}">
         <div class="player-workbench" data-player-workbench>
-          <div class="player-frame ${p.videoUrl ? "has-video" : ""}" data-player-drop>
-            ${p.videoUrl ? `<video id="mainPlayerVideo" class="main-player-video" src="${escapeAttr(p.videoUrl)}" data-source-token="${p.sourceToken}" playsinline preload="metadata"></video>` : `
-              <div class="player-empty">
-                <span class="play-dot">${icon("play")}</span>
-                <h3 class="h3">Choose an MP4 to preview subtitles</h3>
-                <div class="muted">Drop an MP4 here to play, or drop SRT to load captions.</div>
-              </div>
-            `}
-            ${hasSubtitles && p.subtitleOn ? `<div class="${overlayClasses} ${subtitleText ? "" : "is-empty"}" style="${overlayStyle}"><span class="main-subtitle-text">${escapeHtml(subtitleText)}</span></div>` : ""}
-            <div class="player-drop-hint">
-              <strong>Drop MP4 / SRT</strong>
-              <span>MP4 plays immediately. SRT updates captions.</span>
-            </div>
-          </div>
+          ${renderPlayerStage(m)}
 
-          <div class="player-console">
-            <button class="btn icon" data-action="seek-back" title="Back 5 seconds" ${p.videoUrl ? "" : "disabled"}>${icon("arrowL")}</button>
-            <button class="btn icon primary" data-action="toggle-player" title="${p.playing ? "Pause" : "Play"}" ${p.videoUrl ? "" : "disabled"}>${icon(p.playing ? "minus" : "play")}</button>
-            <button class="btn icon" data-action="seek-forward" title="Forward 5 seconds" ${p.videoUrl ? "" : "disabled"}>${icon("arrowR")}</button>
-            <div class="volume-control">
-              <button class="btn icon ${p.muted ? "danger" : ""}" data-action="toggle-mute" title="${p.muted ? "Unmute" : "Mute"}" aria-pressed="${p.muted ? "true" : "false"}" ${p.videoUrl ? "" : "disabled"}>${icon(p.muted ? "volumeOff" : "volume")}</button>
-              <input class="volume-slider" data-volume-slider type="range" min="0" max="1" step="0.01" value="${visibleVolume}" style="--volume-level:${visibleVolume * 100}%" aria-label="Volume" ${p.videoUrl ? "" : "disabled"}>
-              <span class="volume-value mono">${Math.round(visibleVolume * 100)}%</span>
-            </div>
-            <div class="player-scrubber" data-player-scrubber role="slider" aria-label="Video timeline" aria-valuetext="${formatClock(p.currentTime)} of ${formatClock(p.duration)}">
-              <div class="player-scrubber-fill" data-player-scrubber-fill style="width:${progress}%"></div>
-              <span class="player-scrubber-tooltip mono" data-player-scrubber-tooltip>${formatHoverClock(p.currentTime)}</span>
-            </div>
-            <span class="player-time mono">${formatClock(p.currentTime)} / ${formatClock(p.duration)}</span>
-            <div class="player-view-actions">
-              <button class="btn icon ${p.theater ? "lime" : ""}" data-action="toggle-theater" title="${p.theater ? "Exit theater mode" : "Theater mode"}" aria-label="${p.theater ? "Exit theater mode" : "Theater mode"}" aria-pressed="${p.theater ? "true" : "false"}" ${p.videoUrl ? "" : "disabled"}>${icon("theater")}</button>
-              <button class="btn icon ${fullscreenActive ? "lime" : ""}" data-action="toggle-fullscreen" title="${fullscreenActive ? "Exit fullscreen" : "Fullscreen"}" aria-label="${fullscreenActive ? "Exit fullscreen" : "Fullscreen"}" aria-pressed="${fullscreenActive ? "true" : "false"}" ${p.videoUrl ? "" : "disabled"}>${icon(fullscreenActive ? "fullscreenExit" : "fullscreen")}</button>
-            </div>
-          </div>
+          ${renderPlayerMediaSummary(m.videoName, m.srtName, m.hasSubtitles, m.showFolderPanel)}
 
-          <div class="player-meta-grid ${hasSubtitles ? "" : "single"}">
-            <div class="queue-item">
-              <div class="mono muted">VIDEO</div>
-              <strong>${escapeHtml(videoName)}</strong>
-            </div>
-            ${hasSubtitles ? `<div class="queue-item">
-              <div class="mono muted">SUBTITLE</div>
-              <strong>${escapeHtml(srtName)}</strong>
-            </div>` : ""}
-          </div>
-
-          ${hasSubtitles ? `<div class="player-style-panel">
+          ${m.hasSubtitles ? `<div class="player-style-panel">
             <div>
-              <div class="mono muted">SUBTITLE STYLE</div>
-              <h3 class="h3">Sticker caption</h3>
+              <div class="eyebrow">KIỂU PHỤ ĐỀ</div>
+              <h3 class="h3">Hiển thị phụ đề</h3>
             </div>
             <div class="style-actions">
-              ${btn(p.subtitleOn ? "Sub on" : "Sub off", "subtitle-toggle", p.subtitleOn ? "lime" : "", "captions")}
-              ${btn(p.style.background ? "BG on" : "BG off", "subtitle-bg", p.style.background ? "lime" : "")}
-              ${btn(p.style.outline ? "Outline" : "No outline", "subtitle-outline", p.style.outline ? "lime" : "")}
+              ${btn(p.subtitleOn ? "Phụ đề: bật" : "Phụ đề: tắt", "subtitle-toggle", p.subtitleOn ? "lime" : "", "captions")}
+              ${btn(p.style.background ? "Nền: bật" : "Nền: tắt", "subtitle-bg", p.style.background ? "lime" : "")}
+              ${btn(p.style.outline ? "Viền: bật" : "Viền: tắt", "subtitle-outline", p.style.outline ? "lime" : "")}
               ${btn("A-", "subtitle-size-down", "", "minus")}
               ${btn("A+", "subtitle-size-up", "", "plus")}
-              ${btn("Lower", "subtitle-bottom-down", "")}
-              ${btn("Raise", "subtitle-bottom-up", "")}
+              ${btn("Hạ xuống", "subtitle-bottom-down", "")}
+              ${btn("Nâng lên", "subtitle-bottom-up", "")}
             </div>
           </div>` : ""}
         </div>
-        ${hasSubtitles ? `<aside class="player-transcript">
+        ${m.showFolderPanel ? renderPlayerFolderSidebar(m.folderIndex) : ""}
+        ${m.hasSubtitles && !m.showFolderPanel ? `<aside class="player-transcript">
           <div class="mini-row" style="justify-content:space-between">
-            <h3 class="h3">Transcript</h3>
-            <span class="badge" style="background:var(--mint)">${cues.length} cues</span>
+            <h3 class="h3">Lời thoại</h3>
+            <span class="count-badge">${cues.length} câu</span>
           </div>
           <div class="queue-list">
             ${cues.map((cue, index) => `
-              <button class="subtitle-line transcript-line ${p.currentTime >= cue.start && p.currentTime <= cue.end ? "active" : ""}" data-action="seek-cue" data-time="${cue.start}" data-cue-index="${index}" data-cue-start="${cue.start}" data-cue-end="${cue.end}">
+              <button class="subtitle-line transcript-line ${isCueActive(cue, p.currentTime) ? "active" : ""}" data-action="seek-cue" data-time="${cue.start}" data-cue-index="${index}" data-cue-start="${cue.start}" data-cue-end="${cue.end}">
                 <div class="mono muted">${formatClock(cue.start)} · ${formatClock(cue.end)}</div>
                 <strong>${escapeHtml(cue.text)}</strong>
               </button>
@@ -1127,6 +1192,242 @@ function renderPlayerStudio() {
         </aside>` : ""}
       </div>
     </section>
+  `;
+}
+
+function playerStageClasses(m) {
+  return [
+    "player-stage",
+    m.overlay ? "is-overlay" : "",
+    m.fullscreen ? "is-fullscreen" : "",
+    // Re-renders must not pop the hidden overlay bar back up mid-playback.
+    m.overlay && playerControlsHidden && m.p.playing ? "is-controls-idle" : ""
+  ].filter(Boolean).join(" ");
+}
+
+function playerFrameClasses(m) {
+  return ["player-frame", m.hasVideo ? "has-video" : ""].filter(Boolean).join(" ");
+}
+
+// The stage is the fullscreen target: video frame + overlays + control bar only.
+function renderPlayerStage(m) {
+  return `
+    <div class="${playerStageClasses(m)}" data-player-stage>
+      <div class="${playerFrameClasses(m)}" data-player-drop>
+        ${renderPlayerVideoElement(m)}
+        ${renderPlayerFrameLayer(m)}
+      </div>
+      ${renderPlayerConsole(m)}
+    </div>
+  `;
+}
+
+function renderPlayerVideoElement(m) {
+  const p = m.p;
+  if (!m.hasVideo) {
+    return `
+      <div class="player-empty">
+        <span class="play-dot">${icon("play")}</span>
+        <h3 class="h3">Chọn video để xem</h3>
+        <div class="player-empty-text">Kéo thả file video vào đây để phát, hoặc thả file .srt để nạp phụ đề.</div>
+      </div>
+    `;
+  }
+  if (reuseMainPlayerVideo) return `<span data-main-video-slot hidden></span>`;
+  return `<video id="mainPlayerVideo" class="main-player-video" src="${escapeAttr(p.videoUrl)}" data-source-token="${p.sourceToken}" data-video-url="${escapeAttr(p.videoUrl)}" playsinline preload="metadata"></video>`;
+}
+
+function renderPlayerFrameLayer(m) {
+  const p = m.p;
+  const subtitleText = m.hasSubtitles ? activeSubtitleText(p.currentTime) : "";
+  const overlayClasses = [
+    "subtitle-overlay",
+    "visubly-subtitle",
+    p.style.background ? "with-bg" : "",
+    p.style.outline ? "with-outline" : "",
+    subtitleText ? "" : "is-empty"
+  ].filter(Boolean).join(" ");
+  const overlayStyle = `--subtitle-font-size:${p.style.fontSize}px;--subtitle-bottom:${p.style.bottom}px`;
+  const titleLabel = m.folderIndex >= 0 ? `Đang phát · ${m.folderIndex + 1}/${m.folderCount}` : "Đang phát";
+
+  return `
+    <div class="player-frame-layer" data-player-layer>
+      ${m.hasVideo ? `<div class="player-frame-title" title="${escapeAttr(m.videoName)}"><span>${escapeHtml(titleLabel)}</span><strong>${escapeHtml(m.videoName)}</strong></div>` : ""}
+      ${m.hasSubtitles && p.subtitleOn ? `<div class="${overlayClasses}" style="${overlayStyle}"><span class="main-subtitle-text">${escapeHtml(subtitleText)}</span></div>` : ""}
+      ${m.hasVideo && p.mediaError ? renderPlayerMediaError(m) : ""}
+      ${m.showFolderRail ? renderPlayerFolderRail(m.folderIndex) : ""}
+    </div>
+  `;
+}
+
+function playerControlButton(action, iconName, label, options = {}) {
+  const classes = ["btn", "icon", options.className || ""].filter(Boolean).join(" ");
+  const pressed = typeof options.pressed === "boolean" ? ` aria-pressed="${options.pressed ? "true" : "false"}"` : "";
+  return `<button class="${classes}" type="button" data-action="${action}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}"${pressed} ${options.disabled ? "disabled" : ""}>${icon(iconName)}</button>`;
+}
+
+function renderPlayerConsole(m) {
+  const p = m.p;
+  const noVideo = !m.hasVideo;
+  const visibleVolume = p.muted ? 0 : p.volume;
+  const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
+  const inFolder = m.folderIndex >= 0;
+  const hasPrev = inFolder && m.folderIndex > 0;
+  const hasNext = inFolder && m.folderIndex < m.folderCount - 1;
+  const fullscreenLabel = m.fullscreen ? "Thoát toàn màn hình (F)" : "Toàn màn hình (F)";
+  const theaterLabel = p.theater ? "Thoát chế độ rạp (T)" : "Chế độ rạp (T)";
+
+  return `
+    <div class="player-console" data-player-console role="group" aria-label="Điều khiển trình phát">
+      <div class="player-transport">
+        ${inFolder ? playerControlButton("player-prev", "skipPrev", "Video trước (Shift+P)", { disabled: !hasPrev }) : ""}
+        ${playerControlButton("seek-back", "rewind", "Lùi 5 giây (←)", { disabled: noVideo })}
+        ${playerControlButton("toggle-player", p.playing ? "pause" : "play", p.playing ? "Tạm dừng (Space)" : "Phát (Space)", { disabled: noVideo, className: "primary player-play" })}
+        ${playerControlButton("seek-forward", "forward", "Tới 5 giây (→)", { disabled: noVideo })}
+        ${inFolder ? playerControlButton("player-next", "skipNext", "Video tiếp (Shift+N)", { disabled: !hasNext }) : ""}
+      </div>
+      <div class="volume-control">
+        ${playerControlButton("toggle-mute", p.muted ? "volumeOff" : "volume", p.muted ? "Bật tiếng (M)" : "Tắt tiếng (M)", { disabled: noVideo, pressed: p.muted, className: p.muted ? "danger" : "" })}
+        <input class="volume-slider" data-volume-slider type="range" min="0" max="1" step="0.01" value="${visibleVolume}" style="--volume-level:${visibleVolume * 100}%" aria-label="Âm lượng" aria-valuetext="${Math.round(visibleVolume * 100)}%" ${noVideo ? "disabled" : ""}>
+        <span class="volume-value mono">${Math.round(visibleVolume * 100)}%</span>
+      </div>
+      <div class="player-scrubber" data-player-scrubber role="slider" tabindex="${noVideo ? "-1" : "0"}" aria-label="Tua video" aria-valuemin="0" aria-valuemax="${Math.round(p.duration || 0)}" aria-valuenow="${Math.round(p.currentTime || 0)}" aria-valuetext="${formatClock(p.currentTime)} trên ${formatClock(p.duration)}">
+        <div class="player-scrubber-fill" data-player-scrubber-fill style="width:${progress}%"></div>
+        <span class="player-scrubber-tooltip mono" data-player-scrubber-tooltip>${formatHoverClock(p.currentTime)}</span>
+      </div>
+      <span class="player-time mono">${formatClock(p.currentTime)} / ${formatClock(p.duration)}</span>
+      <div class="player-view-actions">
+        ${m.hasSubtitles ? playerControlButton("subtitle-toggle", "captions", p.subtitleOn ? "Ẩn phụ đề" : "Hiện phụ đề", { pressed: p.subtitleOn, className: p.subtitleOn ? "lime" : "" }) : ""}
+        ${m.fullscreen ? "" : playerControlButton("toggle-theater", "theater", theaterLabel, { disabled: noVideo, pressed: p.theater, className: p.theater ? "lime" : "" })}
+        ${playerControlButton("toggle-fullscreen", m.fullscreen ? "fullscreenExit" : "fullscreen", fullscreenLabel, { disabled: noVideo, pressed: m.fullscreen, className: m.fullscreen ? "lime" : "" })}
+      </div>
+    </div>
+  `;
+}
+
+function renderPlayerMediaError(m) {
+  const error = m.p.mediaError;
+  const canOpenExternally = typeof desktop.openInSystemPlayer === "function";
+  const hasNext = m.folderIndex >= 0 && m.folderIndex < m.folderCount - 1;
+  const isWarning = error.kind === "warning";
+  return `
+    <div class="player-error ${isWarning ? "is-warning" : ""}" role="alert">
+      <div class="player-error-card">
+        <span class="player-error-icon">${icon(isWarning ? "video" : "x")}</span>
+        <strong>${escapeHtml(error.title)}</strong>
+        <p>${escapeHtml(error.detail)}</p>
+        ${error.technical ? `<code class="player-error-tech mono">${escapeHtml(error.technical)}</code>` : ""}
+        <div class="player-error-actions">
+          ${canOpenExternally ? btn("Mở bằng trình phát hệ thống", "open-video-externally", "primary", "play") : ""}
+          ${hasNext ? btn("Video tiếp", "player-next", "secondary", "skipNext") : ""}
+          ${btn("Chọn video khác", "choose-video", canOpenExternally ? "" : "primary", "folder")}
+          ${isWarning ? btn("Bỏ qua", "dismiss-media-error", "ghost", "x") : ""}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPlayerMediaSummary(videoName, srtName, hasSubtitles, compact = false) {
+  const classes = ["player-meta-grid", hasSubtitles ? "" : "single", compact ? "compact" : ""].filter(Boolean).join(" ");
+  const notice = state.player.subtitleNotice;
+  return `
+    <div class="${classes}">
+      <div class="queue-item">
+        <div class="eyebrow">VIDEO</div>
+        <strong title="${escapeAttr(videoName)}">${escapeHtml(videoName)}</strong>
+      </div>
+      ${hasSubtitles ? `<div class="queue-item">
+        <div class="eyebrow">PHỤ ĐỀ</div>
+        <strong title="${escapeAttr(srtName)}">${escapeHtml(srtName)}</strong>
+      </div>` : ""}
+      ${notice ? `<div class="player-notice" role="status">${escapeHtml(notice)}</div>` : ""}
+    </div>
+  `;
+}
+
+function renderPlayerFolderRail(activeIndex = currentFolderVideoIndex()) {
+  if (activeIndex < 0 || !state.folder.videos.length) return "";
+  const activeVideo = state.folder.videos[activeIndex];
+
+  return `
+    <aside class="player-folder-rail" data-player-folder-rail>
+      <div class="player-folder-tab" aria-hidden="true">
+        ${icon("folder")}
+        <span>${state.folder.videos.length}</span>
+      </div>
+      <div class="player-folder-panel">
+        <div class="player-folder-head">
+          <div>
+            <div class="eyebrow">DANH SÁCH PHÁT</div>
+            <strong>${escapeHtml(groupLabel(activeVideo?.groupName))}</strong>
+          </div>
+          ${btn("Thư viện", "back-to-folder-context", "ghost", "arrowL")}
+        </div>
+        <div class="player-folder-list" data-player-folder-list="rail">
+          ${renderPlayerFolderListItems(activeIndex)}
+        </div>
+      </div>
+    </aside>
+  `;
+}
+
+function renderPlayerFolderSidebar(activeIndex = currentFolderVideoIndex()) {
+  if (activeIndex < 0 || !state.folder.videos.length) return "";
+  const activeVideo = state.folder.videos[activeIndex];
+  return `
+    <aside class="player-folder-sidebar">
+      <div class="player-folder-head">
+        <div>
+          <div class="eyebrow">DANH SÁCH PHÁT</div>
+          <strong title="${escapeAttr(groupLabel(activeVideo?.groupName))}">${escapeHtml(groupLabel(activeVideo?.groupName))}</strong>
+        </div>
+        <span class="count-badge">${state.folder.videos.length}</span>
+      </div>
+      <div class="player-folder-list" data-player-folder-list="sidebar">
+        ${renderPlayerFolderListItems(activeIndex)}
+      </div>
+    </aside>
+  `;
+}
+
+function renderPlayerFolderListItems(activeIndex = currentFolderVideoIndex()) {
+  let currentFolder = null;
+  let currentGroup = null;
+  let html = "";
+
+  state.folder.videos.forEach((video, index) => {
+    const folderName = video.folderName || video.folder || "Thư mục này";
+    const groupName = video.groupName || "Other";
+    if (folderName !== currentFolder) {
+      currentFolder = folderName;
+      currentGroup = null;
+      html += `<div class="player-folder-section">${escapeHtml(folderName)}</div>`;
+    }
+    if (groupName !== currentGroup) {
+      currentGroup = groupName;
+      html += `<div class="player-folder-group">${escapeHtml(groupLabel(groupName))}</div>`;
+    }
+
+    html += renderPlayerFolderItem(video, index, index === activeIndex);
+  });
+
+  return html;
+}
+
+function renderPlayerFolderItem(video, index, isActive) {
+  const title = video.name || pathBaseName(video.path);
+  const resolution = video.resolutionLabel || inferResolutionFromName(title) || "";
+  const subLabel = hasFolderVideoSubtitle(video) ? "có phụ đề" : "chưa có phụ đề";
+  const meta = [resolution, subLabel].filter(Boolean).join(" · ");
+  return `
+    <button class="player-folder-item ${isActive ? "active" : ""}" data-action="open-folder-video" data-video-index="${index}" data-player-folder-item="${index}" title="${escapeAttr(video.relativePath || title)}">
+      <span class="player-folder-play">${isActive ? icon("play") : index + 1}</span>
+      <span class="player-folder-text">
+        <strong>${escapeHtml(title)}</strong>
+        <span>${escapeHtml(meta)}</span>
+      </span>
+    </button>
   `;
 }
 
@@ -1140,32 +1441,30 @@ function renderFolderPlayer() {
   const hiddenCount = Math.max(0, f.videos.length - visibleVideos.length);
   const selectedPath = state.player.videoPath;
   const status = hasFolder
-    ? `${f.videos.length} videos${f.truncated ? " · capped at 1000" : ""}${f.skippedFolders ? ` · ${f.skippedFolders} folders skipped` : ""}`
-    : "Choose a folder to scan";
+    ? `${f.videos.length} video${f.truncated ? " · tối đa 1000" : ""}${f.skippedFolders ? ` · bỏ qua ${f.skippedFolders} thư mục` : ""}`
+    : "Chọn thư mục để quét";
 
   let groupedHtml = "";
   if (hasVideos && renderReady) {
     let currentFolder = null;
-    let currentPrefix = null;
+    let currentGroup = null;
     
     visibleVideos.forEach((video, index) => {
       let isNewFolder = video.folderName !== currentFolder;
-      let isNewPrefix = isNewFolder || video.prefixName !== currentPrefix;
+      let isNewGroup = isNewFolder || video.groupName !== currentGroup;
       
-      if (isNewFolder || isNewPrefix) {
+      if (isNewFolder || isNewGroup) {
         if (index > 0) groupedHtml += `</div>`;
         
         if (isNewFolder) {
-          groupedHtml += `<h2 class="folder-group-title" style="margin: 24px 0 12px; font-size: 18px; border-bottom: var(--line); padding-bottom: 8px;">${escapeHtml(video.folderName)}</h2>`;
+          groupedHtml += `<h2 class="folder-group-title">${escapeHtml(video.folderName)}</h2>`;
           currentFolder = video.folderName;
-          currentPrefix = null;
+          currentGroup = null;
         }
         
-        if (video.prefixName && (isNewFolder || video.prefixName !== currentPrefix)) {
-          groupedHtml += `<h3 class="folder-prefix-title" style="margin: 16px 0 12px; font-size: 14px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.5px;">${escapeHtml(video.prefixName)}</h3>`;
-          currentPrefix = video.prefixName;
-        } else if (!video.prefixName && isNewPrefix && currentPrefix !== null) {
-          currentPrefix = null;
+        if (video.groupName && (isNewFolder || video.groupName !== currentGroup)) {
+          groupedHtml += `<h3 class="folder-prefix-title">${escapeHtml(groupLabel(video.groupName))}</h3>`;
+          currentGroup = video.groupName;
         }
         
         groupedHtml += `<div class="folder-grid">`;
@@ -1182,68 +1481,68 @@ function renderFolderPlayer() {
   return `
     <section class="screen folder-screen">
       <div class="top-row folder-top-row">
-        <div>
-          <div class="eyebrow">Folder Player</div>
-          <h1 class="h1">Watch by folder</h1>
+        <div class="page-titles">
+          <h1 class="h1">Thư viện</h1>
+          <p class="page-sub">Xem video theo thư mục trên máy, tự nạp phụ đề .srt cùng tên.</p>
         </div>
         <div class="folder-actions">
-          ${hasFolder ? btn("Rescan", "rescan-video-folder", "", "search", f.scanning ? "disabled" : "") : ""}
-          ${btn(hasFolder ? "Choose other" : "Choose Folder", "choose-video-folder", "primary", "folder", f.scanning ? "disabled" : "")}
-          ${hasFolder ? btn("Clear", "clear-video-folder", "ghost", "x", f.scanning ? "disabled" : "") : ""}
+          ${hasFolder ? btn("Quét lại", "rescan-video-folder", "outline", "search", f.scanning ? "disabled" : "") : ""}
+          ${btn(hasFolder ? "Chọn thư mục khác" : "Chọn thư mục", "choose-video-folder", "primary", "folder", f.scanning ? "disabled" : "")}
+          ${hasFolder ? btn("Đóng thư mục", "clear-video-folder", "ghost", "x", f.scanning ? "disabled" : "") : ""}
         </div>
       </div>
 
-      ${f.error ? `<div class="note danger-note folder-note"><strong>Folder scan failed.</strong><br>${escapeHtml(f.error)}</div>` : ""}
+      ${f.error ? `<div class="note is-danger folder-note"><strong>Không quét được thư mục.</strong><br>${escapeHtml(f.error)}</div>` : ""}
 
       ${!hasFolder && !f.scanning ? `
         <div class="folder-empty empty">
           <span class="play-dot">${icon("folder")}</span>
-          <h3 class="h3">Choose a folder</h3>
-          <div class="muted">Visubly will scan video files and keep this tab on that folder until you close the app, clear it, or choose another folder.</div>
-          <div style="margin-top:16px">${btn("Choose Folder", "choose-video-folder", "primary", "folder")}</div>
+          <h3 class="h3">Chọn một thư mục</h3>
+          <div class="muted">ViSUBLY sẽ quét các file video trong thư mục và giữ danh sách này cho tới khi bạn đóng app, đóng thư mục hoặc chọn thư mục khác.</div>
+          <div class="empty-actions">${btn("Chọn thư mục", "choose-video-folder", "primary", "folder")}</div>
         </div>
       ` : ""}
 
       ${f.scanning ? `
         <div class="folder-empty empty">
           <span class="play-dot">${icon("search")}</span>
-          <h3 class="h3">Scanning folder</h3>
-          <div class="muted">${escapeHtml(f.path || "Waiting for folder selection...")}</div>
+          <h3 class="h3">Đang quét thư mục</h3>
+          <div class="muted">${escapeHtml(f.path || "Đang chờ chọn thư mục…")}</div>
         </div>
       ` : ""}
 
       ${hasFolder && !f.scanning ? `
         <div class="folder-summary">
           <div>
-            <div class="mono muted">CURRENT FOLDER</div>
+            <div class="eyebrow">THƯ MỤC ĐANG XEM</div>
             <strong title="${escapeAttr(f.path)}">${escapeHtml(f.name || f.path)}</strong>
             <div class="mono muted folder-path">${escapeHtml(f.path)}</div>
           </div>
           <div class="folder-summary-stats">
-            <span class="badge" style="background:var(--lime)">${escapeHtml(status)}</span>
-            ${f.scannedAt ? `<span class="badge" style="background:var(--paper)">Scanned ${escapeHtml(formatShortDate(f.scannedAt))}</span>` : ""}
+            <span class="count-badge">${escapeHtml(status)}</span>
+            ${f.scannedAt ? `<span class="soft-badge">Quét ${escapeHtml(formatShortDate(f.scannedAt))}</span>` : ""}
           </div>
         </div>
 
         ${hasVideos && !renderReady ? `
           <div class="folder-empty empty compact">
             <span class="play-dot">${icon("folder")}</span>
-            <h3 class="h3">Opening folder</h3>
-            <div class="muted">Preparing the grid without interrupting video playback cleanup.</div>
+            <h3 class="h3">Đang mở thư mục</h3>
+            <div class="muted">Đang chuẩn bị danh sách video…</div>
           </div>
         ` : hasVideos ? `
           ${groupedHtml}
           ${hiddenCount ? `
             <div class="folder-load-more">
-              ${btn(`Show ${Math.min(folderPageSize, hiddenCount)} more`, "load-more-folder-videos", "", "plus")}
-              <span class="mono muted">${visibleVideos.length} of ${f.videos.length} rendered</span>
+              ${btn(`Hiện thêm ${Math.min(folderPageSize, hiddenCount)}`, "load-more-folder-videos", "secondary", "plus")}
+              <span class="mono muted">Đang hiện ${visibleVideos.length}/${f.videos.length}</span>
             </div>
           ` : ""}
         ` : `
           <div class="folder-empty empty">
             <span class="play-dot">${icon("video")}</span>
-            <h3 class="h3">No videos found</h3>
-            <div class="muted">Try another folder or add MP4, MOV, MKV, WEBM, AVI, WMV, or TS files here.</div>
+            <h3 class="h3">Không có video nào</h3>
+            <div class="muted">Thử thư mục khác, hoặc thêm file MP4, MOV, MKV, WEBM, AVI, WMV hay TS vào đây.</div>
           </div>
         `}
       ` : ""}
@@ -1252,16 +1551,16 @@ function renderFolderPlayer() {
 }
 
 function renderFolderVideoCard(video, selectedPath, index) {
-  const folder = video.folder ? video.folder : "This folder";
+  const folder = video.folder ? video.folder : "Thư mục này";
   const isActive = selectedPath && selectedPath === video.path;
   const title = video.name || pathBaseName(video.path);
   const meta = [folder, formatBytes(video.size), video.modifiedAt ? formatShortDate(video.modifiedAt) : ""].filter(Boolean).join(" · ");
-  const resolution = video.resolutionLabel || inferResolutionFromName(title) || "Checking";
+  const resolution = video.resolutionLabel || inferResolutionFromName(title) || "Đang đọc";
   const isSubbed = hasFolderVideoSubtitle(video);
-  const subLabel = video.subtitlePath || video.subtitleName ? "Sub file" : isSubbed ? "-vs sub" : "No sub";
+  const subLabel = video.subtitlePath || video.subtitleName ? "Có file phụ đề" : isSubbed ? "Phụ đề sẵn" : "Chưa có phụ đề";
 
   return `
-    <button class="folder-video-card ${isActive ? "active" : ""}" data-action="open-folder-video" data-video-index="${index}" data-video-path="${escapeAttr(video.path)}" title="${escapeAttr(video.relativePath || title)}">
+    <button class="folder-video-card ${isActive ? "active" : ""}" data-action="open-folder-video" data-video-index="${index}" data-folder-video-index="${index}" data-video-path="${escapeAttr(video.path)}" title="${escapeAttr(video.relativePath || title)}">
       <div class="folder-thumb">
         <video class="folder-thumb-video" data-src="${escapeAttr(video.url || localPathToFileUrl(video.path))}" data-video-index="${index}" muted playsinline preload="none" data-folder-thumb></video>
         <span class="folder-play">${icon("play")}</span>
@@ -1279,162 +1578,83 @@ function renderFolderVideoCard(video, selectedPath, index) {
   `;
 }
 
-function renderLibrary() {
-  return `
-    <section class="screen">
-      <div class="top-row">
-        <div><div class="eyebrow">Library</div><h1 class="h1">My videos</h1></div>
-        ${btn("Import video", "choose-video", "primary", "folder")}
-      </div>
-      <div class="grid-3">
-        ${recent("Inside No.9 · S08E04", "subtitles approved", "Done", "var(--lime)", "player")}
-        ${recent("Le Mans 24h Highlight", "downloaded · needs subtitles", "Ready", "var(--mint)", "subtitle")}
-        ${recent("Conan_OVA_2024.mkv", "download queue", "Queued", "var(--paper)", "download")}
-      </div>
-    </section>
-  `;
-}
 
-function renderSettings() {
-  return `
-    <section class="screen">
-      <div class="top-row">
-        <div><div class="eyebrow">Settings</div><h1 class="h1">Integration hooks</h1></div>
-      </div>
-      <div class="grid-2">
-        <div class="form-panel">
-          <h2 class="h2">Download engine</h2>
-          <p class="muted">Wire your tested cURL parser and downloader through the preload bridge.</p>
-          <div class="field"><label>Adapter status</label><input class="input" value="stub · ready for integration" readonly></div>
-        </div>
-        <div class="form-panel">
-          <h2 class="h2">Subtitle engine</h2>
-          <p class="muted">Connect Opus, Sonnet, Whisper, and ChatGPT orchestration behind the same UI contract.</p>
-          <div class="field"><label>Adapter status</label><input class="input" value="stub · dummy pipeline active" readonly></div>
-        </div>
-      </div>
-    </section>
-  `;
-}
-
-function renderIntro() {
-  return `
-    <div class="intro" data-action="dismiss-intro">
-      <div class="float-blob blob-a">vi-VN ✓</div>
-      <div class="float-blob blob-b">1080p · 4K</div>
-      <div class="float-blob blob-c">+12 phrases learned</div>
-      <div class="float-blob blob-d">cURL → mp4</div>
-      <div class="intro-card">
-        <div class="intro-logo">
-          <span class="intro-tile vi">Vi${starSvg("intro-star")}</span>
-          <span class="intro-tile">S</span>
-          <span class="intro-tile">U</span>
-          <span class="intro-tile">B</span>
-          <span class="intro-tile">L</span>
-          <span class="intro-tile">Y</span>
-        </div>
-        <h1 class="intro-tagline">Grab. <em>Sub.</em> Watch.</h1>
-        <p class="intro-subtag">Vietnamese subtitle and video studio</p>
-        <div class="intro-features">
-          <span>${icon("download")} grab videos</span>
-          <span>${icon("sub")} vi subtitles</span>
-          <span>${icon("brain")} local learning</span>
-        </div>
-        <div class="tap-start"><span></span>TAP ANYWHERE TO START</div>
-      </div>
-    </div>
-  `;
-}
-
-function screenHeader(eyebrow, title, meta, backScreen) {
-  return `
-    <header class="screen-header">
-      <div class="mini-row">
-        ${btn("Back", `back-to-${backScreen}`, "", "arrowL")}
-        <div>
-          <div class="eyebrow">${eyebrow}</div>
-          <h2 class="h2">${title}</h2>
-        </div>
-      </div>
-      <span class="mono muted">${meta}</span>
-    </header>
-  `;
-}
-
-function attachDynamicHandlers() {
-  const drop = document.getElementById("dropZone");
-  if (drop) {
-    drop.addEventListener("dragover", (event) => {
-      event.preventDefault();
-      drop.classList.add("dragging");
-    });
-    drop.addEventListener("dragleave", () => drop.classList.remove("dragging"));
-    drop.addEventListener("drop", async (event) => {
-      event.preventDefault();
-      drop.classList.remove("dragging");
-      const file = event.dataTransfer.files?.[0];
-      if (file) {
-        await loadVideoPath(file.path || file.name);
-        render();
-      }
-    });
-  }
-  attachPlayerDropTarget();
+function attachDynamicHandlers(options = {}) {
+  attachPlayerStage();
   attachMainPlayer();
-  attachPlayerControlActivity();
-  attachMiniPlayers();
-  if (state.screen === "folder") scheduleFolderThumbs();
-  else cancelFolderThumbs();
+  attachPlayerFolderRail(options.folderListMemory || null);
+  syncPlayerControlsVisibility();
+  if (state.screen === "folder") {
+    scheduleFolderThumbs();
+    scrollPendingFolderVideoIntoView();
+  } else {
+    cancelFolderThumbs();
+  }
+  focusCaptureDialog();
+  if (state.screen === "settings" && state.pairing.code) startPairingTicker();
 }
 
-function scheduleFolderThumbs() {
-  cancelFolderThumbs();
-  const sincePlayer = Date.now() - Number(state.player.lastSuspendedAt || 0);
-  const delay = sincePlayer < 700 ? 360 : 120;
-  folderThumbTimer = window.setTimeout(() => {
-    folderThumbTimer = null;
-    attachFolderThumbs();
-  }, delay);
+// New capture on screen: move focus into the dialog (name field) once.
+function focusCaptureDialog() {
+  const capture = state.capture.queue[0];
+  if (!capture) {
+    dialogFocusedFor = "";
+    return;
+  }
+  if (dialogFocusedFor === capture.captureId) return;
+  dialogFocusedFor = capture.captureId;
+  const input = document.getElementById("capName");
+  if (input) {
+    input.focus({ preventScroll: true });
+    input.select();
+  }
 }
 
-function cancelFolderThumbs() {
-  if (folderThumbTimer) window.clearTimeout(folderThumbTimer);
-  folderThumbTimer = null;
-  folderThumbQueue = [];
-  folderThumbActive = 0;
-}
-
-function attachPlayerDropTarget() {
-  const playerDrop = document.querySelector("[data-player-drop]");
-  if (!playerDrop) return;
-
-  playerDrop.addEventListener("dragover", (event) => {
+function trapDialogFocus(dialog, event) {
+  const focusables = [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')]
+    .filter((element) => element.offsetParent !== null);
+  if (!focusables.length) {
     event.preventDefault();
-    playerDrop.classList.add("dragging");
-  });
-  playerDrop.addEventListener("dragleave", (event) => {
-    if (!playerDrop.contains(event.relatedTarget)) playerDrop.classList.remove("dragging");
-  });
-  playerDrop.addEventListener("drop", async (event) => {
+    return;
+  }
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement;
+  if (!dialog.contains(active)) {
     event.preventDefault();
-    playerDrop.classList.remove("dragging");
-    const file = event.dataTransfer.files?.[0];
-    if (!file) return;
-
-    const filePath = file.path || file.name;
-    if (isSubtitlePath(filePath)) {
-      await loadSubtitlePath(filePath);
-      render();
-      return;
-    }
-
-    if (isVideoPath(filePath)) {
-      await loadVideoPath(filePath);
-      state.player.playing = true;
-      render();
-    }
-  });
+    first.focus();
+  } else if (event.shiftKey && active === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
+
+function closeTopDialog() {
+  if (state.capture.queue.length) return skipCurrentCapture();
+  if (state.remote.pairingActive || state.remote.qrUrl || state.remote.loading) return closeRemoteModal();
+  return undefined;
+}
+
+function closeRemoteModal() {
+  // Closing the approval dialog (Esc / ×) means "Từ chối".
+  if (state.remote.pairingActive && state.remote.pairingRequestId) return respondRemotePairing(false);
+  state.remote.qrUrl = null;
+  state.remote.testUrl = null;
+  state.remote.loading = false;
+  state.remote.pairingActive = false;
+  state.remote.pairingPin = null;
+  render();
+}
+
+document.addEventListener("submit", (event) => {
+  const form = event.target.closest?.("[data-paste-form]");
+  if (!form) return;
+  event.preventDefault();
+  submitPaste(form.dataset.pasteForm);
+});
 
 document.addEventListener("click", async (event) => {
   const nav = event.target.closest("[data-screen]");
@@ -1444,180 +1664,131 @@ document.addEventListener("click", async (event) => {
   }
 
   const actionEl = event.target.closest("[data-action]");
-  if (!actionEl) return;
+  if (!actionEl || actionEl.disabled) return;
   const action = actionEl.dataset.action;
+  const id = actionEl.dataset.id || "";
+  // A mouse click must not leave focus on a player control, otherwise Space would
+  // re-activate that button instead of toggling playback. Keyboard clicks keep focus.
+  if (event.detail > 0 && actionEl.closest("[data-player-stage]")) actionEl.blur();
 
   if (action === "minimize") return desktop.minimize();
   if (action === "maximize") return desktop.toggleMaximize();
   if (action === "close") return desktop.close();
-  if (action === "dismiss-intro") {
-    state.intro = false;
-    render();
-    return;
-  }
-  if (action.startsWith("back-to-")) return setScreen(action.replace("back-to-", ""));
-  if (action === "go-home") return setScreen("home");
-  if (action === "noop") return;
+  if (action === "dismiss-intro") return dismissIntro();
 
-  if (action === "start-remote") {
-    state.remote.loading = true;
-    render();
-    desktop.airplay.start().then(info => {
-      state.remote.qrUrl = info.qrUrl;
-      state.remote.testUrl = `${info.baseUrl}/?token=${info.pairingToken}`;
-      state.remote.loading = false;
-      render();
-    }).catch(err => {
-      console.error(err);
-      state.remote.loading = false;
-      render();
-    });
-    return;
-  }
+  if (action === "start-remote") return startRemote();
   if (action === "copy-remote-link") {
-    if (state.remote.testUrl) {
-      navigator.clipboard.writeText(state.remote.testUrl);
-      const b = e.target.closest("button");
-      if (b) {
-        const old = b.innerHTML;
-        b.innerHTML = "Đã Copy!";
-        setTimeout(() => b.innerHTML = old, 1500);
-      }
+    if (!state.remote.testUrl) return undefined;
+    try {
+      await navigator.clipboard.writeText(state.remote.testUrl);
+      showToast("Đã sao chép link Remote");
+    } catch {
+      showToast("Không sao chép được link");
     }
-    return;
+    return undefined;
+  }
+  if (action === "close-remote") return closeRemoteModal();
+  if (action === "remote-allow") return respondRemotePairing(true);
+  if (action === "remote-deny") return respondRemotePairing(false);
+  if (action === "toggle-remote-autostart") return updateSettings({ remoteAutoStart: !(state.settings?.remoteAutoStart !== false) });
+  if (action === "remote-revoke") {
+    await desktop.airplay?.revokeDevice?.(id);
+    showToast("Đã gỡ thiết bị");
+    return refreshRemoteState();
+  }
+  if (action === "remote-revoke-all") {
+    if (!window.confirm("Gỡ tất cả thiết bị đã ghép nối? Các điện thoại sẽ phải kết nối lại.")) return undefined;
+    await desktop.airplay?.revokeAllDevices?.();
+    showToast("Đã gỡ tất cả thiết bị");
+    return refreshRemoteState();
   }
 
-  if (action === "close-remote") {
-    state.remote.qrUrl = null;
-    state.remote.testUrl = null;
-    state.remote.loading = false;
-    state.remote.pairingActive = false;
-    state.remote.pairingPin = null;
-    return render();
-  }
-
-  if (action === "use-sample-curl") {
-    state.download.curl = sampleCurl;
-    return render();
-  }
-  if (action === "download-next") {
-    if (state.download.step === 0 && !state.download.curl.trim()) state.download.curl = sampleCurl;
-    if (state.download.step === 1 && !state.download.name.trim()) state.download.name = suggestNameFromCurl(state.download.curl);
-    
-    if (state.download.step === 1) {
-      if (state.download.loadingQualities) return;
-      state.download.loadingQualities = true;
-      state.download.qualityError = "";
-      render();
-      
-      desktop.download.prepareItem({
-        source: state.download.curl,
-        name: state.download.name,
-        type: "m3u8",
-        noPreflight: true
-      }).then(res => {
-        const item = res.item || res;
-        state.download.preparedItem = item;
-        let variants = item.variants || [];
-        
-        if (variants.length > 0) {
-          state.download.dynamicQualities = variants.map(v => {
-            let resParts = (v.resolution || "").split("x");
-            let height = parseInt(resParts[1] || resParts[0]) || 0;
-            return {
-              id: v.resolution || String(height),
-              label: height ? `${height}p` : "Unknown",
-              note: `Res: ${v.resolution || "N/A"}` + (v.bandwidth ? ` · ${Math.round(v.bandwidth/1024)} kbps` : ""),
-              height: height
-            };
-          }).sort((a, b) => b.height - a.height);
-          
-          let exact1080 = state.download.dynamicQualities.find(q => q.height === 1080 || q.id === "1080");
-          let bestQuality = state.download.dynamicQualities[0];
-          
-          state.download.quality = exact1080 ? exact1080.id : (bestQuality ? bestQuality.id : "1080");
-          state.download.maxHeight = bestQuality ? bestQuality.height : 0;
-        } else {
-          state.download.dynamicQualities = qualities;
-          state.download.quality = "1080";
-          state.download.maxHeight = 1080;
-        }
-        
-        state.download.step = 2;
-        state.download.loadingQualities = false;
-        render();
-      }).catch(err => {
-        state.download.qualityError = err.message;
-        state.download.loadingQualities = false;
-        render();
-      });
-      return;
-    }
-
-    state.download.step = Math.min(3, state.download.step + 1);
-    return render();
-  }
-  if (action === "download-back") {
-    state.download.step = Math.max(0, state.download.step - 1);
-    return render();
-  }
-  if (action === "download-cancel-record") {
-    state.download.curl = "";
-    state.download.name = "";
-    state.download.quality = "1080";
-    state.download.step = 0;
-    state.download.dynamicQualities = null;
-    state.download.maxHeight = 0;
-    state.download.preparedItem = null;
-    return render();
-  }
+  // Capture dialog
+  if (action === "capture-skip") return skipCurrentCapture();
+  if (action === "capture-queue") return confirmCurrentCapture(false);
+  if (action === "capture-now") return confirmCurrentCapture(true);
   if (action === "pick-quality") {
-    state.download.quality = actionEl.dataset.quality;
+    state.capture.quality = actionEl.dataset.value || "";
     return render();
   }
-  if (action === "add-download-item") {
-    await addDownloadItem();
-    return;
-  }
-  if (action === "remove-download") {
-    const id = actionEl.dataset.id || state.download.items[Number(actionEl.dataset.index)]?.id;
-    if (id) await desktop.download.removeItem(id);
-    else state.download.items.splice(Number(actionEl.dataset.index), 1);
+  if (action === "change-download-dir") return changeDownloadDir();
+
+  // Downloads
+  if (action === "filter-downloads") {
+    state.download.filter = actionEl.dataset.value || "all";
     return render();
   }
-  if (action === "start-downloads") {
-    await desktop.download.startQueue({ parallelItems: state.download.parallelItems });
-    state.download.phase = "running";
-    await refreshDownloadState();
-    render();
-    return;
-  }
-  if (action === "edit-batch") {
-    state.download.phase = "input";
+  if (action === "start-queue") {
+    const result = await desktop.download.startQueue();
+    applyDownloadResult(result);
     return render();
   }
-  if (action === "select-download-log") {
-    state.download.terminalItemId = actionEl.dataset.id || "";
+  if (action === "open-download-dir") {
+    const result = await desktop.download.openDownloadDir();
+    if (result?.ok === false) showToast(result.error || "Không mở được thư mục tải xuống");
+    return undefined;
+  }
+  if (action === "clear-finished-downloads") {
+    state.download.actionError = "";
+    const result = await desktop.download.clearCompleted();
+    applyDownloadResult(result);
     return render();
   }
   if (action === "cancel-download") {
-    await desktop.download.cancelItem(actionEl.dataset.id);
-    return refreshDownloadState();
+    const result = await desktop.download.cancelItem(id);
+    applyDownloadResult(result);
+    return render();
   }
   if (action === "retry-download") {
-    await desktop.download.retryItem(actionEl.dataset.id);
-    state.download.phase = "running";
-    return refreshDownloadState();
+    if (state.download.expandedLogId === id) state.download.expandedLogId = "";
+    const result = await desktop.download.retryItem(id);
+    applyDownloadResult(result);
+    return render();
   }
-  if (action === "subtitle-downloaded") {
-    const item = state.download.items[Number(actionEl.dataset.index)];
-    await loadVideoPath(item.output || `D:\\Downloads\\${item.name}.mp4`, { displayName: item.name });
-    return setScreen("subtitle");
+  if (action === "remove-download") {
+    const result = await desktop.download.removeItem(id);
+    applyDownloadResult(result);
+    return render();
   }
+  if (action === "toggle-download-log") {
+    state.download.expandedLogId = state.download.expandedLogId === id ? "" : id;
+    return render();
+  }
+  if (action === "reveal-download-output") {
+    const result = await desktop.download.revealOutput(id);
+    if (result?.ok === false) showToast("Không tìm thấy file. Có thể nó đã bị chuyển hoặc xóa.");
+    return undefined;
+  }
+  if (action === "play-download") return playDownloadedItem(id);
+  if (action === "open-recent") return openRecent(actionEl.dataset.path || "");
 
+  // Settings
+  if (action === "set-theme") return setThemeMode(actionEl.dataset.value);
+  if (action === "set-parallel") return updateSettings({ maxParallelDownloads: Number(actionEl.dataset.value) });
+  if (action === "set-short-videos") return updateSettings({ ignoreShortVideosSec: Number(actionEl.dataset.value) });
+  if (action === "toggle-notify") return updateSettings({ notifyOnComplete: !(state.settings?.notifyOnComplete !== false) });
+  if (action === "new-pairing-code") return ensurePairingCode(true);
+  if (action === "open-extension-folder") {
+    const result = await desktop.app.openExtensionFolder();
+    state.pairing.notice = result?.ok
+      ? `Đã mở thư mục extension: ${result.path}`
+      : `Không mở được thư mục extension${result?.path ? ` (${result.path})` : ""}.`;
+    return render();
+  }
+  if (action === "ask-revoke") {
+    state.pairing.confirmRevoke = true;
+    return render();
+  }
+  if (action === "cancel-revoke") {
+    state.pairing.confirmRevoke = false;
+    return render();
+  }
+  if (action === "confirm-revoke") return revokeAllPairings();
+
+  // Library + player
   if (action === "choose-video") {
     const picked = await desktop.selectVideo();
-    if (picked) await loadVideoPath(picked);
+    if (picked) await loadVideoPath(picked, { folderContext: null });
     return render();
   }
   if (action === "choose-srt") {
@@ -1639,67 +1810,27 @@ document.addEventListener("click", async (event) => {
     return render();
   }
   if (action === "open-folder-video") {
-    const video = state.folder.videos[Number(actionEl.dataset.videoIndex)];
-    const videoPath = video?.path || actionEl.dataset.videoPath;
-    if (!videoPath) return;
-    await loadVideoPath(videoPath, { displayName: video?.name || "", subtitlePath: video?.subtitlePath || "" });
-    state.player.playing = true;
-    return setScreen("player");
+    return openFolderVideo(Number(actionEl.dataset.videoIndex), actionEl.dataset.videoPath || "");
   }
-  if (action === "add-cast") {
-    const name = state.subtitle.castDraft.trim();
-    if (name) state.subtitle.cast.push(name);
-    state.subtitle.castDraft = "";
+  if (action === "player-prev") return stepFolderVideo(-1);
+  if (action === "player-next") return stepFolderVideo(1);
+  if (action === "dismiss-media-error") {
+    state.player.mediaError = null;
     return render();
   }
-  if (action === "remove-cast") {
-    state.subtitle.cast.splice(Number(actionEl.dataset.index), 1);
-    return render();
-  }
-  if (action === "start-processing") {
-    await desktop.integrations.generateSubtitle({
-      videoPath: state.subtitle.videoPath,
-      movieTitle: state.subtitle.movieTitle,
-      cast: state.subtitle.cast
-    });
-    startProcessingSimulation();
-    return;
-  }
-  if (action === "go-approve") {
-    state.screen = "approve";
-    state.approvals.cursor = 0;
-    return render();
-  }
-  if (action === "choose-approval") return chooseApproval(actionEl.dataset.pick);
-  if (action === "choose-custom") return chooseApproval("custom");
-  if (action === "approval-back") {
-    state.approvals.cursor = Math.max(0, state.approvals.cursor - 1);
-    state.approvals.customText = "";
-    return render();
-  }
-  if (action === "approval-next") {
-    if (state.approvals.decisions[state.approvals.cursor + 1]) state.approvals.cursor += 1;
-    state.approvals.customText = "";
-    return render();
-  }
-  if (action === "jump-approval") {
-    const index = Number(actionEl.dataset.index);
-    if (index <= state.approvals.cursor || state.approvals.decisions[index]) {
-      state.approvals.cursor = index;
-      state.approvals.customText = "";
-      render();
+  if (action === "open-video-externally") return openVideoExternally();
+  if (action === "back-to-folder-context") {
+    const index = currentFolderVideoIndex();
+    if (index >= 0) {
+      state.folder.visibleLimit = Math.max(Number(state.folder.visibleLimit || folderPageSize), index + 1);
+      state.folder.pendingScrollPath = state.player.videoPath;
     }
-    return;
+    return setScreen("folder");
   }
-  if (action === "review-decisions") {
-    state.approvals.cursor = 0;
-    return render();
-  }
-  if (action === "open-player") return setScreen("player");
   if (action === "toggle-player") return toggleMainPlayer();
   if (action === "toggle-mute") return toggleMainMute();
-  if (action === "seek-back") return seekMainPlayer(state.player.currentTime - 5);
-  if (action === "seek-forward") return seekMainPlayer(state.player.currentTime + 5);
+  if (action === "seek-back") return seekMainPlayerBy(-5);
+  if (action === "seek-forward") return seekMainPlayerBy(5);
   if (action === "toggle-theater") return toggleTheaterMode();
   if (action === "toggle-fullscreen") return togglePlayerFullscreen();
   if (action === "subtitle-toggle") {
@@ -1731,93 +1862,318 @@ document.addEventListener("click", async (event) => {
     return render();
   }
   if (action === "seek-cue") return seekMainPlayer(Number(actionEl.dataset.time || 0));
-  if (action === "player-vi") {
-    state.playerMode = "vi";
-    return render();
-  }
-  if (action === "player-en") {
-    state.playerMode = "en";
-    return render();
-  }
+  return undefined;
 });
 
 document.addEventListener("input", (event) => {
-  const target = event.target;
-  const bind = target.dataset.bind;
+  const bind = event.target.dataset?.bind;
   if (!bind) return;
-  const value = target.value;
-  if (bind === "download.curl") state.download.curl = value;
-  if (bind === "download.name") state.download.name = value;
-  if (bind === "subtitle.movieTitle") {
-    state.subtitle.movieTitle = value;
-    state.subtitle.movieEdited = true;
+  const value = event.target.value;
+  if (bind === "paste.home" || bind === "paste.download") {
+    const where = bind.slice(6);
+    state.paste[where] = value;
+    if (state.paste.errorFor === where && state.paste.error) {
+      state.paste.error = "";
+      state.paste.errorFor = "";
+      event.target.closest(".paste-wrap")?.querySelector(".inline-error")?.remove();
+    }
   }
-  if (bind === "subtitle.castDraft") state.subtitle.castDraft = value;
-  if (bind === "approvals.customText") state.approvals.customText = value;
+  if (bind === "capture.name") state.capture.name = value;
 });
 
 document.addEventListener("keydown", (event) => {
-  const tag = document.activeElement?.tagName;
-  if (tag === "TEXTAREA" || tag === "INPUT") return;
-
-  if (state.screen === "player") {
-    if (event.key === " " || event.key === "Spacebar") {
-      event.preventDefault();
-      toggleMainPlayer();
-      return;
-    }
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      seekMainPlayer(state.player.currentTime - 5);
-      return;
-    }
-    if (event.key === "ArrowRight") {
-      event.preventDefault();
-      seekMainPlayer(state.player.currentTime + 5);
-      return;
-    }
-    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-      if (!state.player.videoUrl) return;
-      event.preventDefault();
-      adjustMainPlayerVolume(event.key === "ArrowUp" ? 0.05 : -0.05);
-      return;
-    }
-    if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "t") {
-      event.preventDefault();
-      toggleTheaterMode();
-      return;
-    }
-    if (!event.ctrlKey && !event.metaKey && !event.altKey && event.key.toLowerCase() === "f") {
-      event.preventDefault();
-      togglePlayerFullscreen();
-      return;
-    }
-  }
-
-  if (state.screen !== "approve") return;
-  if (event.key === "ArrowLeft" && state.approvals.cursor > 0) {
+  if (event.key === "Tab") playerKeyboardModality = true;
+  if (state.intro && ["Escape", "Enter", " "].includes(event.key)) {
     event.preventDefault();
-    state.approvals.cursor -= 1;
-    render();
+    dismissIntro();
+    return;
   }
-  if (event.key === "ArrowRight" && state.approvals.decisions[state.approvals.cursor + 1]) {
-    event.preventDefault();
-    state.approvals.cursor += 1;
-    render();
+  const dialog = root.querySelector('[role="dialog"][aria-modal="true"]');
+  if (dialog) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeTopDialog();
+    } else if (event.key === "Tab") {
+      trapDialogFocus(dialog, event);
+    } else if (event.key === "Enter" && event.target?.id === "capName" && !event.isComposing) {
+      event.preventDefault();
+      confirmCurrentCapture(true);
+    }
+    return;
+  }
+  handlePlayerShortcut(event);
+});
+
+// Keep keyboard focus inside an open dialog (the rest of the app is inert).
+document.addEventListener("focusin", (event) => {
+  const dialog = root.querySelector('[role="dialog"][aria-modal="true"]');
+  if (dialog && !dialog.contains(event.target) && root.contains(event.target)) {
+    const first = dialog.querySelector("input:not([disabled]), button:not([disabled])");
+    first?.focus({ preventScroll: true });
   }
 });
 
-document.addEventListener("fullscreenchange", syncFullscreenState);
-document.addEventListener("webkitfullscreenchange", syncFullscreenState);
-document.addEventListener("MSFullscreenChange", syncFullscreenState);
 
+function scheduleFolderThumbs() {
+  cancelFolderThumbs();
+  const sincePlayer = Date.now() - Number(state.player.lastSuspendedAt || 0);
+  const delay = sincePlayer < 700 ? 360 : 120;
+  folderThumbTimer = window.setTimeout(() => {
+    folderThumbTimer = null;
+    attachFolderThumbs();
+  }, delay);
+}
+
+function cancelFolderThumbs() {
+  if (folderThumbTimer) window.clearTimeout(folderThumbTimer);
+  folderThumbTimer = null;
+  folderThumbQueue = [];
+  folderThumbActive = 0;
+}
+
+// Stage handlers use on* properties so they stay idempotent: the stage element
+// survives fullscreen patches and must not accumulate duplicate listeners.
+function attachPlayerStage() {
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage) {
+    clearPlayerControlsTimer();
+    return;
+  }
+
+  stage.onpointermove = (event) => {
+    if (event.screenX === playerLastPointer.x && event.screenY === playerLastPointer.y) return;
+    playerLastPointer = { x: event.screenX, y: event.screenY };
+    showPlayerControls();
+  };
+  stage.onpointerdown = () => showPlayerControls();
+  stage.onmouseleave = () => {
+    // Pointer left the picture (theater mode / second monitor): hide right away.
+    if (!state.player.playing || !stage.classList.contains("is-overlay") || playerScrubbing) return;
+    if (playerKeyboardModality && stage.contains(document.activeElement)) return;
+    hidePlayerControls(stage);
+  };
+
+  const playerDrop = stage.querySelector("[data-player-drop]");
+  if (!playerDrop) return;
+
+  playerDrop.ondragover = (event) => {
+    event.preventDefault();
+    playerDrop.classList.add("dragging");
+  };
+  playerDrop.ondragleave = (event) => {
+    if (!playerDrop.contains(event.relatedTarget)) playerDrop.classList.remove("dragging");
+  };
+  playerDrop.ondrop = async (event) => {
+    event.preventDefault();
+    playerDrop.classList.remove("dragging");
+    const file = event.dataTransfer.files?.[0];
+    if (!file) return;
+
+    const filePath = file.path || file.name;
+    if (isSubtitlePath(filePath)) {
+      await loadSubtitlePath(filePath);
+      render();
+      return;
+    }
+
+    if (isVideoPath(filePath)) {
+      const token = await loadVideoPath(filePath);
+      if (token !== state.player.sourceToken) return;
+      state.player.playing = true;
+      render();
+    }
+  };
+
+  const ignoreFrameClick = (event) => Boolean(event.target.closest("button, input, a, [data-player-folder-rail], .player-error"));
+  // Single click toggles playback, double click toggles fullscreen (the two
+  // single clicks cancel each other out, like most desktop players).
+  playerDrop.onclick = (event) => {
+    if (!state.player.videoUrl || ignoreFrameClick(event)) return;
+    toggleMainPlayer();
+    showPlayerControls();
+  };
+  playerDrop.ondblclick = (event) => {
+    if (!state.player.videoUrl || ignoreFrameClick(event)) return;
+    togglePlayerFullscreen();
+  };
+}
+
+function capturePlayerFolderListScroll() {
+  const scroll = {};
+  document.querySelectorAll("[data-player-folder-list]").forEach((list) => {
+    if (list.clientHeight) scroll[list.dataset.playerFolderList] = list.scrollTop;
+  });
+  return { path: playerFolderCenteredPath, scroll };
+}
+
+// Keep the active playlist item visible by scrolling only the list itself;
+// scrollIntoView() would also scroll the page and the overflow-hidden frame.
+function attachPlayerFolderRail(memory = null) {
+  if (state.screen !== "player" || !document.querySelector("[data-player-folder-list]")) return;
+  const activePath = state.player.videoPath;
+  window.requestAnimationFrame(() => {
+    document.querySelectorAll("[data-player-folder-list]").forEach((list) => {
+      if (!list.clientHeight) return;
+      const key = list.dataset.playerFolderList;
+      const remembered = memory?.scroll?.[key];
+      if (memory?.path && sameLocalPath(memory.path, activePath) && Number.isFinite(remembered)) {
+        list.scrollTop = remembered;
+        return;
+      }
+      const active = list.querySelector(".player-folder-item.active");
+      if (active) scrollChildIntoContainer(list, active);
+    });
+    playerFolderCenteredPath = activePath;
+  });
+}
+
+function scrollChildIntoContainer(container, child, behavior = "auto") {
+  if (!container || !child || !container.clientHeight) return;
+  const containerRect = container.getBoundingClientRect();
+  const childRect = child.getBoundingClientRect();
+  const offset = childRect.top - containerRect.top - container.clientTop + container.scrollTop;
+  const target = Math.max(0, offset - (container.clientHeight - childRect.height) / 2);
+  if (Math.abs(target - container.scrollTop) < 2) return;
+  container.scrollTo({ top: target, behavior });
+}
+
+function patchPlayerStage() {
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage) return;
+  const m = playerViewModel();
+  const active = document.activeElement;
+  const focusedAction = active && stage.contains(active) ? active.closest?.("[data-action]")?.dataset.action || "" : "";
+  const folderListMemory = capturePlayerFolderListScroll();
+
+  stage.className = playerStageClasses(m);
+  const frame = stage.querySelector("[data-player-drop]");
+  if (frame) frame.className = playerFrameClasses(m);
+  const layer = stage.querySelector("[data-player-layer]");
+  if (layer) layer.outerHTML = renderPlayerFrameLayer(m);
+  const consoleEl = stage.querySelector("[data-player-console]");
+  if (consoleEl) consoleEl.outerHTML = renderPlayerConsole(m);
+
+  attachPlayerStage();
+  attachMainPlayer();
+  attachPlayerFolderRail(folderListMemory);
+  if (focusedAction) stage.querySelector(`[data-action="${focusedAction}"]`)?.focus({ preventScroll: true });
+}
+
+function scrollPendingFolderVideoIntoView() {
+  const targetPath = state.folder.pendingScrollPath;
+  if (!targetPath) return;
+  const index = state.folder.videos.findIndex((video) => sameLocalPath(video.path, targetPath));
+  if (index < 0) {
+    state.folder.pendingScrollPath = "";
+    return;
+  }
+
+  window.requestAnimationFrame(() => {
+    const card = document.querySelector(`[data-folder-video-index="${index}"]`);
+    card?.scrollIntoView({ block: "center" });
+    state.folder.pendingScrollPath = "";
+  });
+}
+
+document.addEventListener("pointerdown", () => {
+  playerKeyboardModality = false;
+}, true);
+
+// Safety net: if the scrubber was re-rendered mid-drag its own pointerup never fires.
+["pointerup", "pointercancel"].forEach((type) => window.addEventListener(type, () => {
+  if (!playerScrubbing) return;
+  playerScrubbing = false;
+  schedulePlayerControlsHide();
+}));
+
+document.addEventListener("focusin", (event) => {
+  if (playerKeyboardModality && event.target?.closest?.("[data-player-stage]")) showPlayerControls();
+});
+
+if ("onfullscreenchange" in document) {
+  document.addEventListener("fullscreenchange", syncFullscreenState);
+} else {
+  document.addEventListener("webkitfullscreenchange", syncFullscreenState);
+}
+
+function isTextEntryElement(element) {
+  if (!element || element === document.body) return false;
+  if (element.isContentEditable) return true;
+  const tag = element.tagName;
+  if (tag === "TEXTAREA" || tag === "SELECT") return true;
+  if (tag !== "INPUT") return false;
+  return !["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"].includes(String(element.type || "").toLowerCase());
+}
+
+function handlePlayerShortcut(event) {
+  if (state.screen !== "player" || event.defaultPrevented) return false;
+  if (event.ctrlKey || event.metaKey || event.altKey) return false;
+  if (isTextEntryElement(event.target) || isTextEntryElement(document.activeElement)) return false;
+  if (modalKey() || state.intro) return false;
+
+  const p = state.player;
+  const key = event.key;
+  const lower = key.length === 1 ? key.toLowerCase() : key;
+
+  if (key === "Escape") {
+    // Esc leaves fullscreen first (Chromium usually consumes it, this is the fallback)
+    // and theater mode only when not fullscreen, so fullscreen-from-theater lands in theater.
+    if (getFullscreenElement()) {
+      event.preventDefault();
+      exitDocumentFullscreen().catch(() => {});
+      return true;
+    }
+    if (p.theater && p.videoUrl) {
+      event.preventDefault();
+      toggleTheaterMode();
+      return true;
+    }
+    return false;
+  }
+  if (!p.videoUrl) return false;
+
+  showPlayerControls();
+  const onButton = Boolean(event.target?.closest?.("button, a[href], summary"));
+  if (key === " " || key === "Spacebar") {
+    // Keyboard users who tabbed to a control get native activation of that control.
+    if (onButton && playerKeyboardModality) return false;
+    event.preventDefault();
+    if (!event.repeat) toggleMainPlayer();
+    return true;
+  }
+  if (key === "ArrowLeft" || key === "ArrowRight") {
+    event.preventDefault();
+    seekMainPlayerBy(key === "ArrowLeft" ? -5 : 5);
+    return true;
+  }
+  if (key === "ArrowUp" || key === "ArrowDown") {
+    event.preventDefault();
+    adjustMainPlayerVolume(key === "ArrowUp" ? 0.05 : -0.05);
+    return true;
+  }
+  const toggles = {
+    m: () => toggleMainMute(),
+    f: () => togglePlayerFullscreen(),
+    t: () => toggleTheaterMode()
+  };
+  if (event.shiftKey && (lower === "n" || lower === "p")) {
+    event.preventDefault();
+    if (!event.repeat) stepFolderVideo(lower === "n" ? 1 : -1);
+    return true;
+  }
+  if (toggles[lower]) {
+    event.preventDefault();
+    if (!event.repeat) toggles[lower]();
+    return true;
+  }
+  return false;
+}
+
+// ---------- Downloads bridge ----------
 function initDownloadBridge() {
   desktop.download?.onState?.((snapshot) => {
     syncDownloadState(snapshot);
-    render();
-  });
-  desktop.download?.onEvent?.((event) => {
-    if (event?.event === "item-started" && event.itemId) state.download.terminalItemId = event.itemId;
+    scheduleDownloadRender();
   });
   refreshDownloadState();
 }
@@ -1826,140 +2182,778 @@ async function refreshDownloadState() {
   try {
     const snapshot = await desktop.download.getState();
     syncDownloadState(snapshot);
-    render();
+    onDownloadsChanged();
   } catch {
     // The browser fallback keeps the UI usable without Electron IPC.
   }
 }
 
+function scheduleDownloadRender() {
+  if (downloadRenderTimer) return;
+  downloadRenderTimer = window.setTimeout(() => {
+    downloadRenderTimer = null;
+    onDownloadsChanged();
+  }, 180);
+}
+
+// Screens that show downloads re-render; elsewhere only the sidebar badge is patched,
+// so a playing video's controls are never rebuilt by progress ticks.
+function onDownloadsChanged() {
+  if (state.screen === "download" || state.screen === "home") render({ preserveScroll: true });
+  else refreshSidebar();
+}
+
+function refreshSidebar() {
+  const sidebar = document.querySelector("[data-sidebar]");
+  if (sidebar) sidebar.outerHTML = renderSidebar();
+}
+
+function applyDownloadResult(result = {}) {
+  if (result?.state) syncDownloadState(result.state);
+  state.download.actionError = result?.ok === false ? describeFailure(result.error).message : "";
+}
+
 function syncDownloadState(snapshot = {}) {
-  if (!Array.isArray(snapshot.items)) return;
+  if (!snapshot || !Array.isArray(snapshot.items)) return;
+  const doneBefore = state.download.items.filter((item) => item.status === "done").length;
   state.download.items = snapshot.items;
-  state.download.parallelItems = snapshot.parallelItems || state.download.parallelItems || 2;
-  const activeItem = state.download.items.find((item) => ["active", "preparing", "muxing"].includes(item.status));
-  if (activeItem) state.download.phase = "running";
-  if (!state.download.terminalItemId || !state.download.items.some((item) => item.id === state.download.terminalItemId)) {
-    state.download.terminalItemId = activeItem?.id || state.download.items[0]?.id || "";
+  if (Number(snapshot.parallelItems)) state.download.parallelItems = Number(snapshot.parallelItems);
+  if (snapshot.downloadDir) state.download.downloadDir = snapshot.downloadDir;
+  const expanded = state.download.expandedLogId;
+  if (expanded && !snapshot.items.some((item) => item.id === expanded)) state.download.expandedLogId = "";
+  if (snapshot.items.filter((item) => item.status === "done").length !== doneBefore) refreshDiskSpace();
+}
+
+function downloadCounts() {
+  const items = state.download.items;
+  const today = new Date().toDateString();
+  const counts = { all: items.length, active: 0, queued: 0, done: 0, failed: 0, doneToday: 0 };
+  for (const item of items) {
+    if (activeStatuses.has(item.status)) counts.active += 1;
+    else if (item.status === "queued") counts.queued += 1;
+    else if (item.status === "done") {
+      counts.done += 1;
+      const finished = new Date(item.finishedAt || item.updatedAt || 0);
+      if (finished.toDateString() === today) counts.doneToday += 1;
+    } else if (item.status === "failed" || item.status === "canceled") counts.failed += 1;
   }
+  return counts;
 }
 
-function selectedDownloadItem() {
-  return (
-    state.download.items.find((item) => item.id === state.download.terminalItemId) ||
-    state.download.items.find((item) => ["active", "preparing", "muxing"].includes(item.status)) ||
-    state.download.items[0] ||
-    null
-  );
+function downloadSortRank(item) {
+  if (activeStatuses.has(item.status)) return 0;
+  if (item.status === "queued") return 1;
+  if (item.status === "done") return 2;
+  return 3;
 }
 
-async function addDownloadItem() {
-  const d = state.download;
-  const source = d.curl.trim();
-  if (!source) {
-    d.prepareError = "Paste a URL or full cURL command first.";
+function filteredDownloadItems() {
+  const filter = state.download.filter;
+  const matches = (item) => {
+    if (filter === "active") return activeStatuses.has(item.status);
+    if (filter === "queued") return item.status === "queued";
+    if (filter === "done") return item.status === "done";
+    if (filter === "failed") return item.status === "failed" || item.status === "canceled";
+    return true;
+  };
+  return state.download.items
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => matches(item))
+    .sort((a, b) => {
+      const rank = downloadSortRank(a.item) - downloadSortRank(b.item);
+      if (rank) return rank;
+      if (a.item.status === "done" && b.item.status === "done") {
+        return String(b.item.finishedAt || "").localeCompare(String(a.item.finishedAt || ""));
+      }
+      return a.index - b.index;
+    })
+    .map(({ item }) => item);
+}
+
+function queuePosition(item) {
+  return state.download.items.filter((entry) => entry.status === "queued").findIndex((entry) => entry.id === item.id) + 1;
+}
+
+function currentDownloadDir() {
+  return state.settings?.downloadDir || state.download.downloadDir || state.info?.downloadDir || "";
+}
+
+async function playDownloadedItem(itemId) {
+  const item = state.download.items.find((entry) => entry.id === itemId);
+  if (!item?.output) return;
+  let exists = {};
+  try {
+    exists = (await desktop.checkFiles([item.output])) || {};
+  } catch {
+    exists = {};
+  }
+  if (exists[item.output] === false) {
+    state.download.actionError = `Không tìm thấy file ${item.output}. Có thể nó đã bị chuyển hoặc xóa.`;
     render();
     return;
   }
+  state.download.actionError = "";
+  const token = await loadVideoPath(item.output, { displayName: item.name, folderContext: null });
+  if (token !== state.player.sourceToken) return;
+  state.player.playing = true;
+  setScreen("player");
+}
 
-  d.preparing = true;
-  d.prepareError = "";
-  render();
-  try {
-    const prepared = await desktop.download.prepareItem({
-      source,
-      name: d.name.trim() || suggestNameFromCurl(source),
-      quality: d.quality,
-      type: "m3u8",
-      workers: 8
-    });
-    const item = prepared.item || prepared;
-    await desktop.download.enqueueItems([item]);
-    await refreshDownloadState();
-    d.curl = "";
-    d.name = "";
-    d.quality = "1080";
-    d.step = 0;
-    d.prepareError = "";
-  } catch (error) {
-    d.prepareError = error?.message || "Could not prepare this download item.";
-  } finally {
-    d.preparing = false;
+// ---------- Paste + capture dialog ----------
+async function submitPaste(where) {
+  if (where !== "home" && where !== "download") return;
+  if (state.paste.busy) return;
+  const source = String(state.paste[where] || "").trim();
+  if (!source) {
+    state.paste.error = "Dán link video hoặc lệnh cURL trước đã.";
+    state.paste.errorFor = where;
     render();
+    return;
+  }
+  state.paste.busy = where;
+  state.paste.error = "";
+  state.paste.errorFor = "";
+  render();
+  let result;
+  try {
+    result = await desktop.capture.prepareManual(source);
+  } catch (error) {
+    result = { ok: false, error: error?.message || "" };
+  }
+  state.paste.busy = "";
+  if (result?.ok && result.capture) {
+    state.paste[where] = "";
+    enqueueCaptureDialog(result.capture);
+    return;
+  }
+  state.paste.error = describeFailure(result?.error).message;
+  state.paste.errorFor = where;
+  render();
+}
+
+function initCaptureBridge() {
+  desktop.capture?.onIncoming?.((payload) => enqueueCaptureDialog(payload));
+}
+
+function enqueueCaptureDialog(payload) {
+  if (!payload?.captureId) return;
+  if (state.capture.queue.some((entry) => entry.captureId === payload.captureId)) return;
+  const wasEmpty = state.capture.queue.length === 0;
+  if (wasEmpty) {
+    state.capture.handled = 0;
+    dialogReturnFocus = focusSelector(document.activeElement);
+  }
+  state.capture.queue.push(payload);
+  if (wasEmpty) primeCaptureForm();
+  if (payload.downloadDir && !state.settings?.downloadDir) state.download.downloadDir = payload.downloadDir;
+  if (state.intro) dismissIntro();
+  render();
+}
+
+function primeCaptureForm() {
+  const capture = state.capture.queue[0];
+  state.capture.name = capture ? String(capture.name || "") : "";
+  state.capture.quality = capture ? defaultVariantKey(capture) : "";
+  state.capture.error = "";
+  state.capture.busy = false;
+}
+
+function advanceCaptureQueue() {
+  state.capture.queue.shift();
+  state.capture.handled += 1;
+  const empty = state.capture.queue.length === 0;
+  if (empty) state.capture.handled = 0;
+  primeCaptureForm();
+  render();
+  if (empty && dialogReturnFocus) {
+    const target = root.querySelector(dialogReturnFocus);
+    if (target && !target.disabled) target.focus({ preventScroll: true });
+    dialogReturnFocus = "";
   }
 }
 
-function startDownloadSimulation() {
-  stopDownloadSimulation();
-  state.download.phase = "running";
-  state.download.active = 0;
-  state.download.items.forEach((item, index) => {
-    item.status = index === 0 ? "active" : "queued";
-    item.progress = 0;
-  });
+async function confirmCurrentCapture(start) {
+  const capture = state.capture.queue[0];
+  if (!capture || state.capture.busy) return;
+  state.capture.busy = true;
+  state.capture.error = "";
   render();
-  downloadTimer = setInterval(() => {
-    const active = state.download.items[state.download.active];
-    if (!active) {
-      stopDownloadSimulation();
+  let result;
+  try {
+    result = await desktop.capture.confirm({
+      captureId: capture.captureId,
+      name: state.capture.name.trim() || capture.name,
+      quality: state.capture.quality,
+      start
+    });
+  } catch (error) {
+    result = { ok: false, error: error?.message || "" };
+  }
+  state.capture.busy = false;
+  if (result?.ok) {
+    if (result.state) syncDownloadState(result.state);
+    showToast(start ? "Đã thêm và bắt đầu tải" : "Đã thêm vào hàng đợi");
+    advanceCaptureQueue();
+    return;
+  }
+  const raw = String(result?.error || "");
+  state.capture.error = /expired|already handled/i.test(raw)
+    ? capture.origin === "manual"
+      ? "Yêu cầu này đã hết hạn. Hãy dán lại link."
+      : "Yêu cầu này đã hết hạn. Bấm lại Tải bằng ViSUBLY trên Chrome."
+    : describeFailure(raw).message;
+  render();
+}
+
+async function skipCurrentCapture() {
+  const capture = state.capture.queue[0];
+  if (!capture || state.capture.busy) return;
+  try {
+    await desktop.capture.dismiss(capture.captureId);
+  } catch {
+    // The pending capture simply expires in the main process.
+  }
+  advanceCaptureQueue();
+}
+
+function variantKey(variant) {
+  return String(variant?.url || variant?.resolution || "");
+}
+
+function sortedVariants(variants) {
+  if (!Array.isArray(variants)) return [];
+  return variants
+    .filter((variant) => variant && (variant.url || variant.resolution))
+    .slice()
+    .sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0) || (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0));
+}
+
+// The extension may name the quality the user clicked in its popup (URL first, height as fallback
+// because signed variant URLs can change between the probe and the capture).
+function defaultVariantKey(capture) {
+  const variants = sortedVariants(capture.variants);
+  if (!variants.length) return "";
+  const byUrl = (url) => (url ? variants.find((variant) => variant.url && variant.url === url) : null);
+  const preferredHeight = Number(capture.preferredHeight) || 0;
+  const selected =
+    byUrl(capture.preferredVariantUrl) ||
+    (preferredHeight ? variants.find((variant) => Number(variant.height) === preferredHeight) : null) ||
+    byUrl(capture.preparedItem?.selectedUrl);
+  return variantKey(selected || variants[0]);
+}
+
+function captureDuration(capture) {
+  if (capture.isLive || capture.preparedItem?.isLive) return 0;
+  return Number(capture.durationSec || capture.preparedItem?.durationSec || capture.preparedItem?.estimatedDuration) || 0;
+}
+
+async function changeDownloadDir() {
+  let result;
+  try {
+    result = await desktop.settings.selectDownloadDir();
+  } catch (error) {
+    showToast(error?.message || "Không đổi được thư mục");
+    return;
+  }
+  if (!result || result.canceled) return;
+  if (result.settings) state.settings = result.settings;
+  refreshDiskSpace();
+  render();
+}
+
+// ---------- Settings + theme ----------
+function applyTheme(mode) {
+  const next = ["dark", "light", "system"].includes(mode) ? mode : "dark";
+  const resolved = next === "system" ? (systemDarkQuery && !systemDarkQuery.matches ? "light" : "dark") : next;
+  state.theme = { mode: next, resolved };
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved;
+}
+
+async function setThemeMode(mode) {
+  applyTheme(mode);
+  state.settings = { ...(state.settings || {}), theme: state.theme.mode };
+  render();
+  await updateSettings({ theme: state.theme.mode }, { quiet: true });
+}
+
+async function updateSettings(partial, options = {}) {
+  let next = null;
+  try {
+    next = await desktop.settings.update(partial);
+  } catch (error) {
+    showToast(error?.message || "Không lưu được cài đặt");
+  }
+  if (next && typeof next === "object" && !("ok" in next)) state.settings = next;
+  else state.settings = { ...(state.settings || {}), ...partial };
+  if (!options.quiet) render();
+}
+
+function initSettingsBridge() {
+  desktop.settings?.onChange?.((next) => {
+    if (!next || typeof next !== "object") return;
+    const themeChanged = next.theme && next.theme !== state.theme.mode;
+    state.settings = next;
+    if (themeChanged) applyTheme(next.theme);
+    if (state.screen === "player") refreshSidebar();
+    else render();
+  });
+  systemDarkQuery?.addEventListener?.("change", () => {
+    if (state.theme.mode === "system") applyTheme("system");
+  });
+}
+
+async function refreshAppInfo() {
+  try {
+    const info = await desktop.app.getInfo();
+    if (info) {
+      state.info = info;
+      if (info.captureBridge) applyChromeInfo(info.captureBridge);
+    }
+  } catch {
+    // Info is decorative; screens show "Đang kiểm tra…" without it.
+  }
+  if (state.screen === "player") refreshSidebar();
+  else render();
+}
+
+async function refreshSettings() {
+  try {
+    const next = await desktop.settings.get();
+    if (next && typeof next === "object") {
+      state.settings = next;
+      if (next.theme && next.theme !== state.theme.mode) applyTheme(next.theme);
+    }
+  } catch {
+    // Keep defaults.
+  }
+}
+
+async function refreshDiskSpace() {
+  let result = null;
+  try {
+    result = await desktop.app.diskSpace();
+  } catch {
+    result = null;
+  }
+  const changed = JSON.stringify(result?.ok ? result : null) !== JSON.stringify(state.disk);
+  state.disk = result?.ok ? result : null;
+  if (changed && state.screen === "download") render();
+}
+
+// ---------- Chrome connection + pairing ----------
+function applyChromeInfo(info) {
+  if (!info || typeof info !== "object") return false;
+  const next = {
+    known: true,
+    running: Boolean(info.running),
+    pairedClients: Number(info.pairedClients) || 0,
+    error: String(info.error || "")
+  };
+  const changed =
+    !state.chrome.known ||
+    next.running !== state.chrome.running ||
+    next.pairedClients !== state.chrome.pairedClients ||
+    next.error !== state.chrome.error;
+  state.chrome = next;
+  return changed;
+}
+
+async function pollChrome() {
+  let info = null;
+  try {
+    info = await desktop.capture.info();
+  } catch {
+    info = null;
+  }
+  if (!info) return;
+  const pairedBefore = state.chrome.known ? state.chrome.pairedClients : null;
+  if (!applyChromeInfo(info)) return;
+  // A pairing code is single use: once a browser paired with it, offer a fresh one.
+  if (pairedBefore !== null && state.chrome.pairedClients > pairedBefore && state.pairing.code) {
+    state.pairing.code = "";
+    state.pairing.expiresAt = 0;
+    state.pairing.notice = "Đã ghép nối với Chrome. Mã cũ đã dùng xong.";
+    if (state.screen === "settings") ensurePairingCode(true);
+  }
+  if (state.screen === "player") refreshSidebar();
+  else render();
+}
+
+function startChromePolling() {
+  if (chromePollTimer || !window.visublyDesktop) return;
+  pollChrome();
+  chromePollTimer = window.setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    pollChrome();
+  }, chromePollMs);
+}
+
+async function ensurePairingCode(force = false) {
+  const pairing = state.pairing;
+  if (pairing.loading) return;
+  if (!force && pairing.code && pairing.expiresAt > Date.now() + 5000) return;
+  pairing.loading = true;
+  pairing.error = "";
+  if (state.screen === "settings") render();
+  let result;
+  try {
+    result = await desktop.capture.createPairingCode();
+  } catch (error) {
+    result = { ok: false, error: error?.message || "" };
+  }
+  pairing.loading = false;
+  if (result?.ok && result.code) {
+    pairing.code = String(result.code);
+    pairing.expiresAt = Number(result.expiresAt) || Date.now() + 5 * 60 * 1000;
+  } else {
+    pairing.code = "";
+    pairing.expiresAt = 0;
+    pairing.error = bridgeErrorText(result?.error);
+  }
+  if (state.screen === "settings") render();
+}
+
+function bridgeErrorText(raw) {
+  const text = String(raw || "");
+  if (/turned off/i.test(text)) return "Kết nối trình duyệt đang tắt.";
+  if (/could not start|EADDRINUSE|not running|not installed|failed to load/i.test(text)) {
+    return "Cầu nối Chrome chưa chạy. Khởi động lại ViSUBLY rồi thử lại.";
+  }
+  return text ? `Không tạo được mã: ${text}` : "Không tạo được mã ghép nối.";
+}
+
+function startPairingTicker() {
+  if (pairingTimer) return;
+  pairingTimer = window.setInterval(() => {
+    const pairing = state.pairing;
+    if (state.screen !== "settings" || !pairing.code) {
+      window.clearInterval(pairingTimer);
+      pairingTimer = null;
       return;
     }
-    active.progress = Math.min(100, active.progress + 7 + Math.random() * 9);
-    if (active.progress >= 100) {
-      active.progress = 100;
-      active.status = "done";
-      state.download.active += 1;
-      const next = state.download.items[state.download.active];
-      if (next) next.status = "active";
+    const left = (pairing.expiresAt - Date.now()) / 1000;
+    if (left <= 0) {
+      pairing.code = "";
+      pairing.expiresAt = 0;
+      render();
+      return;
     }
-    render();
-  }, 450);
+    const countdown = document.querySelector("[data-pair-countdown]");
+    if (countdown) countdown.textContent = `Hết hạn sau ${formatClock(left)}`;
+  }, 1000);
 }
 
-function stopDownloadSimulation() {
-  if (downloadTimer) clearInterval(downloadTimer);
-  downloadTimer = null;
+function formatPairingCode(code) {
+  const value = String(code || "");
+  return value.length === 6 ? `${value.slice(0, 3)} ${value.slice(3)}` : value;
 }
 
-function startProcessingSimulation() {
-  stopProcessingSimulation();
-  state.screen = "processing";
-  state.subtitle.processing = { running: true, values: [0, 0, 0, 0, 0], done: false };
+async function revokeAllPairings() {
+  state.pairing.confirmRevoke = false;
+  let result;
+  try {
+    result = await desktop.capture.revokeAll();
+  } catch (error) {
+    result = { ok: false, error: error?.message || "" };
+  }
+  if (result?.ok) {
+    if (result.info) applyChromeInfo(result.info);
+    state.pairing.notice = "Đã hủy mọi ghép nối. Chrome cần nhập mã mới để kết nối lại.";
+  } else {
+    state.pairing.notice = bridgeErrorText(result?.error).replace("Không tạo được mã", "Không hủy được ghép nối");
+  }
   render();
-  processingTimer = setInterval(() => {
-    const p = state.subtitle.processing;
-    for (let i = 0; i < p.values.length; i += 1) {
-      const priorDone = i === 0 || p.values[i - 1] >= 80;
-      if (priorDone && p.values[i] < 100) {
-        p.values[i] = Math.min(100, p.values[i] + 4 + Math.random() * 8);
-        break;
-      }
+}
+
+// ---------- Remote iPhone ----------
+function startRemote() {
+  state.remote.loading = true;
+  render();
+  desktop.airplay
+    .start()
+    .then((info) => {
+      state.remote.qrUrl = info?.qrUrl || null;
+      state.remote.testUrl = info?.pairingUrl || (info?.baseUrl ? `${info.baseUrl}/?token=${info.pairingToken}` : null);
+      state.remote.running = Boolean(info?.running ?? true);
+      if (Array.isArray(info?.devices)) state.remote.devices = info.devices;
+      state.remote.loading = false;
+      if (!state.remote.qrUrl) showToast("Không bật được Remote iPhone");
+      render();
+    })
+    .catch((error) => {
+      state.remote.loading = false;
+      showToast(`Không bật được Remote: ${error?.message || "lỗi không rõ"}`);
+      render();
+    });
+}
+
+// ---------- "Xem tiếp" (recently played, localStorage) ----------
+function loadRecentEntries() {
+  try {
+    const list = JSON.parse(window.localStorage.getItem(recentKey) || "[]");
+    if (!Array.isArray(list)) return [];
+    return list.filter((entry) => entry && typeof entry.path === "string" && entry.path);
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentEntries(list) {
+  try {
+    window.localStorage.setItem(recentKey, JSON.stringify(list.slice(0, maxRecentEntries)));
+  } catch {
+    // Storage may be unavailable; the list just will not persist.
+  }
+}
+
+async function refreshRecent() {
+  const entries = loadRecentEntries();
+  let exists = {};
+  if (entries.length) {
+    try {
+      exists = (await desktop.checkFiles(entries.map((entry) => entry.path))) || {};
+    } catch {
+      exists = {};
     }
-    p.done = p.values.every((v) => v >= 100);
-    if (p.done) stopProcessingSimulation();
-    render();
-  }, 420);
+  }
+  const next = entries.filter((entry) => exists[entry.path] === true);
+  const changed = JSON.stringify(next) !== JSON.stringify(state.recent);
+  state.recent = next;
+  if (changed && state.screen === "home") render();
 }
 
-function stopProcessingSimulation() {
-  if (processingTimer) clearInterval(processingTimer);
-  processingTimer = null;
+function rememberPlayback(video) {
+  const p = state.player;
+  if (!p.videoPath || !video) return;
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : p.duration;
+  if (!duration) return;
+  const entry = {
+    path: p.videoPath,
+    name: p.displayName || pathBaseName(p.videoPath),
+    position: Math.max(0, Math.min(duration, Number(video.currentTime) || 0)),
+    duration,
+    updatedAt: new Date().toISOString()
+  };
+  const list = [entry, ...loadRecentEntries().filter((item) => !sameLocalPath(item.path, entry.path))];
+  saveRecentEntries(list);
+  lastRecentSaveAt = Date.now();
+  state.recent = [entry, ...state.recent.filter((item) => !sameLocalPath(item.path, entry.path))].slice(0, maxRecentEntries);
 }
 
-function chooseApproval(pick) {
-  const cursor = state.approvals.cursor;
-  const seg = flaggedSegments[cursor];
-  const text = pick === "claude" ? seg.claude : pick === "chatgpt" ? seg.chatgpt : state.approvals.customText.trim();
-  if (!text) return;
-  state.approvals.decisions[cursor] = { pick, text };
-  state.approvals.customText = "";
-  state.approvals.cursor = cursor + 1;
-  render();
+async function openRecent(pathValue) {
+  if (!pathValue) return;
+  const entry = state.recent.find((item) => sameLocalPath(item.path, pathValue));
+  const token = await loadVideoPath(pathValue, { displayName: entry?.name || "", folderContext: null });
+  if (token !== state.player.sourceToken) return;
+  const position = Number(entry?.position) || 0;
+  const duration = Number(entry?.duration) || 0;
+  if (position > 5 && (!duration || position < duration - 10)) state.player.resumeAt = position;
+  state.player.playing = true;
+  setScreen("player");
+}
+
+// ---------- Errors (friendly Vietnamese text, raw log stays available) ----------
+function httpStatusFrom(text) {
+  const patterns = [
+    /HTTP Error (\d{3})/i,
+    /returned error:?\s*(\d{3})/i,
+    /status(?: code)?[:= ]+(\d{3})/i,
+    /\b(\d{3})\s+(?:Forbidden|Unauthorized|Not Found|Gone|Too Many Requests|Internal Server Error|Bad Gateway|Service Unavailable)/i,
+    /server returned (\d{3})/i
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) return Number(match[1]);
+  }
+  if (/\bForbidden\b/i.test(text)) return 403;
+  if (/\bUnauthorized\b/i.test(text)) return 401;
+  return 0;
+}
+
+function describeFailure(raw) {
+  const text = String(raw || "");
+  const status = httpStatusFrom(text);
+  if (status === 401 || status === 403) {
+    return { code: `Lỗi ${status}`, message: "Link đã hết hạn hoặc cần đăng nhập. Mở lại trang trên Chrome rồi bấm Tải bằng ViSUBLY." };
+  }
+  if (status === 404 || status === 410) {
+    return { code: `Lỗi ${status}`, message: "Không tìm thấy video ở link này. Có thể video đã bị gỡ hoặc link bị thiếu, hãy lấy link mới." };
+  }
+  if (/download folder is not available|cannot use download folder|EPERM|EACCES|EROFS|operation not permitted|permission denied/i.test(text)) {
+    return { code: "Lỗi thư mục lưu", message: "ViSUBLY không ghi được vào thư mục lưu video. Kiểm tra ổ đĩa còn kết nối và cho phép ghi, hoặc đổi thư mục trong Cài đặt." };
+  }
+  if (/no space left|ENOSPC|disk (is )?full|not enough space/i.test(text)) {
+    return { code: "Hết dung lượng", message: "Ổ đĩa lưu video đã đầy. Giải phóng bớt dung lượng hoặc đổi thư mục lưu trong Cài đặt rồi thử lại." };
+  }
+  if (/ffmpeg/i.test(text) && /not found|missing|cannot find|ENOENT|not recognized|no such file/i.test(text)) {
+    return { code: "Thiếu ffmpeg", message: "Không tìm thấy ffmpeg để ghép video. Hãy cài lại ViSUBLY." };
+  }
+  if (/engine|runner|python|visubly-downloader|spawn/i.test(text) && /not found|missing|ENOENT|could not start|cannot start|not available|failed to start/i.test(text)) {
+    return { code: "Thiếu trình tải", message: "Trình tải video không khởi động được. Hãy cài lại ViSUBLY." };
+  }
+  if (/\bDRM\b|widevine|playready|fairplay|SAMPLE-AES|encrypted|EXT-X-KEY/i.test(text)) {
+    return { code: "Không hỗ trợ", message: "Video này được bảo vệ bản quyền (DRM) nên ViSUBLY không tải được." };
+  }
+  if (/blob url|unsupported|not supported|no variants or media segments|could not find url|no url or curl|invalid url|unknown url type|not a valid/i.test(text)) {
+    return { code: "Không hỗ trợ", message: "ViSUBLY chưa đọc được link này. Hãy dùng link .m3u8 hoặc .mp4, hoặc bấm Tải bằng ViSUBLY trên Chrome." };
+  }
+  if (/timed? ?out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|getaddrinfo|network|connection (reset|refused|aborted)|URLError|RemoteDisconnected|SSL|Could not resolve host|Failed to connect/i.test(text)) {
+    return { code: "Lỗi mạng", message: "Mất kết nối hoặc máy chủ phản hồi quá chậm. Kiểm tra mạng rồi bấm Thử lại." };
+  }
+  if (status >= 500 && status < 600) {
+    return { code: `Lỗi ${status}`, message: "Máy chủ video đang gặp sự cố. Thử lại sau ít phút." };
+  }
+  if (status === 429) {
+    return { code: "Lỗi 429", message: "Máy chủ đang giới hạn tốc độ tải. Đợi một lát rồi bấm Thử lại." };
+  }
+  if (/paste a url|full curl command first/i.test(text)) {
+    return { code: "Thiếu link", message: "Dán link video hoặc lệnh cURL trước đã." };
+  }
+  if (/output file (is not available|was not found)/i.test(text)) {
+    return { code: "Không thấy file", message: "Không tìm thấy file đã tải. Có thể nó đã bị chuyển hoặc xóa." };
+  }
+  if (/only in the visubly app|chỉ có trong ứng dụng/i.test(text)) {
+    return { code: "Cần ứng dụng", message: "Tính năng này chỉ có trong ứng dụng ViSUBLY." };
+  }
+  return { code: "Lỗi", message: "Tải không thành công. Bấm Thử lại, hoặc Xem log để biết chi tiết." };
+}
+
+function describeItemFailure(item) {
+  const fromError = describeFailure(item.error);
+  if (fromError.code !== "Lỗi") return fromError;
+  const logs = Array.isArray(item.logs) ? item.logs.slice(-40).join("\n") : "";
+  return describeFailure(`${item.error || ""}\n${logs}`);
+}
+
+// ---------- Formatting ----------
+function progressPercent(item) {
+  return Math.round(Math.max(0, Math.min(100, Number(item?.progress) || 0)));
+}
+
+function etaShort(seconds) {
+  const value = Number(seconds);
+  if (seconds === null || seconds === undefined || !Number.isFinite(value) || value <= 0) return "";
+  return `còn ${formatClock(value)}`;
+}
+
+function etaLong(seconds) {
+  const value = Number(seconds);
+  if (seconds === null || seconds === undefined || !Number.isFinite(value) || value <= 0) return "";
+  if (value < 60) return "còn chưa tới 1 phút";
+  if (value < 3600) return `còn khoảng ${Math.round(value / 60)} phút`;
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.round((value % 3600) / 60);
+  return `còn khoảng ${hours} giờ${minutes ? ` ${minutes} phút` : ""}`;
+}
+
+function typeLabel(type) {
+  const value = String(type || "").toLowerCase();
+  return { m3u8: "HLS", hls: "HLS", mp4: "MP4", dash: "DASH" }[value] || (value ? value.toUpperCase() : "VIDEO");
+}
+
+function qualityText(item) {
+  const match = String(item?.selectedQuality || "").match(/(\d{2,5})\s*[x×]\s*(\d{2,5})/i);
+  if (match) return resolutionLabelFromSize(Number(match[1]), Number(match[2]));
+  return "";
+}
+
+function sizeText(item) {
+  if (item.status === "done" && item.fileSize) return formatBytes(item.fileSize);
+  const duration = Number(item.estimatedDuration) || 0;
+  const variant = Array.isArray(item.variants) ? item.variants.find((entry) => entry.url && entry.url === item.selectedUrl) : null;
+  const bandwidth = Number(variant?.bandwidth) || 0;
+  return duration && bandwidth ? `~${formatBytes((bandwidth * duration) / 8)}` : "";
+}
+
+function formatTimeOfDay(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (date.toDateString() === new Date().toDateString()) return time;
+  return `${String(date.getDate()).padStart(2, "0")}/${String(date.getMonth() + 1).padStart(2, "0")} ${time}`;
+}
+
+function stripVideoExtension(name) {
+  return String(name || "").replace(/\.(mp4|m4v|mov|mkv|webm|avi|wmv|flv|ts|m2ts|mts)$/i, "");
+}
+
+// ---------- Toast + intro ----------
+function showToast(message) {
+  let toast = document.getElementById("toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "toast";
+    toast.className = "toast";
+    toast.setAttribute("role", "status");
+    toast.setAttribute("aria-live", "polite");
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.classList.add("is-visible");
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => toast.classList.remove("is-visible"), 2600);
+}
+
+function introVersionKey() {
+  return desktop.boot?.version || "dev";
+}
+
+function shouldShowIntro() {
+  try {
+    return window.localStorage.getItem(introKey) !== introVersionKey();
+  } catch {
+    return false;
+  }
+}
+
+function dismissIntro() {
+  if (!state.intro) return;
+  state.intro = false;
+  if (introTimer) window.clearTimeout(introTimer);
+  introTimer = null;
+  try {
+    window.localStorage.setItem(introKey, introVersionKey());
+  } catch {
+    // Showing the splash again next launch is harmless.
+  }
+  const intro = document.querySelector("[data-intro]");
+  if (!intro) return;
+  intro.classList.add("is-leaving");
+  window.setTimeout(() => intro.remove(), 240);
+}
+
+
+function currentFolderVideoIndex() {
+  if (!state.player.videoPath || !state.folder.videos.length) return -1;
+  return state.folder.videos.findIndex((video) => sameLocalPath(video.path, state.player.videoPath));
+}
+
+function sameLocalPath(a, b) {
+  return normalizeLocalPath(a) === normalizeLocalPath(b);
+}
+
+function normalizeLocalPath(value) {
+  return String(value || "").replaceAll("/", "\\").toLowerCase();
+}
+
+// A reused <video> (fullscreen patch, folder next/prev) may still point at the
+// previous source: swap its src in place instead of creating a new element.
+function ensureMainPlayerVideoSource(video) {
+  const p = state.player;
+  if (!p.videoUrl) return;
+  if (video.dataset.sourceToken === String(p.sourceToken) && video.dataset.videoUrl === p.videoUrl) return;
+  video.dataset.sourceToken = String(p.sourceToken);
+  video.dataset.videoUrl = p.videoUrl;
+  video.src = p.videoUrl;
+  video.load();
 }
 
 function attachMainPlayer() {
   const video = document.getElementById("mainPlayerVideo");
   if (!video) return;
 
+  ensureMainPlayerVideoSource(video);
   video.muted = state.player.muted;
   video.volume = state.player.volume;
   const sourceToken = video.dataset.sourceToken;
@@ -1973,55 +2967,111 @@ function attachMainPlayer() {
     updatePlayerUi();
   };
 
-  video.addEventListener("loadedmetadata", () => {
+  video.onloadedmetadata = () => {
     if (!isCurrentSource()) return;
     state.player.duration = Number.isFinite(video.duration) ? video.duration : 0;
+    // "Xem tiếp" resumes from the saved position once the duration is known.
+    const resumeAt = state.player.resumeAt;
+    state.player.resumeAt = 0;
+    if (resumeAt > 0 && resumeAt < state.player.duration) state.player.currentTime = resumeAt;
     if (state.player.currentTime > 0 && state.player.currentTime < state.player.duration) {
       video.currentTime = state.player.currentTime;
     } else {
       video.currentTime = 0;
       state.player.currentTime = 0;
     }
+    if (!video.videoWidth && !video.videoHeight && !state.player.mediaError) {
+      // Audio decodes but the picture does not (typically HEVC without hardware support).
+      state.player.mediaError = describeMissingVideoTrack();
+      render();
+      return;
+    }
     updatePlayerUi();
-  });
-  video.addEventListener("timeupdate", syncState);
-  video.addEventListener("play", syncState);
-  video.addEventListener("pause", syncState);
-  video.addEventListener("ended", syncState);
-  video.addEventListener("volumechange", () => {
+    rememberPlayback(video);
+  };
+  video.ontimeupdate = () => {
+    syncState();
+    if (isCurrentSource() && !video.paused && Date.now() - lastRecentSaveAt > recentSaveIntervalMs) rememberPlayback(video);
+  };
+  video.onplay = () => {
+    syncState();
+    showPlayerControls();
+  };
+  video.onpause = () => {
+    syncState();
+    showPlayerControls();
+    if (isCurrentSource()) rememberPlayback(video);
+  };
+  video.onended = () => {
+    syncState();
+    showPlayerControls();
+    if (!isCurrentSource() || playerScrubbing) return;
+    // Folder playlists continue with the next file.
+    const index = currentFolderVideoIndex();
+    if (index >= 0 && index < state.folder.videos.length - 1) openFolderVideo(index + 1);
+  };
+  video.onerror = () => {
+    if (!isCurrentSource() || !video.error) return;
+    state.player.playing = false;
+    state.player.mediaError = describeMediaError(video.error, state.player.videoPath);
+    render();
+  };
+  video.onvolumechange = () => {
     if (!isCurrentSource()) return;
     state.player.muted = video.muted || video.volume === 0;
     state.player.volume = video.volume;
     if (video.volume > 0) state.player.lastVolume = video.volume;
+    savePlayerPrefs();
     updatePlayerUi();
-  });
+  };
 
   const scrubber = document.querySelector("[data-player-scrubber]");
-  scrubber?.addEventListener("click", (event) => {
-    if (!state.player.duration) return;
-    const rect = scrubber.getBoundingClientRect();
-    const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
-    seekMainPlayer(ratio * state.player.duration);
-  });
-  scrubber?.addEventListener("mousemove", (event) => {
-    updateScrubberPreview(scrubber, event.clientX);
-  });
-  scrubber?.addEventListener("mouseleave", () => {
-    scrubber.classList.remove("previewing");
-  });
-
-  const playerFrame = document.querySelector("[data-player-drop]");
-  playerFrame?.addEventListener("click", () => {
-    toggleMainPlayer();
-  });
+  if (scrubber) {
+    scrubber.onpointerdown = (event) => {
+      if (event.button !== 0 || !state.player.duration) return;
+      event.preventDefault();
+      playerScrubbing = true;
+      scrubber.classList.add("is-scrubbing", "previewing");
+      try {
+        scrubber.setPointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture is best effort.
+      }
+      updateScrubberPreview(scrubber, event.clientX);
+      scrubPlayerTo(scrubber, event.clientX);
+    };
+    scrubber.onpointermove = (event) => {
+      updateScrubberPreview(scrubber, event.clientX);
+      if (playerScrubbing) scrubPlayerTo(scrubber, event.clientX);
+    };
+    const endScrub = (event) => {
+      if (!playerScrubbing) return;
+      playerScrubbing = false;
+      scrubber.classList.remove("is-scrubbing");
+      if (event.type === "pointerup") scrubPlayerTo(scrubber, event.clientX, true);
+      try {
+        scrubber.releasePointerCapture(event.pointerId);
+      } catch {
+        // Already released.
+      }
+      if (!scrubber.matches(":hover")) scrubber.classList.remove("previewing");
+      schedulePlayerControlsHide();
+    };
+    scrubber.onpointerup = endScrub;
+    scrubber.onpointercancel = endScrub;
+    scrubber.onlostpointercapture = endScrub;
+    scrubber.onpointerleave = () => {
+      if (!playerScrubbing) scrubber.classList.remove("previewing");
+    };
+  }
 
   const volumeSlider = document.querySelector("[data-volume-slider]");
-  volumeSlider?.addEventListener("input", (event) => {
+  if (volumeSlider) volumeSlider.oninput = (event) => {
     const value = Math.min(1, Math.max(0, Number(event.target.value) || 0));
     setMainPlayerVolume(value);
-  });
+  };
 
-  if (state.player.playing) {
+  if (state.player.playing && video.paused) {
     video.play().catch(() => {
       state.player.playing = false;
       updatePlayerUi();
@@ -2030,38 +3080,218 @@ function attachMainPlayer() {
   updatePlayerUi();
 }
 
-function attachMiniPlayers() {
-  document.querySelectorAll(".mini-player").forEach((holder) => {
-    const video = holder.querySelector("video");
-    if (!video) return;
-    const start = Number(holder.dataset.clipStart || 0);
-    const end = Number(holder.dataset.clipEnd || start + 6);
+function scrubPlayerTo(scrubber, clientX, final = false) {
+  const duration = state.player.duration;
+  const rect = scrubber.getBoundingClientRect();
+  if (!duration || !rect.width) return;
+  const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  const time = ratio * duration;
+  state.player.currentTime = time;
+  playerScrubPendingTime = time;
+  updatePlayerUi();
+  if (final) {
+    if (playerScrubFrame) window.cancelAnimationFrame(playerScrubFrame);
+    applyPlayerScrub();
+    return;
+  }
+  // Coalesce seeks to one per frame while dragging.
+  if (!playerScrubFrame) playerScrubFrame = window.requestAnimationFrame(applyPlayerScrub);
+}
 
-    const resetClip = () => {
-      try {
-        video.currentTime = start;
-      } catch {
-        // Metadata may not be ready yet.
-      }
+function applyPlayerScrub() {
+  playerScrubFrame = 0;
+  if (playerScrubPendingTime === null) return;
+  const time = playerScrubPendingTime;
+  playerScrubPendingTime = null;
+  seekMainPlayer(time);
+}
+
+function describeMediaError(error, videoPath) {
+  const ext = (pathExtension(videoPath) || "video").toUpperCase();
+  const code = Number(error?.code || 0);
+  const technical = String(error?.message || "").trim();
+  const missing = code === 2 || /ERR_FILE_NOT_FOUND|ERR_ACCESS_DENIED|ERR_FILE_/i.test(technical);
+  if (missing) {
+    return {
+      kind: "error",
+      title: "Không đọc được file video này",
+      detail: "Không mở được file. Có thể file đã bị chuyển, đổi tên, xóa, hoặc vẫn đang được tải về.",
+      technical
     };
+  }
+  if (code === 3) {
+    return {
+      kind: "error",
+      title: "Dừng phát: lỗi giải mã",
+      detail: `Một phần file ${ext} bị hỏng hoặc dùng codec mà trình phát tích hợp không giải mã được. Hãy mở bằng trình phát hệ thống, hoặc chuyển sang MP4 (H.264 + AAC).`,
+      technical
+    };
+  }
+  const legacy = ["AVI", "WMV", "FLV", "ASF", "MPG", "MPEG", "VOB", "TS", "M2TS", "MTS", "3GP", "RM", "RMVB", "DIVX"];
+  return {
+    kind: "error",
+    title: `File ${ext} này không phát được trong ViSUBLY`,
+    detail: legacy.includes(ext)
+      ? `${ext} dùng định dạng hoặc codec mà trình phát tích hợp không hỗ trợ. Hãy mở bằng trình phát hệ thống, hoặc chuyển sang MP4 (H.264 + AAC).`
+      : "Codec video hoặc âm thanh chưa được hỗ trợ (thường là video HEVC/H.265 hoặc âm thanh AC3/DTS). Hãy mở bằng trình phát hệ thống, hoặc chuyển sang MP4 (H.264 + AAC).",
+    technical
+  };
+}
 
-    video.addEventListener("loadedmetadata", resetClip);
-    holder.addEventListener("mouseenter", () => {
-      video.muted = true;
-      resetClip();
-      video.play().catch(() => {});
-    });
-    holder.addEventListener("mouseleave", () => {
-      video.pause();
-      resetClip();
-    });
-    video.addEventListener("timeupdate", () => {
-      if (video.currentTime >= end) {
-        video.pause();
-        resetClip();
-      }
-    });
+function describeMissingVideoTrack() {
+  return {
+    kind: "warning",
+    title: "Không có hình: không giải mã được video",
+    detail: "Âm thanh vẫn có thể phát, nhưng codec video (thường là HEVC/H.265 khi máy không hỗ trợ phần cứng) chưa được trình phát tích hợp hỗ trợ. Hãy mở bằng trình phát hệ thống, hoặc chuyển sang MP4 (H.264 + AAC).",
+    technical: ""
+  };
+}
+
+async function openFolderVideo(index, fallbackPath = "") {
+  const video = state.folder.videos[index];
+  const videoPath = video?.path || fallbackPath;
+  if (!videoPath) return;
+  const wasPlayer = state.screen === "player";
+  const token = await loadVideoPath(videoPath, {
+    displayName: video?.name || "",
+    subtitlePath: video?.subtitlePath || "",
+    folderContext: {
+      folderPath: state.folder.path,
+      videoIndex: index,
+      videoPath,
+      groupName: video?.groupName || "Other"
+    }
   });
+  // A newer pick (fast next/next clicks) supersedes this one.
+  if (token !== state.player.sourceToken) return;
+  state.player.playing = true;
+  // In fullscreen render() patches the stage in place, so fullscreen survives.
+  if (wasPlayer && state.screen === "player") return render();
+  return setScreen("player");
+}
+
+// ---------- Files opened from Windows (default app / "Open with") ----------
+function pathDirName(pathValue) {
+  const value = String(pathValue || "");
+  const index = Math.max(value.lastIndexOf("\\"), value.lastIndexOf("/"));
+  if (index < 0) return "";
+  const dir = value.slice(0, index);
+  return /^[A-Za-z]:$/.test(dir) ? `${dir}\\` : dir; // "E:" -> "E:\"
+}
+
+let openFilesChain = Promise.resolve();
+
+function initOpenFilesBridge() {
+  if (typeof desktop.app?.onOpenFiles === "function") {
+    desktop.app.onOpenFiles((payload) => enqueueOpenFiles(payload?.paths));
+  }
+  // Files passed on the command line before the UI existed.
+  if (typeof desktop.app?.takeOpenFiles === "function") {
+    desktop.app.takeOpenFiles().then(enqueueOpenFiles).catch(() => {});
+  }
+}
+
+function enqueueOpenFiles(paths) {
+  if (!Array.isArray(paths) || !paths.length) return;
+  // Serialize so a burst of launches can't interleave half-loaded videos.
+  openFilesChain = openFilesChain.then(() => handleOpenFiles(paths)).catch(() => {});
+}
+
+async function handleOpenFiles(paths) {
+  const videos = paths.filter(isVideoPath);
+  const subtitles = paths.filter(isSubtitlePath);
+  if (!videos.length && !subtitles.length) return;
+  dismissIntro();
+  if (videos.length) await openVideosFromSystem(videos);
+  if (!subtitles.length) return;
+  if (state.player.videoPath) {
+    await loadSubtitlePath(subtitles[0]);
+  } else {
+    state.player.subtitleNotice = "Hãy mở video trước, rồi mở file phụ đề để nạp vào video đó.";
+  }
+  if (state.screen === "player") render();
+  else setScreen("player");
+}
+
+async function openVideosFromSystem(videos) {
+  const first = videos[0];
+  let scan = null;
+  if (videos.length > 1) {
+    // Several files selected in Explorer: they become the playlist (sorted like the library).
+    scan = {
+      path: pathDirName(first),
+      name: `${videos.length} video đã chọn`,
+      videos: videos.map((p) => ({ path: p, name: pathBaseName(p), folder: "" }))
+    };
+  } else {
+    try {
+      // Only this folder (not subfolders) so prev/next work without walking a whole drive.
+      scan = await desktop.scanVideoFolder(pathDirName(first), { recursive: false });
+    } catch {
+      scan = null;
+    }
+  }
+  if (scan && Array.isArray(scan.videos) && scan.videos.length) {
+    applyFolderScan(scan);
+    const index = videos.length > 1 ? 0 : state.folder.videos.findIndex((video) => sameLocalPath(video.path, first));
+    if (index >= 0) return openFolderVideo(index, first);
+  }
+  const token = await loadVideoPath(first, { folderContext: null });
+  if (token !== state.player.sourceToken) return;
+  state.player.playing = true;
+  return state.screen === "player" ? render() : setScreen("player");
+}
+
+function stepFolderVideo(delta) {
+  const index = currentFolderVideoIndex();
+  if (index < 0) return;
+  const next = index + delta;
+  if (next < 0 || next >= state.folder.videos.length) return;
+  return openFolderVideo(next);
+}
+
+async function openVideoExternally() {
+  const videoPath = state.player.videoPath;
+  if (!videoPath || typeof desktop.openInSystemPlayer !== "function") return;
+  document.getElementById("mainPlayerVideo")?.pause();
+  try {
+    const result = await desktop.openInSystemPlayer(videoPath);
+    if (result?.ok === false) throw new Error(result.error || "");
+  } catch (error) {
+    state.player.mediaError = {
+      kind: "error",
+      title: "Không mở được trình phát hệ thống",
+      detail: error?.message || "Windows chưa có ứng dụng nào mở được loại file này.",
+      technical: ""
+    };
+    render();
+  }
+}
+
+function loadPlayerPrefs() {
+  try {
+    const prefs = JSON.parse(window.localStorage.getItem(playerPrefsKey) || "null");
+    if (!prefs || typeof prefs !== "object") return;
+    const volume = Number(prefs.volume);
+    if (Number.isFinite(volume)) state.player.volume = Math.min(1, Math.max(0, volume));
+    const lastVolume = Number(prefs.lastVolume);
+    if (Number.isFinite(lastVolume) && lastVolume > 0) state.player.lastVolume = Math.min(1, lastVolume);
+    state.player.muted = Boolean(prefs.muted);
+  } catch {
+    // Preferences are a convenience; defaults are fine.
+  }
+}
+
+function savePlayerPrefs() {
+  try {
+    window.localStorage.setItem(playerPrefsKey, JSON.stringify({
+      volume: state.player.volume,
+      lastVolume: state.player.lastVolume,
+      muted: state.player.muted
+    }));
+  } catch {
+    // Storage may be unavailable.
+  }
 }
 
 function attachFolderThumbs() {
@@ -2162,6 +3392,7 @@ function updateFolderResolution(video) {
 function updateScrubberPreview(scrubber, clientX) {
   if (!state.player.duration) return;
   const rect = scrubber.getBoundingClientRect();
+  if (!rect.width) return;
   const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
   const previewTime = ratio * state.player.duration;
   const tooltip = scrubber.querySelector("[data-player-scrubber-tooltip]");
@@ -2172,69 +3403,68 @@ function updateScrubberPreview(scrubber, clientX) {
 
 function updatePlayerUi() {
   const p = state.player;
-  const text = hasRealSubtitleTrack() ? activeSubtitleText(p.currentTime) : "";
+  const hasTrack = hasRealSubtitleTrack();
+  const text = hasTrack ? activeSubtitleText(p.currentTime) : "";
   const subtitleBox = document.querySelector(".visubly-subtitle");
   if (subtitleBox) subtitleBox.classList.toggle("is-empty", !text);
 
   const subtitle = document.querySelector(".main-subtitle-text");
-  if (subtitle) subtitle.textContent = text || "";
+  if (subtitle && subtitle.textContent !== text) subtitle.textContent = text;
 
   const time = document.querySelector(".player-time");
   if (time) time.textContent = `${formatClock(p.currentTime)} / ${formatClock(p.duration)}`;
 
+  const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
   const fill = document.querySelector("[data-player-scrubber-fill]");
-  if (fill) {
-    const progress = p.duration ? Math.min(100, Math.max(0, (p.currentTime / p.duration) * 100)) : 0;
-    fill.style.width = `${progress}%`;
+  if (fill) fill.style.width = `${progress}%`;
+
+  const scrubber = document.querySelector("[data-player-scrubber]");
+  if (scrubber) {
+    scrubber.setAttribute("aria-valuemax", String(Math.round(p.duration || 0)));
+    scrubber.setAttribute("aria-valuenow", String(Math.round(p.currentTime || 0)));
+    scrubber.setAttribute("aria-valuetext", `${formatClock(p.currentTime)} trên ${formatClock(p.duration)}`);
   }
 
-  const cueIndex = hasRealSubtitleTrack() ? state.player.cues.findIndex((cue) => p.currentTime >= cue.start && p.currentTime <= cue.end) : -1;
-  document.querySelectorAll(".transcript-line").forEach((line) => {
-    line.classList.toggle("active", Number(line.dataset.cueIndex) === cueIndex);
-  });
-  if (cueIndex !== state.player.activeCueIndex) {
-    state.player.activeCueIndex = cueIndex;
-    const activeLine = document.querySelector(`.transcript-line[data-cue-index="${cueIndex}"]`);
-    activeLine?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const cueIndex = hasTrack ? p.cues.findIndex((cue) => isCueActive(cue, p.currentTime)) : -1;
+  if (cueIndex !== p.activeCueIndex) {
+    p.activeCueIndex = cueIndex;
+    document.querySelectorAll(".transcript-line.active").forEach((line) => line.classList.remove("active"));
+    const activeLine = cueIndex >= 0 ? document.querySelector(`.transcript-line[data-cue-index="${cueIndex}"]`) : null;
+    if (activeLine) {
+      activeLine.classList.add("active");
+      // Scroll the transcript panel only, never the page.
+      scrollChildIntoContainer(activeLine.closest(".player-transcript"), activeLine, "smooth");
+    }
   }
 
   const playButton = document.querySelector('[data-action="toggle-player"]');
-  if (playButton) {
-    playButton.innerHTML = icon(p.playing ? "minus" : "play");
-    playButton.title = p.playing ? "Pause" : "Play";
+  const playState = p.playing ? "playing" : "paused";
+  if (playButton && playButton.dataset.state !== playState) {
+    const label = p.playing ? "Tạm dừng (Space)" : "Phát (Space)";
+    playButton.dataset.state = playState;
+    playButton.innerHTML = icon(p.playing ? "pause" : "play");
+    playButton.title = label;
+    playButton.setAttribute("aria-label", label);
   }
 
   const muteButton = document.querySelector('[data-action="toggle-mute"]');
-  if (muteButton) {
+  const muteState = p.muted ? "muted" : "sound";
+  if (muteButton && muteButton.dataset.state !== muteState) {
+    const label = p.muted ? "Bật tiếng (M)" : "Tắt tiếng (M)";
+    muteButton.dataset.state = muteState;
     muteButton.innerHTML = icon(p.muted ? "volumeOff" : "volume");
-    muteButton.title = p.muted ? "Unmute" : "Mute";
+    muteButton.title = label;
+    muteButton.setAttribute("aria-label", label);
     muteButton.setAttribute("aria-pressed", p.muted ? "true" : "false");
     muteButton.classList.toggle("danger", p.muted);
-  }
-
-  const theaterButton = document.querySelector('[data-action="toggle-theater"]');
-  if (theaterButton) {
-    theaterButton.title = p.theater ? "Exit theater mode" : "Theater mode";
-    theaterButton.setAttribute("aria-label", theaterButton.title);
-    theaterButton.setAttribute("aria-pressed", p.theater ? "true" : "false");
-    theaterButton.classList.toggle("lime", p.theater);
-  }
-
-  p.fullscreen = isDocumentFullscreen();
-  const fullscreenButton = document.querySelector('[data-action="toggle-fullscreen"]');
-  if (fullscreenButton) {
-    fullscreenButton.innerHTML = icon(p.fullscreen ? "fullscreenExit" : "fullscreen");
-    fullscreenButton.title = p.fullscreen ? "Exit fullscreen" : "Fullscreen";
-    fullscreenButton.setAttribute("aria-label", fullscreenButton.title);
-    fullscreenButton.setAttribute("aria-pressed", p.fullscreen ? "true" : "false");
-    fullscreenButton.classList.toggle("lime", p.fullscreen);
   }
 
   const visibleVolume = p.muted ? 0 : p.volume;
   const volumeSlider = document.querySelector("[data-volume-slider]");
   if (volumeSlider) {
-    volumeSlider.value = String(visibleVolume);
+    if (document.activeElement !== volumeSlider || Number(volumeSlider.value) !== visibleVolume) volumeSlider.value = String(visibleVolume);
     volumeSlider.style.setProperty("--volume-level", `${visibleVolume * 100}%`);
+    volumeSlider.setAttribute("aria-valuetext", `${Math.round(visibleVolume * 100)}%`);
   }
 
   const volumeValue = document.querySelector(".volume-value");
@@ -2243,9 +3473,15 @@ function updatePlayerUi() {
 
 function toggleMainPlayer() {
   const video = document.getElementById("mainPlayerVideo");
-  if (!video) return;
-  if (video.paused || video.ended) video.play().catch(() => {});
-  else video.pause();
+  if (!video || state.player.mediaError?.kind === "error") return;
+  if (video.paused || video.ended) {
+    video.play().catch(() => {
+      state.player.playing = false;
+      updatePlayerUi();
+    });
+  } else {
+    video.pause();
+  }
 }
 
 function toggleMainMute() {
@@ -2259,20 +3495,22 @@ function toggleMainMute() {
   }
   state.player.muted = video.muted;
   state.player.volume = video.volume;
+  savePlayerPrefs();
   updatePlayerUi();
 }
 
 function setMainPlayerVolume(value) {
   const video = document.getElementById("mainPlayerVideo");
   if (!video) return;
-  const nextVolume = Math.min(1, Math.max(0, Number(value) || 0));
+  const nextVolume = Math.min(1, Math.max(0, Math.round((Number(value) || 0) * 100) / 100));
   video.volume = nextVolume;
   video.muted = nextVolume === 0;
   state.player.volume = nextVolume;
   state.player.muted = video.muted;
   if (nextVolume > 0) state.player.lastVolume = nextVolume;
+  savePlayerPrefs();
   updatePlayerUi();
-  showFullscreenPlayerControls();
+  showPlayerControls();
 }
 
 function adjustMainPlayerVolume(delta) {
@@ -2284,6 +3522,8 @@ function suspendMainPlayerForNavigation() {
   const video = document.getElementById("mainPlayerVideo");
   state.player.lastSuspendedAt = Date.now();
   state.player.playing = false;
+  clearPlayerControlsTimer();
+  playerControlsHidden = false;
   if (!video) return;
 
   state.player.currentTime = video.currentTime || state.player.currentTime || 0;
@@ -2301,30 +3541,31 @@ function suspendMainPlayerForNavigation() {
 
 function toggleTheaterMode() {
   if (state.screen !== "player" || !state.player.videoUrl) return;
+  // Theater is the layout underneath fullscreen; change it after leaving fullscreen.
+  if (getFullscreenElement()) return;
   state.player.theater = !state.player.theater;
-
-  document.querySelector(".player-screen")?.classList.toggle("is-theater", state.player.theater);
-  document.querySelector(".player-layout")?.classList.toggle("theater", state.player.theater);
-  updatePlayerUi();
+  render();
+  showPlayerControls();
 }
 
 async function togglePlayerFullscreen() {
   if (state.screen !== "player" || !state.player.videoUrl) return;
-  const activeElement = getFullscreenElement();
-  if (activeElement) {
-    await exitDocumentFullscreen();
+  if (getFullscreenElement()) {
+    try {
+      await exitDocumentFullscreen();
+    } catch {
+      syncFullscreenState();
+    }
     return;
   }
 
-  const target = document.querySelector("[data-player-workbench]") || document.querySelector("[data-player-drop]");
-  if (!target) return;
-
+  // Only the video stage (picture + subtitles + overlay bar) goes fullscreen.
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage) return;
   try {
-    await requestElementFullscreen(target);
-    syncFullscreenControlVisibility();
+    await requestElementFullscreen(stage);
   } catch {
-    state.player.fullscreen = false;
-    updatePlayerUi();
+    syncFullscreenState();
   }
 }
 
@@ -2336,76 +3577,94 @@ function isDocumentFullscreen() {
   return Boolean(getFullscreenElement());
 }
 
+function isPlayerStageFullscreen() {
+  const element = getFullscreenElement();
+  return Boolean(element && element.isConnected && element.matches?.("[data-player-stage]"));
+}
+
 function requestElementFullscreen(element) {
-  const request = element.requestFullscreen || element.webkitRequestFullscreen || element.msRequestFullscreen;
+  if (element.requestFullscreen) return Promise.resolve(element.requestFullscreen({ navigationUI: "hide" }));
+  const request = element.webkitRequestFullscreen || element.msRequestFullscreen;
   if (!request) return Promise.resolve();
   return Promise.resolve(request.call(element));
 }
 
 function exitDocumentFullscreen() {
   const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
-  if (!exit) return Promise.resolve();
+  if (!exit || !getFullscreenElement()) return Promise.resolve();
   return Promise.resolve(exit.call(document));
 }
 
+// Runs for every fullscreen enter/exit (button, F, double click, Esc, F11).
 function syncFullscreenState() {
-  state.player.fullscreen = isDocumentFullscreen();
-  updatePlayerUi();
-  syncFullscreenControlVisibility();
+  state.player.fullscreen = isPlayerStageFullscreen();
+  if (state.screen !== "player") return;
+  // Entering: render() patches the fullscreen stage in place (overlay classes, exit icon).
+  // Leaving: full render back to the window/theater layout, reusing the same <video>.
+  render();
+  showPlayerControls();
 }
 
-function attachPlayerControlActivity() {
-  const workbench = document.querySelector("[data-player-workbench]");
-  if (!workbench) {
-    clearFullscreenControlsTimer();
+function showPlayerControls() {
+  playerControlsHidden = false;
+  document.querySelector("[data-player-stage]")?.classList.remove("is-controls-idle");
+  schedulePlayerControlsHide();
+}
+
+function schedulePlayerControlsHide() {
+  clearPlayerControlsTimer();
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage || !stage.classList.contains("is-overlay") || !state.player.playing) return;
+  playerControlsIdleTimer = window.setTimeout(hidePlayerControlsWhenIdle, playerControlsIdleMs);
+}
+
+function hidePlayerControlsWhenIdle() {
+  playerControlsIdleTimer = null;
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage || !stage.classList.contains("is-overlay") || !state.player.playing) return;
+  if (playerControlsPinned(stage)) {
+    schedulePlayerControlsHide();
     return;
   }
-  ["mousemove", "mousedown", "touchstart", "touchmove"].forEach((eventName) => {
-    workbench.addEventListener(eventName, showFullscreenPlayerControls, { passive: true });
-  });
-  syncFullscreenControlVisibility();
+  hidePlayerControls(stage);
 }
 
-function syncFullscreenControlVisibility() {
-  if (isPlayerWorkbenchFullscreen()) {
-    showFullscreenPlayerControls();
+function hidePlayerControls(stage) {
+  clearPlayerControlsTimer();
+  playerControlsHidden = true;
+  stage.classList.add("is-controls-idle");
+}
+
+// The overlay bar stays up while scrubbing, hovering the bar/playlist, showing an
+// error, or while a control has keyboard focus.
+function playerControlsPinned(stage) {
+  if (playerScrubbing) return true;
+  if (stage.querySelector(".player-console:hover, .player-folder-rail:hover, .player-error")) return true;
+  const active = document.activeElement;
+  return Boolean(playerKeyboardModality && active && stage.contains(active) && active.closest(".player-console, .player-folder-rail"));
+}
+
+function syncPlayerControlsVisibility() {
+  const stage = document.querySelector("[data-player-stage]");
+  if (!stage || !stage.classList.contains("is-overlay")) {
+    clearPlayerControlsTimer();
+    playerControlsHidden = false;
     return;
   }
-  clearFullscreenControlsTimer();
-  document.querySelector("[data-player-workbench]")?.classList.remove("is-controls-idle");
+  if (!playerControlsHidden) schedulePlayerControlsHide();
 }
 
-function showFullscreenPlayerControls() {
-  const workbench = document.querySelector("[data-player-workbench]");
-  if (!workbench || !isPlayerWorkbenchFullscreen()) return;
-  workbench.classList.remove("is-controls-idle");
-  clearFullscreenControlsTimer();
-  playerControlsIdleTimer = window.setTimeout(() => {
-    if (isPlayerWorkbenchFullscreen()) {
-      document.querySelector("[data-player-workbench]")?.classList.add("is-controls-idle");
-    }
-  }, playerControlsIdleMs);
-}
-
-function clearFullscreenControlsTimer() {
+function clearPlayerControlsTimer() {
   if (!playerControlsIdleTimer) return;
   window.clearTimeout(playerControlsIdleTimer);
   playerControlsIdleTimer = null;
 }
 
-function isPlayerWorkbenchFullscreen() {
-  const workbench = document.querySelector("[data-player-workbench]");
-  const fullscreenElement = getFullscreenElement();
-  return Boolean(
-    workbench &&
-    fullscreenElement &&
-    (fullscreenElement === workbench || workbench.contains(fullscreenElement) || fullscreenElement.contains(workbench))
-  );
-}
-
 function seekMainPlayer(seconds) {
   const video = document.getElementById("mainPlayerVideo");
-  const target = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const duration = state.player.duration || (video && Number.isFinite(video.duration) ? video.duration : 0);
+  let target = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  if (duration) target = Math.min(target, duration);
   state.player.currentTime = target;
   if (video) {
     video.currentTime = target;
@@ -2413,6 +3672,12 @@ function seekMainPlayer(seconds) {
   } else {
     render();
   }
+}
+
+function seekMainPlayerBy(delta) {
+  const video = document.getElementById("mainPlayerVideo");
+  const now = video && video.readyState > 0 ? video.currentTime : state.player.currentTime;
+  seekMainPlayer(now + delta);
 }
 
 function emptyFolderState() {
@@ -2425,7 +3690,8 @@ function emptyFolderState() {
     error: "",
     scannedAt: "",
     skippedFolders: 0,
-    truncated: false
+    truncated: false,
+    pendingScrollPath: ""
   };
 }
 
@@ -2442,7 +3708,7 @@ async function chooseVideoFolder() {
     }
     applyFolderScan(result);
   } catch (error) {
-    state.folder = { ...state.folder, scanning: false, error: error?.message || "Could not scan this folder." };
+    state.folder = { ...state.folder, scanning: false, error: error?.message || "Không quét được thư mục này." };
   }
 
   render();
@@ -2457,7 +3723,7 @@ async function rescanVideoFolder() {
     const result = await desktop.scanVideoFolder(state.folder.path);
     applyFolderScan(result);
   } catch (error) {
-    state.folder = { ...state.folder, scanning: false, error: error?.message || "Could not rescan this folder." };
+    state.folder = { ...state.folder, scanning: false, error: error?.message || "Không quét lại được thư mục này." };
   }
 
   render();
@@ -2476,7 +3742,7 @@ function applyFolderScan(result = {}) {
   let videos = Array.isArray(result.videos) ? result.videos : [];
   
   videos.forEach(v => {
-    v.folderName = v.folder || "This folder";
+    v.folderName = v.folder || "Thư mục này";
     v.prefixRaw = extractVideoPrefix(v.name || pathBaseName(v.path));
   });
 
@@ -2495,15 +3761,16 @@ function applyFolderScan(result = {}) {
     } else {
       v.prefixName = null;
     }
+    v.groupName = v.prefixName || "Other";
   });
 
   videos.sort((a, b) => {
     if (a.folderName !== b.folderName) return a.folderName.localeCompare(b.folderName);
     
-    if (a.prefixName !== b.prefixName) {
-      if (!a.prefixName) return 1;
-      if (!b.prefixName) return -1;
-      return a.prefixName.localeCompare(b.prefixName);
+    if (a.groupName !== b.groupName) {
+      if (a.groupName === "Other") return 1;
+      if (b.groupName === "Other") return -1;
+      return a.groupName.localeCompare(b.groupName);
     }
     
     const nameA = a.name || "";
@@ -2526,61 +3793,50 @@ function applyFolderScan(result = {}) {
 }
 
 async function loadVideoPath(pathValue, options = {}) {
-  if (!pathValue) return;
+  if (!pathValue) return state.player.sourceToken;
   const sourceToken = setVideoPath(pathValue, options);
   try {
     const url = await desktop.toFileUrl(pathValue);
-    if (sourceToken !== state.player.sourceToken) return;
+    if (sourceToken !== state.player.sourceToken) return sourceToken;
     if (url) state.player.videoUrl = url;
   } catch {
-    if (sourceToken !== state.player.sourceToken) return;
+    if (sourceToken !== state.player.sourceToken) return sourceToken;
     state.player.videoUrl = localPathToFileUrl(pathValue);
   }
 
-  let subtitleLoaded = false;
-  if (options.subtitlePath) {
-    subtitleLoaded = await loadSubtitlePath(options.subtitlePath, sourceToken);
-  }
-  if (subtitleLoaded) return;
+  if (options.subtitlePath && await loadSubtitlePath(options.subtitlePath, sourceToken)) return sourceToken;
 
   try {
     const matchingSubtitle = await desktop.findMatchingSubtitle(pathValue);
-    if (sourceToken !== state.player.sourceToken) return;
-    if (matchingSubtitle) {
-      subtitleLoaded = await loadSubtitlePath(matchingSubtitle, sourceToken);
-      if (!subtitleLoaded) {
-        state.player.srtPath = "";
-        state.player.cues = sampleCues;
-        state.player.activeCueIndex = -1;
-      }
-    } else {
-      state.player.srtPath = "";
-      state.player.cues = sampleCues;
-      state.player.activeCueIndex = -1;
-    }
+    if (sourceToken !== state.player.sourceToken) return sourceToken;
+    if (matchingSubtitle) await loadSubtitlePath(matchingSubtitle, sourceToken);
   } catch {
-    if (sourceToken !== state.player.sourceToken) return;
-    state.player.srtPath = "";
-    state.player.cues = sampleCues;
-    state.player.activeCueIndex = -1;
+    // No sidecar subtitle: the video simply plays without captions (never demo text).
   }
+  return sourceToken;
 }
 
 async function loadSubtitlePath(pathValue, sourceToken = state.player.sourceToken) {
   if (!pathValue) return false;
   let text = "";
   try {
-    text = await desktop.readTextFile(pathValue);
+    text = await desktop.readSubtitleText(pathValue);
   } catch {
     text = "";
   }
   if (sourceToken !== state.player.sourceToken) return false;
   const cues = parseSrt(text);
-  state.player.srtPath = cues.length ? pathValue : "";
-  state.player.cues = cues.length ? cues : sampleCues;
-  state.player.currentTime = 0;
+  if (!cues.length) {
+    // Keep whatever track is already loaded and tell the user why nothing changed.
+    state.player.subtitleNotice = `Không đọc được câu phụ đề nào từ ${pathBaseName(pathValue)}. Hãy kiểm tra đó là file SRT hoặc WebVTT hợp lệ.`;
+    return false;
+  }
+  state.player.srtPath = pathValue;
+  state.player.cues = cues;
+  state.player.subtitleNotice = "";
   state.player.activeCueIndex = -1;
-  return cues.length > 0;
+  // Do not touch currentTime: loading captions mid-video must not restart playback.
+  return true;
 }
 
 function setVideoPath(pathValue, options = {}) {
@@ -2595,17 +3851,20 @@ function setVideoPath(pathValue, options = {}) {
   const parts = pathValue.split(/[\\/]/);
   const fileName = parts[parts.length - 1] || "video.mkv";
   const displayFileName = displayNameWithExtension(options.displayName, fileName);
-  state.subtitle.videoPath = pathValue;
-  state.subtitle.fileName = displayFileName;
-  state.subtitle.movieTitle = parseMovieTitle(displayFileName);
-  state.subtitle.movieEdited = false;
   state.player.videoPath = pathValue;
   state.player.displayName = displayFileName;
   state.player.videoUrl = localPathToFileUrl(pathValue);
   state.player.currentTime = 0;
+  state.player.resumeAt = 0;
   state.player.duration = 0;
   state.player.playing = false;
   state.player.activeCueIndex = -1;
+  // Drop the previous video's captions/errors so they never flash over the new file.
+  state.player.srtPath = "";
+  state.player.cues = [];
+  state.player.subtitleNotice = "";
+  state.player.mediaError = null;
+  state.player.folderContext = options.folderContext || null;
   return state.player.sourceToken;
 }
 
@@ -2613,48 +3872,96 @@ function hasRealSubtitleTrack() {
   return Boolean(state.player.srtPath && state.player.cues.length);
 }
 
+function isCueActive(cue, seconds) {
+  const time = Number(seconds) || 0;
+  return time >= cue.start && time < cue.end;
+}
+
 function activeSubtitleText(seconds) {
   if (!state.player.subtitleOn) return "";
-  const cue = findActiveCue(seconds);
-  if (!cue) return "";
-  return cue.text;
+  // Overlapping cues (two speakers, signs + dialogue) are shown together.
+  return findActiveCues(seconds).map((cue) => cue.text).join("\n");
 }
 
-function findActiveCue(seconds) {
-  const time = Number(seconds) || 0;
-  return state.player.cues.find((cue) => time >= cue.start && time <= cue.end) || null;
+function findActiveCues(seconds) {
+  return state.player.cues.filter((cue) => isCueActive(cue, seconds));
 }
 
+// Line-based SRT/WebVTT parser: tolerates a BOM, CRLF/CR line endings, whitespace-only
+// "blank" lines, missing index lines, missing blank lines between cues, VTT headers,
+// NOTE/STYLE blocks, cue settings and inline markup.
 function parseSrt(text) {
-  const normalized = String(text || "")
+  const lines = String(text || "")
     .replace(/^\uFEFF/, "")
-    .replace(/\r/g, "")
-    .replace(/^WEBVTT[^\n]*\n+/i, "");
+    .replace(/\u0000/g, "")
+    .split(/\r\n|\r|\n/);
+  const cues = [];
+  let current = null;
+  let closed = false;
 
-  return normalized
-    .split(/\n{2,}/)
-    .map((block) => {
-      const lines = block.split("\n").map((line) => line.trim()).filter(Boolean);
-      const timeIndex = lines.findIndex((line) => line.includes("-->"));
-      if (timeIndex < 0) return null;
-      const [startRaw, endRaw] = lines[timeIndex].split("-->").map((part) => part.trim().split(/\s+/)[0]);
-      const start = parseSrtTime(startRaw);
-      const end = parseSrtTime(endRaw);
-      const cueText = lines.slice(timeIndex + 1).join("\n");
-      if (!Number.isFinite(start) || !Number.isFinite(end) || !cueText) return null;
-      return { start, end, text: cueText };
-    })
+  const finish = () => {
+    if (!current) return;
+    const cueText = cleanCueText(current.lines.join("\n"));
+    if (cueText && current.end > current.start) cues.push({ start: current.start, end: current.end, text: cueText });
+    current = null;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const timing = parseCueTiming(line);
+    if (timing) {
+      // No blank line before this cue: the previous text's last line is its index.
+      if (current && !closed && /^\d+$/.test(current.lines[current.lines.length - 1] || "")) current.lines.pop();
+      finish();
+      current = { ...timing, lines: [] };
+      closed = false;
+      continue;
+    }
+    if (!current || closed) continue;
+    if (!line) {
+      if (current.lines.length) closed = true;
+      continue;
+    }
+    current.lines.push(line);
+  }
+  finish();
+  return cues.sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function parseCueTiming(line) {
+  if (!line.includes("-->")) return null;
+  const [left, right = ""] = line.split("-->");
+  const start = parseSrtTime(left.trim().split(/\s+/).pop());
+  const end = parseSrtTime(right.trim().split(/\s+/)[0]);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { start, end };
+}
+
+function cleanCueText(text) {
+  return String(text || "")
+    .replace(/\{\\[^}]*\}/g, "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/\\N/g, "\n")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&lrm;|&rlm;/gi, "")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#0?39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .split("\n")
+    .map((line) => line.trim())
     .filter(Boolean)
-    .sort((a, b) => a.start - b.start);
+    .join("\n");
 }
 
 function parseSrtTime(value) {
-  const match = String(value || "").match(/(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})/);
+  const match = String(value || "").trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:[,.](\d{1,3}))?$/);
   if (!match) return Number.NaN;
   const hours = Number(match[1] || 0);
   const minutes = Number(match[2] || 0);
   const seconds = Number(match[3] || 0);
-  const millis = Number(match[4].padEnd(3, "0"));
+  const millis = Number((match[4] || "0").padEnd(3, "0"));
   return hours * 3600 + minutes * 60 + seconds + millis / 1000;
 }
 
@@ -2669,7 +3976,7 @@ function formatClock(seconds) {
 }
 
 function formatHoverClock(seconds) {
-  return `${formatClock(seconds)}s`;
+  return formatClock(seconds);
 }
 
 function resolutionLabelFromSize(width, height) {
@@ -2703,6 +4010,16 @@ function hasFolderVideoSubtitle(video = {}) {
 function hasSubbedVideoMarker(value) {
   const stem = pathBaseName(value).replace(/\.[^.]+$/, "");
   return /(?:^|[-_.\s])vs(?:$|[-_.\s])/i.test(stem);
+}
+
+// "~1.1 GB" / "~640 MB": an estimate, so fewer digits than formatBytes.
+function formatApproxBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const gb = value / 1024 ** 3;
+  if (gb >= 1) return `~${gb >= 10 ? Math.round(gb) : gb.toFixed(1)} GB`;
+  const mb = value / 1024 ** 2;
+  return `~${mb >= 10 ? Math.round(mb) : Math.max(0.1, mb).toFixed(1)} MB`;
 }
 
 function formatBytes(bytes) {
@@ -2756,105 +4073,12 @@ function isSubtitlePath(pathValue) {
 }
 
 function isVideoPath(pathValue) {
-  return ["mp4", "m4v", "mov", "mkv", "webm", "avi"].includes(pathExtension(pathValue));
+  // Accept every container the folder scanner lists; unsupported codecs get a clear error state.
+  return ["mp4", "m4v", "mov", "mkv", "webm", "ogv", "avi", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg", "3gp"].includes(pathExtension(pathValue));
 }
 
-function parseMovieTitle(fileName) {
-  return fileName
-    .replace(/\.[^.]+$/, "")
-    .replace(/[_-]+/g, " ")
-    .replace(/\bS(\d{2})E(\d{2})\b/i, "· S$1E$2")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractHost(curl) {
-  const match = String(curl || "").match(/https?:\/\/([^\/'"\s]+)/);
-  return match ? match[1].replace(/^www\./, "") : "";
-}
-
-function suggestNameFromCurl(curl) {
-  const host = extractHost(curl);
-  if (!host) return "Inside_No9_S08E04";
-  return host.split(".")[0].replace(/[^a-z0-9]+/gi, "_") + "_clip";
-}
-
-function qualityLabel(id) {
-  if (state.download && state.download.dynamicQualities) {
-      const q = state.download.dynamicQualities.find(x => x.id === id);
-      if (q) return q.label;
-  }
-  const q = qualities.find((x) => x.id === id);
-  return q ? q.label : id;
-}
-
-function qualityToResolution(id) {
-  return {
-    "2160": "3840x2160",
-    "1440": "2560x1440",
-    "1080": "1920x1080",
-    "720": "1280x720",
-    "480": "854x480"
-  }[String(id || "1080")] || "1920x1080";
-}
-
-function statusLabel(status) {
-  if (status === "done") return "ready for subtitle";
-  if (status === "preparing") return "checking playlist";
-  if (status === "muxing") return "muxing mp4";
-  if (status === "active") return "downloading now";
-  if (status === "failed") return "failed";
-  if (status === "canceled") return "canceled";
-  return "queued";
-}
-
-function phaseLabel(phase) {
-  return {
-    queued: "queued",
-    starting: "starting",
-    preflight: "preflight",
-    download_segments: "segments",
-    ffmpeg_download: "ffmpeg",
-    combine_segments: "combine",
-    mux_ts_to_mp4: "TS to MP4",
-    done: "done",
-    failed: "failed",
-    canceled: "canceled"
-  }[phase] || phase || "queued";
-}
-
-function progressMeta(item) {
-  if (!item) return "";
-  const bits = [];
-  if (item.speed) bits.push(item.speed);
-  if (Number.isFinite(Number(item.eta))) bits.push(`eta ${formatClock(Number(item.eta))}`);
-  if (item.completedSegments && item.totalSegments) bits.push(`${item.completedSegments}/${item.totalSegments} segments`);
-  if (item.error) bits.push(item.error);
-  return bits.join(" · ") || item.output || "";
-}
-
-function pipelineLogs(values) {
-  const logs = [];
-  if (values[0] > 3) logs.push("[OPUS] resolved title from filename + user edit field");
-  if (values[0] > 35) logs.push("[OPUS] matched cast names and built style guide");
-  if (values[1] > 15) logs.push("[WHISPER] listening · 412 source segments");
-  if (values[2] > 20) logs.push("[SONNET] translating with protected proper nouns");
-  if (values[3] > 30) logs.push("[OPUS-QC] scene context pass · character voice fixed");
-  if (values[4] > 20) logs.push("[CHATGPT] native-tone scan found 5 review candidates");
-  if (values.every((v) => v >= 100)) logs.push("[WRITE] subtitles and learning notes saved locally");
-  return logs.length ? logs : ["[READY] pipeline waiting for first task"];
-}
-
-function decisionLabel(pick) {
-  return { claude: "Claude", chatgpt: "ChatGPT", custom: "Your edit" }[pick] || "Open";
-}
-
-function decisionShort(pick) {
-  return { claude: "C", chatgpt: "G", custom: "✎" }[pick] || "open";
-}
-
-function decisionColor(pick) {
-  return { claude: "var(--violet)", chatgpt: "var(--mint)", custom: "var(--rose)" }[pick] || "var(--paper)";
+function groupLabel(name) {
+  return !name || name === "Other" ? "Khác" : String(name);
 }
 
 function escapeHtml(value) {
@@ -2872,19 +4096,46 @@ function escapeAttr(value) {
 
 function initAirPlayPairingBridge() {
   if (desktop.airplay?.onPairingRequested) {
-    desktop.airplay.onPairingRequested((pin) => {
-      state.remote.pairingPin = pin;
+    desktop.airplay.onPairingRequested((request) => {
+      // New servers send { requestId, deviceName, pin }; a bare string is the old PIN-only event.
+      const payload = typeof request === "object" && request ? request : { pin: request };
+      state.remote.pairingRequestId = String(payload.requestId || "");
+      state.remote.pairingDevice = String(payload.deviceName || "");
+      state.remote.pairingPin = payload.pin ? String(payload.pin) : null;
       state.remote.pairingActive = true;
+      state.remote.qrUrl = null;
+      state.remote.loading = false;
+      if (state.intro) dismissIntro();
+      render();
+    });
+  }
+  if (desktop.airplay?.onPairingResolved) {
+    desktop.airplay.onPairingResolved((payload) => {
+      if (!payload || payload.requestId !== state.remote.pairingRequestId) return;
+      state.remote.pairingActive = false;
+      state.remote.pairingPin = null;
+      state.remote.pairingRequestId = "";
       render();
     });
   }
   if (desktop.airplay?.onPairingSuccess) {
-    desktop.airplay.onPairingSuccess(() => {
+    desktop.airplay.onPairingSuccess((device) => {
+      const wasShowing = state.remote.pairingActive || Boolean(state.remote.qrUrl);
       state.remote.pairingPin = null;
       state.remote.pairingActive = false;
-      render();
+      state.remote.pairingRequestId = "";
+      state.remote.qrUrl = null;
+      showToast(`${device?.name || "Điện thoại"} đã kết nối`);
+      if (wasShowing || state.screen === "settings") render();
     });
   }
+  if (desktop.airplay?.onDevicesChanged) {
+    desktop.airplay.onDevicesChanged((devices) => {
+      state.remote.devices = Array.isArray(devices) ? devices : [];
+      if (state.screen === "settings") render();
+    });
+  }
+  refreshRemoteState();
   if (desktop.airplay?.onPowerState) {
     desktop.airplay.onPowerState((payload) => {
       const nextAwake = Boolean(payload?.active);
@@ -2896,6 +4147,22 @@ function initAirPlayPairingBridge() {
   }
 }
 
-initDownloadBridge();
-initAirPlayPairingBridge();
-render();
+async function bootstrap() {
+  applyTheme(desktop.boot?.theme || "dark");
+  state.intro = shouldShowIntro();
+  loadPlayerPrefs();
+  initDownloadBridge();
+  initCaptureBridge();
+  initSettingsBridge();
+  initAirPlayPairingBridge();
+  render();
+  initOpenFilesBridge();
+  if (state.intro) introTimer = window.setTimeout(dismissIntro, introDurationMs);
+  await refreshSettings();
+  refreshAppInfo();
+  refreshRecent();
+  refreshDiskSpace();
+  startChromePolling();
+}
+
+bootstrap();

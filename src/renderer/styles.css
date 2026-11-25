@@ -1764,6 +1764,19 @@ img {
   font-weight: 600;
 }
 
+.setting-subhead {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.setting-row.is-end {
+  justify-content: flex-end;
+}
+
 .setting-mono {
   overflow: hidden;
   color: var(--muted);

@@ -153,6 +153,10 @@ const state = {
     loading: false,
     pairingPin: null,
     pairingActive: false,
+    pairingRequestId: "",
+    pairingDevice: "",
+    devices: [],
+    running: false,
     awake: false,
     awakeReason: ""
   }
@@ -343,7 +347,7 @@ function restoreFocus(snapshot) {
 function modalKey() {
   const capture = state.capture.queue[0];
   if (capture) return `capture:${capture.captureId}`;
-  if (state.remote.pairingActive && state.remote.pairingPin) return `pin:${state.remote.pairingPin}`;
+  if (state.remote.pairingActive) return `pair:${state.remote.pairingRequestId || state.remote.pairingPin}`;
   if (state.remote.qrUrl || state.remote.loading) return "qr";
   return "";
 }
@@ -903,13 +907,7 @@ function renderSettings() {
 
         <div class="settings-col">
           ${renderChromeSettings()}
-          <section class="card settings-card is-row">
-            <div class="setting-text">
-              <h2 class="h2">Remote iPhone</h2>
-              <span class="setting-hint">Quét mã QR để điều khiển và xem video từ điện thoại qua Wi-Fi.</span>
-            </div>
-            <button type="button" class="btn secondary" data-action="start-remote">Bật Remote</button>
-          </section>
+          ${renderRemoteSettings()}
           <section class="soon-card is-column">
             <div class="soon-title"><h2 class="h2">Phụ đề AI</h2><span class="soon-badge">Sắp có</span></div>
             <span>Whisper, Claude và ChatGPT sẽ được cấu hình ở đây.</span>
@@ -918,6 +916,67 @@ function renderSettings() {
       </div>
     </section>
   `;
+}
+
+function renderRemoteSettings() {
+  const remote = state.remote;
+  const autoStart = state.settings?.remoteAutoStart !== false;
+  const devices = Array.isArray(remote.devices) ? remote.devices : [];
+  const deviceRows = devices.map((device) => `
+    <div class="setting-row">
+      <div class="setting-text">
+        <span class="setting-label">${escapeHtml(device.name || "Thiết bị")}</span>
+        <span class="setting-hint">Lần cuối: ${escapeHtml(formatShortDate(device.lastSeen) || "—")}</span>
+      </div>
+      <button type="button" class="btn ghost danger-text" data-action="remote-revoke" data-id="${escapeAttr(device.id)}">Gỡ</button>
+    </div>
+  `).join("");
+  return `
+    <section class="card settings-card">
+      <div class="setting-row">
+        <div class="setting-text">
+          <h2 class="h2">Remote iPhone</h2>
+          <span class="setting-hint">${remote.running ? "Đang bật · điện thoại đã ghép nối tự kết nối qua Wi-Fi." : "Xem video trên điện thoại qua Wi-Fi. Ghép nối một lần bằng QR hoặc bấm Cho phép."}</span>
+        </div>
+        <button type="button" class="btn secondary" data-action="start-remote">${remote.running ? "Hiện mã QR" : "Bật Remote"}</button>
+      </div>
+      <div class="setting-row">
+        <div class="setting-text">
+          <span class="setting-label">Tự bật khi mở ViSUBLY</span>
+          <span class="setting-hint">Khi đã có thiết bị ghép nối, điện thoại vào được mà không cần bật tay.</span>
+        </div>
+        <button type="button" class="switch ${autoStart ? "is-on" : ""}" role="switch" aria-checked="${autoStart}" aria-label="Tự bật Remote khi mở ViSUBLY" data-action="toggle-remote-autostart"><span class="switch-knob"></span></button>
+      </div>
+      ${devices.length ? `<div class="setting-subhead">Thiết bị đã ghép nối (${devices.length})</div>${deviceRows}
+        <div class="setting-row is-end">${btn("Gỡ tất cả", "remote-revoke-all", "ghost danger-text")}</div>`
+        : `<span class="setting-hint">Chưa có thiết bị nào được ghép nối.</span>`}
+    </section>
+  `;
+}
+
+async function refreshRemoteState() {
+  if (!desktop.airplay?.listDevices) return;
+  try {
+    const [devices, info] = await Promise.all([desktop.airplay.listDevices(), desktop.airplay.info()]);
+    state.remote.devices = Array.isArray(devices) ? devices : [];
+    state.remote.running = Boolean(info?.running);
+  } catch {
+    // Remote is optional; keep the last known state.
+  }
+  if (state.screen === "settings") render();
+}
+
+function respondRemotePairing(allow) {
+  const requestId = state.remote.pairingRequestId;
+  state.remote.pairingActive = false;
+  state.remote.pairingPin = null;
+  state.remote.pairingRequestId = "";
+  render();
+  if (requestId && desktop.airplay?.respondPairing) {
+    desktop.airplay.respondPairing(requestId, allow).then(() => {
+      if (allow) showToast("Đã cho phép thiết bị kết nối");
+    }).catch(() => {});
+  }
 }
 
 function renderChromeSettings() {
@@ -1013,15 +1072,19 @@ function renderIntro() {
 
 function renderRemoteModal() {
   if (state.capture.queue.length) return "";
-  if (state.remote.pairingActive && state.remote.pairingPin) {
+  if (state.remote.pairingActive) {
+    const device = state.remote.pairingDevice || "Một thiết bị";
     return `
       <div class="dialog-overlay">
-        <section class="dialog is-narrow is-center" role="dialog" aria-modal="true" aria-labelledby="pinTitle">
+        <section class="dialog is-narrow is-center" role="dialog" aria-modal="true" aria-labelledby="pairTitle">
           <span class="dialog-icon">${icon("phone", { size: 26, stroke: 2 })}</span>
-          <h2 id="pinTitle" class="dialog-title">Yêu cầu ghép nối</h2>
-          <p class="dialog-text">Nhập mã PIN sau trên điện thoại của bạn:</p>
-          <div class="pin-code">${escapeHtml(state.remote.pairingPin)}</div>
-          <div class="dialog-actions is-center">${btn("Đóng", "close-remote", "secondary")}</div>
+          <h2 id="pairTitle" class="dialog-title">Cho phép kết nối?</h2>
+          <p class="dialog-text"><strong>${escapeHtml(device)}</strong> muốn xem video trên máy tính này qua Wi-Fi. Chỉ cần cho phép một lần, lần sau thiết bị tự kết nối.</p>
+          <div class="dialog-actions is-center">
+            ${btn("Từ chối", "remote-deny", "secondary")}
+            ${btn("Cho phép", "remote-allow", "primary")}
+          </div>
+          ${state.remote.pairingPin ? `<p class="dialog-note">Dùng app ViSUBLY cũ trên điện thoại? Nhập mã <strong class="mono-text">${escapeHtml(state.remote.pairingPin)}</strong></p>` : ""}
         </section>
       </div>
     `;
@@ -1032,7 +1095,7 @@ function renderRemoteModal() {
     <div class="dialog-overlay">
       <section class="dialog is-narrow is-center" role="dialog" aria-modal="true" aria-labelledby="remoteTitle">
         <h2 id="remoteTitle" class="dialog-title">Remote iPhone</h2>
-        <p class="dialog-text">Quét mã QR bằng camera iPhone để điều khiển và xem video qua Wi-Fi.</p>
+        <p class="dialog-text">Quét mã QR bằng camera iPhone để xem video qua Wi-Fi. Chỉ cần quét một lần — lần sau mở lại trang (hoặc biểu tượng trên màn hình chính) là vào.</p>
         ${state.remote.loading
           ? `<div class="qr-box is-loading"><span class="spinner" aria-hidden="true"></span><span>Đang bật…</span></div>`
           : `<img class="qr-box" src="${escapeAttr(state.remote.qrUrl)}" alt="Mã QR để mở Remote trên điện thoại" width="232" height="232">`}
@@ -1576,6 +1639,8 @@ function closeTopDialog() {
 }
 
 function closeRemoteModal() {
+  // Closing the approval dialog (Esc / ×) means "Từ chối".
+  if (state.remote.pairingActive && state.remote.pairingRequestId) return respondRemotePairing(false);
   state.remote.qrUrl = null;
   state.remote.testUrl = null;
   state.remote.loading = false;
@@ -1623,6 +1688,20 @@ document.addEventListener("click", async (event) => {
     return undefined;
   }
   if (action === "close-remote") return closeRemoteModal();
+  if (action === "remote-allow") return respondRemotePairing(true);
+  if (action === "remote-deny") return respondRemotePairing(false);
+  if (action === "toggle-remote-autostart") return updateSettings({ remoteAutoStart: !(state.settings?.remoteAutoStart !== false) });
+  if (action === "remote-revoke") {
+    await desktop.airplay?.revokeDevice?.(id);
+    showToast("Đã gỡ thiết bị");
+    return refreshRemoteState();
+  }
+  if (action === "remote-revoke-all") {
+    if (!window.confirm("Gỡ tất cả thiết bị đã ghép nối? Các điện thoại sẽ phải kết nối lại.")) return undefined;
+    await desktop.airplay?.revokeAllDevices?.();
+    showToast("Đã gỡ tất cả thiết bị");
+    return refreshRemoteState();
+  }
 
   // Capture dialog
   if (action === "capture-skip") return skipCurrentCapture();
@@ -2595,7 +2674,9 @@ function startRemote() {
     .start()
     .then((info) => {
       state.remote.qrUrl = info?.qrUrl || null;
-      state.remote.testUrl = info?.baseUrl ? `${info.baseUrl}/?token=${info.pairingToken}` : null;
+      state.remote.testUrl = info?.pairingUrl || (info?.baseUrl ? `${info.baseUrl}/?token=${info.pairingToken}` : null);
+      state.remote.running = Boolean(info?.running ?? true);
+      if (Array.isArray(info?.devices)) state.remote.devices = info.devices;
       state.remote.loading = false;
       if (!state.remote.qrUrl) showToast("Không bật được Remote iPhone");
       render();
@@ -4015,19 +4096,46 @@ function escapeAttr(value) {
 
 function initAirPlayPairingBridge() {
   if (desktop.airplay?.onPairingRequested) {
-    desktop.airplay.onPairingRequested((pin) => {
-      state.remote.pairingPin = pin;
+    desktop.airplay.onPairingRequested((request) => {
+      // New servers send { requestId, deviceName, pin }; a bare string is the old PIN-only event.
+      const payload = typeof request === "object" && request ? request : { pin: request };
+      state.remote.pairingRequestId = String(payload.requestId || "");
+      state.remote.pairingDevice = String(payload.deviceName || "");
+      state.remote.pairingPin = payload.pin ? String(payload.pin) : null;
       state.remote.pairingActive = true;
+      state.remote.qrUrl = null;
+      state.remote.loading = false;
+      if (state.intro) dismissIntro();
+      render();
+    });
+  }
+  if (desktop.airplay?.onPairingResolved) {
+    desktop.airplay.onPairingResolved((payload) => {
+      if (!payload || payload.requestId !== state.remote.pairingRequestId) return;
+      state.remote.pairingActive = false;
+      state.remote.pairingPin = null;
+      state.remote.pairingRequestId = "";
       render();
     });
   }
   if (desktop.airplay?.onPairingSuccess) {
-    desktop.airplay.onPairingSuccess(() => {
+    desktop.airplay.onPairingSuccess((device) => {
+      const wasShowing = state.remote.pairingActive || Boolean(state.remote.qrUrl);
       state.remote.pairingPin = null;
       state.remote.pairingActive = false;
-      render();
+      state.remote.pairingRequestId = "";
+      state.remote.qrUrl = null;
+      showToast(`${device?.name || "Điện thoại"} đã kết nối`);
+      if (wasShowing || state.screen === "settings") render();
     });
   }
+  if (desktop.airplay?.onDevicesChanged) {
+    desktop.airplay.onDevicesChanged((devices) => {
+      state.remote.devices = Array.isArray(devices) ? devices : [];
+      if (state.screen === "settings") render();
+    });
+  }
+  refreshRemoteState();
   if (desktop.airplay?.onPowerState) {
     desktop.airplay.onPowerState((payload) => {
       const nextAwake = Boolean(payload?.active);

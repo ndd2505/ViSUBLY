@@ -77,7 +77,9 @@ const defaultSettings = Object.freeze({
   captureBridgePort: 47653,
   // Browser captures shorter than this (previews, ads) are hidden in the extension; 0 = off.
   ignoreShortVideosSec: 120,
-  theme: "dark"
+  theme: "dark",
+  // Start the iPhone Remote server with the app once at least one phone is trusted.
+  remoteAutoStart: true
 });
 const themeModes = new Set(["dark", "light", "system"]);
 const ignoreShortVideoChoices = new Set([0, 30, 60, 120, 300]);
@@ -175,6 +177,8 @@ if (!gotSingleInstanceLock) {
     if (app.isReady()) focusMainWindow();
   });
   queueOpenFiles(extractOpenPaths(process.argv, process.cwd()));
+  // Trusted phones are stored next to the other user data; the PNG icon is served to the phone page.
+  airplayServer.configure({ dataDir: runtimePaths.userData, iconPath: path.join(projectRoot, "build", "icon.png") });
   const legacy = migrateLegacyQueue();
   settings = loadSettings(legacy);
   applySettingsToQueue();
@@ -283,6 +287,9 @@ if (gotSingleInstanceLock) {
   app.whenReady().then(() => {
     createWindow();
     startCaptureBridge();
+    if (settings.remoteAutoStart && airplayServer.hasDevices()) {
+      airplayServer.start().catch((error) => logMain("warn", `Remote auto-start failed: ${error.message}`));
+    }
     setTimeout(cleanupStaleEngineTemp, 15000);
 
     app.on("activate", () => {
@@ -578,16 +585,32 @@ ipcMain.handle("airplay:info", async () => {
   return airplayServer.getServerInfo();
 });
 
-airplayServer.on("pairing_requested", (pin) => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("airplay:pairing-requested", pin);
-  }
+ipcMain.handle("airplay:respondPairing", (_event, payload = {}) => ({
+  ok: airplayServer.respondPairing(String(payload.requestId || ""), Boolean(payload.allow))
+}));
+ipcMain.handle("airplay:listDevices", () => airplayServer.listDevices());
+ipcMain.handle("airplay:revokeDevice", (_event, id) => ({ ok: airplayServer.revokeDevice(String(id || "")) }));
+ipcMain.handle("airplay:revokeAllDevices", () => {
+  airplayServer.revokeAllDevices();
+  return { ok: true };
 });
 
-airplayServer.on("pairing_success", () => {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("airplay:pairing-success");
-  }
+airplayServer.on("pairing_requested", (request) => {
+  // { requestId, deviceName, pin }: the renderer asks "Cho phép / Từ chối"; the PIN is for old phone apps.
+  focusMainWindow();
+  sendToRenderer("airplay:pairing-requested", request);
+});
+
+airplayServer.on("pairing_resolved", (payload) => {
+  sendToRenderer("airplay:pairing-resolved", payload);
+});
+
+airplayServer.on("pairing_success", (device) => {
+  sendToRenderer("airplay:pairing-success", device || null);
+});
+
+airplayServer.on("devices_changed", (devices) => {
+  sendToRenderer("airplay:devices-changed", devices);
 });
 
 airplayServer.on("activity_changed", (activity) => {
@@ -1826,6 +1849,7 @@ function sanitizeSettings(input = {}, base = defaultSettings) {
   next.captureBridgePort = clampInt(input.captureBridgePort, 1024, 65535, next.captureBridgePort);
   if (ignoreShortVideoChoices.has(Number(input.ignoreShortVideosSec))) next.ignoreShortVideosSec = Number(input.ignoreShortVideosSec);
   if (themeModes.has(input.theme)) next.theme = input.theme;
+  if (typeof input.remoteAutoStart === "boolean") next.remoteAutoStart = input.remoteAutoStart;
   return next;
 }
 

@@ -68,6 +68,12 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
     start: () => ipcRenderer.invoke("airplay:start"),
     stop: () => ipcRenderer.invoke("airplay:stop"),
     info: () => ipcRenderer.invoke("airplay:info"),
+    respondPairing: (requestId, allow) => ipcRenderer.invoke("airplay:respondPairing", { requestId, allow }),
+    listDevices: () => ipcRenderer.invoke("airplay:listDevices"),
+    revokeDevice: (id) => ipcRenderer.invoke("airplay:revokeDevice", id),
+    revokeAllDevices: () => ipcRenderer.invoke("airplay:revokeAllDevices"),
+    onPairingResolved: subscribe("airplay:pairing-resolved"),
+    onDevicesChanged: subscribe("airplay:devices-changed"),
     onPairingRequested: subscribe("airplay:pairing-requested"),
     onPairingSuccess: (callback) => {
       const listener = () => callback();

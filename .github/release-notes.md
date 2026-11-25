@@ -1,3 +1,14 @@
+## What's new in 1.2.2
+
+- **Faster downloads.** Each video now uses several connections at once, like IDM.
+  - HLS segments (TS, fMP4, AES-128) download in parallel and are joined on your PC; large MP4 files are split into ranges.
+  - On a test server capped at 2 MB/s per connection: AES-128 HLS 5× faster, a 148 MB MP4 7× faster.
+  - Backs off automatically when a site limits connections. New setting: **Số kết nối mỗi video** (Tự động / Ít / Nhiều).
+- **ViSUBLY Grabber 1.2.0** (reload the extension in `chrome://extensions` after updating).
+  - Marks the video that is playing now; reloading the page clears the list; videos from the previous page move to *Đã thấy trước đó*.
+  - Finds hidden playlists (service workers, renamed files, iframes) and notices DRM. Turn off **Dò video ẩn** at the bottom of the popup if a site misbehaves.
+  - **Không thấy video? Chẩn đoán** explains why nothing shows and copies a report without cookies or full links.
+
 ## What's new in 1.2 (1.2.1)
 
 - **Nâng cấp video (Upscale video) tab.** Turn a 360p / 480p video into a sharper 720p–4K copy, one video at a time.

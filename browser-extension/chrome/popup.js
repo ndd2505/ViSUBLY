@@ -46,8 +46,14 @@ function nameLine(g) {
   return name;
 }
 
+// "▶ Đang phát" / "⏸ Đang dừng trên trang": the video on the page right now.
+function nowTag(g) {
+  return el('span', g.playing === 'paused' ? 'now paused' : 'now', g.playing === 'paused' ? '⏸ Đang dừng trên trang' : '▶ Đang phát');
+}
+
 function card(g) {
-  const li = el('li', 'item');
+  const li = el('li', g.playing ? 'item is-playing' : 'item');
+  if (g.playing) li.append(nowTag(g));
   const head = el('div', 'head');
   const meta = el('div', 'meta');
   meta.append(nameLine(g), metaLine(g));
@@ -107,14 +113,17 @@ function render(state) {
   $('notRunning').hidden = state.running;
   $('pairBox').hidden = !(state.running && !state.paired);
   $('forget').hidden = !state.paired;
+  if (typeof state.sniff === 'boolean' && !sniffBusy) $('sniffToggle').checked = state.sniff;
   if (!state.running) { dot.className = 'dot bad'; $('connText').textContent = 'ViSUBLY chưa mở'; }
   else if (!state.paired) { dot.className = 'dot warn'; $('connText').textContent = 'Chưa ghép nối'; }
   else { dot.className = 'dot ok'; $('connText').textContent = 'Đã kết nối'; }
 
   const groups = state.groups || [];
   const short = state.short || [];
-  $('note').hidden = !state.note;
-  $('note').textContent = state.note || '';
+  // DRM pages: say so up front instead of a puzzling "no video".
+  const note = state.drm ? `Trang này dùng DRM (${state.drm}): video có bảo vệ bản quyền, ViSUBLY không tải được.` : state.note;
+  $('note').hidden = !note;
+  $('note').textContent = note || '';
   const list = $('list');
   list.textContent = '';
   for (const g of groups) list.append(card(g));
@@ -126,6 +135,12 @@ function render(state) {
   const sl = $('shortList');
   sl.textContent = '';
   for (const g of short) sl.append(shortRow(g));
+  const previous = state.previous || [];
+  $('prevBox').hidden = !previous.length;
+  $('prevCount').textContent = String(previous.length);
+  const pl = $('prevList');
+  pl.textContent = '';
+  for (const g of previous) pl.append(shortRow(g));
 }
 function rerender() { if (lastState) render(lastState); }
 
@@ -158,5 +173,35 @@ $('pairBtn').addEventListener('click', async () => {
 $('code').addEventListener('input', (e) => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); });
 $('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('pairBtn').click(); });
 $('forget').addEventListener('click', async () => { await send({ type: 'unpair' }); refresh(); });
+
+// "Không thấy video? Chẩn đoán": the background's guess at why, plus a copyable report.
+let sniffBusy = false;
+$('sniffToggle').addEventListener('change', async (e) => {
+  sniffBusy = true;
+  const r = await send({ type: 'setSniff', enabled: e.target.checked });
+  sniffBusy = false;
+  if (r && typeof r.sniff === 'boolean') e.target.checked = r.sniff;
+  $('sniffHint').hidden = false;
+});
+
+let diagReport = '';
+$('diagBtn').addEventListener('click', async () => {
+  const box = $('diagBox');
+  if (!box.hidden) { box.hidden = true; return; }
+  const r = tabId == null ? null : await send({ type: 'diag', tabId });
+  const reasons = $('diagReasons');
+  reasons.textContent = '';
+  for (const line of (r && r.reasons) || ['Không đọc được thông tin của tab này.']) reasons.append(el('li', '', line));
+  const unknown = $('diagUnknown');
+  unknown.textContent = '';
+  for (const u of (r && r.unknown) || []) unknown.append(el('li', '', u));
+  unknown.hidden = !unknown.childElementCount;
+  diagReport = (r && r.report) || '';
+  $('diagCopied').hidden = true;
+  box.hidden = false;
+});
+$('diagCopy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(diagReport); $('diagCopied').hidden = false; } catch { /* ignore */ }
+});
 
 refresh();

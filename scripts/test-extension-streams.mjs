@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   upsertStream, buildGroups, isShortGroup, isRenditionChild, pickBestGroup, describeGroups,
   markPlaybackStart, formatDuration, formatApproxSize, streamKey, SHORT_MP4_BYTES,
+  noteSegment, findPlayingGroup, isSegmentLike,
 } from '../browser-extension/chrome/lib/streams.js';
 
 let passed = 0;
@@ -180,6 +181,64 @@ const masterProbe = (base, durationSec = 2472, extra = {}) => ({
   assert.equal(pickBestGroup(buildGroups(mp4), { src: 'https://cdn.example.com/b.mp4' }).root.url, 'https://cdn.example.com/b.mp4', 'direct src match');
   assert.equal(pickBestGroup([], {}), null);
   ok('pill picks the main video, not a preview');
+}
+
+// 8. "Đang phát": segment activity marks the playlist being played (reload / several videos)
+{
+  const list = [];
+  add(list, 'https://cdn.example.com/v/first/index.m3u8');
+  add(list, 'https://cdn.example.com/v/first/720/index.m3u8');
+  add(list, 'https://cdn.example.com/v/second/index.m3u8');
+  add(list, 'https://cdn.example.com/v/second/1080/index.m3u8');
+  const t0 = clock + 1000;
+  // The first video played earlier: its segments were fetched long ago.
+  assert.equal(noteSegment(list, 'https://cdn.example.com/v/first/720/seg_00041.ts', t0), streamKey('https://cdn.example.com/v/first/720/index.m3u8'));
+  // Now the second one is playing: its 1080p rendition fetches segments.
+  const t1 = t0 + 60000;
+  assert.equal(noteSegment(list, 'https://cdn.example.com/v/second/1080/seg_00003.ts', t1), streamKey('https://cdn.example.com/v/second/1080/index.m3u8'), 'longest folder prefix wins');
+  assert.equal(noteSegment(list, 'https://other.example/seg.ts', t1), null, 'other origin ignored');
+  const groups = buildGroups(list);
+  assert.equal(groups.length, 2);
+  const playing = findPlayingGroup(groups, { playing: true, at: t1 }, t1 + 2000);
+  assert.equal(playing.root.url, 'https://cdn.example.com/v/second/index.m3u8', 'the video fetching segments now');
+  assert.equal(findPlayingGroup(groups, { playing: true, at: t1 }, t1 + 60000), null, 'stale activity and no other evidence: no label rather than a wrong one');
+  const view = describeGroups(groups, { playingId: playing.id, playState: 'playing' });
+  assert.equal(view.groups[0].id, playing.id, 'playing card first');
+  assert.equal(view.groups[0].playing, 'playing');
+  assert.equal(view.groups[1].playing, '');
+  assert.equal(describeGroups(groups, { playingId: playing.id, playState: 'paused' }).groups[0].playing, 'paused');
+  assert.equal(pickBestGroup(groups, { playing: true, at: t1 }, t1 + 2000).id, playing.id, 'pill sends the playing video');
+  ok('segment activity tells which video is playing');
+}
+
+// 9. segment detection: extensions and content types
+{
+  assert.equal(isSegmentLike('/v/a/seg_001.ts'), true);
+  assert.equal(isSegmentLike('/v/a/chunk-5.m4s'), true);
+  assert.equal(isSegmentLike('/v/a/frag', 'video/iso.segment'), true);
+  assert.equal(isSegmentLike('/v/a/frag', 'video/mp2t'), true);
+  assert.equal(isSegmentLike('/v/a/part', 'video/mp4'), true, 'extension-less fMP4 fragment');
+  assert.equal(isSegmentLike('/v/a/movie.mp4', 'video/mp4'), false, 'a real mp4 file is not a segment');
+  assert.equal(isSegmentLike('/v/a/index.m3u8', 'application/vnd.apple.mpegurl'), false);
+  ok('segment detection');
+}
+
+// 10. page sessions: videos from before an in-site navigation go to "previous"
+{
+  const list = [];
+  add(list, 'https://cdn.example.com/v/old/index.m3u8', 'hls', { ctx: { navId: 1 } });
+  add(list, 'https://cdn.example.com/v/new/index.m3u8', 'hls', { ctx: { navId: 2 } });
+  const groups = buildGroups(list);
+  const view = describeGroups(groups, { navId: 2 });
+  assert.equal(view.groups.length, 1);
+  assert.equal(view.groups[0].hint, '');
+  assert.equal(view.previous.length, 1);
+  assert.equal(view.previous[0].title, 'Video trước đó 1');
+  // Re-requested on the new page -> belongs to the current page again.
+  add(list, 'https://cdn.example.com/v/old/index.m3u8', 'hls', { ctx: { navId: 2 } });
+  assert.equal(describeGroups(buildGroups(list), { navId: 2 }).previous.length, 0);
+  assert.equal(describeGroups(groups).previous.length, 0, 'no navId: everything is current (old callers)');
+  ok('page sessions split current and previous videos');
 }
 
 // 7. formatting

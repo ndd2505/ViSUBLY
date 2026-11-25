@@ -84,7 +84,8 @@ $pyiArgs = @(
   "--workpath", $workDir,
   "--specpath", $workDir,
   "--paths", $engineSrc,
-  "--hidden-import", "hls2mp4"
+  "--hidden-import", "hls2mp4",
+  "--hidden-import", "fastdl"
 )
 if (Test-Path $icon) { $pyiArgs += @("--icon", $icon) }
 $pyiArgs += $runner

@@ -41,6 +41,14 @@ button.primary:hover:not(:disabled) { background: #2d2636; }
 .meta { flex: 1; min-width: 0; }
 .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hint-inline { margin-left: 6px; font-weight: 500; font-size: 12px; color: rgba(26,22,32,.5); }
+.diag-btn { display: block; margin: 6px auto 2px; font-size: 12px; }
+.diag { margin: 4px 8px 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: #FBF9F4; display: flex; flex-direction: column; gap: 8px; }
+.diag-title { font-weight: 700; font-size: 13px; }
+.diag-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; line-height: 1.45; }
+.diag-list.unknown { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: rgba(26,22,32,.7); }
+.now { display: inline-flex; align-items: center; gap: 4px; align-self: flex-start; padding: 2px 8px; border-radius: 999px; background: var(--lime); color: var(--ink); font-size: 11px; font-weight: 800; letter-spacing: .02em; }
+.now.paused { background: #EEE9DF; color: rgba(26,22,32,.75); }
+.item.is-playing { border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink) inset; }
 .live { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 5px; background: var(--red); color: #fff; font-size: 10px; font-weight: 800; letter-spacing: .03em; vertical-align: 1px; }
 .chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 6px; }
 .chip { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-height: 44px; padding: 6px 4px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); }
@@ -66,6 +74,10 @@ button.primary:hover:not(:disabled) { background: #2d2636; }
 .status.ok { color: #3d7a00; }
 .status.bad { color: var(--red); }
 .empty { margin: 0; padding: 28px 24px; text-align: center; color: rgba(26,22,32,.65); }
-footer { padding: 6px 14px 12px; text-align: right; }
+footer { padding: 6px 14px 12px; display: flex; align-items: center; gap: 10px; }
+footer #forget { margin-left: auto; }
+.switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: rgba(26,22,32,.7); cursor: pointer; user-select: none; }
+.switch input { margin: 0; accent-color: var(--ink); cursor: pointer; }
+footer .hint { margin: 0; font-size: 11px; }
 button.link { background: none; padding: 2px 0; color: rgba(26,22,32,.55); text-decoration: underline; font-size: 12px; }
 button.link:hover { color: var(--red); }

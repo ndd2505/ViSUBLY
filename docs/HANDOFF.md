@@ -1,6 +1,6 @@
 # ViSUBLY — Ghi chú bàn giao (kết thúc Giai đoạn 1 · v1.0)
 
-> Cập nhật: 2026-11-25 · Nhánh chính: `main` · App: **Visubly Studio 1.2.1** · Extension: **ViSUBLY Grabber 1.1.2** · Release: GitHub Actions khi push tag `v*`
+> Cập nhật: 2026-11-25 · Nhánh chính: `main` · App: **Visubly Studio 1.2.2** · Extension: **ViSUBLY Grabber 1.2.0** · Release: GitHub Actions khi push tag `v*`
 
 Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) để nắm nhanh trạng thái và làm tiếp tính năng mới.
 
@@ -55,13 +55,17 @@ src/main/preload.js         window.visublyDesktop (API cho renderer)
 src/main/capture-bridge.js  HTTP 127.0.0.1:47653(+1..3): /v1/ping, /v1/pair, /v1/capture, /v1/probe
 src/main/airplay-server.js  Remote iPhone (express + ws + bonjour)
 src/renderer/               index.html, theme-boot.js (áp theme trước khi vẽ), app.js (UI vanilla JS), styles.css, fonts.css
-engine/downloader/          hls2mp4.py + hls2mp4_runner.py (bản copy từ D:\Projects\Extracting Video — nguồn gốc chỉ đọc)
+engine/downloader/          hls2mp4.py + hls2mp4_runner.py (bản copy từ D:\Projects\Extracting Video — nguồn gốc chỉ đọc) + fastdl.py (tải song song, của ViSUBLY; test: test_fastdl.py)
 browser-extension/chrome/   MV3: background.js, lib/streams.js (gom nhóm, test được bằng Node), popup.*, content.js, app-client.js
 build/                      icon.ico/png, installerSidebar.bmp, installerHeader.bmp
 scripts/                    build-downloader.ps1, check-app.js, test-capture-bridge.js, test-extension-streams.mjs, after-pack.js
 ```
 
 **Renderer** (`app.js`): vẽ lại toàn bộ bằng `innerHTML` nhưng **giữ nguyên phần tử `<video>`** (không tạo lại) để không giật/mất fullscreen — đừng phá cơ chế này (`render()`, `renderPlayerWhileFullscreen`, `patchPlayerStage`).
+
+**Tải song song (fastdl.py, 1.2.2)**: một tiến trình `curl --parallel` (dùng lại kết nối) cho mọi đoạn HLS; playlist media được viết lại thành bản local (đoạn, `EXT-X-MAP`, khoá AES-128) rồi ffmpeg chỉ remux từ ổ đĩa; MP4 có Range → chia tối đa 16 phần (≥ 4 MB/phần), ghép lại, kiểm tra đủ byte. Config curl: **mỗi lượt tải một khối, ngăn bằng `next`** (`range` trong config phẳng là tuỳ chọn chung → mọi phần nhận Range cuối; đã dính lỗi này), header/cookie nằm trong file config (không lộ trên dòng lệnh). Lỗi → lượt 2 với ½ kết nối → lượt 3 với 1 kết nối → urllib (báo lỗi khi HTTP ≥ 400; `core.fetch_bytes` dùng curl không `--fail` nên sẽ lưu trang lỗi 404 như dữ liệu) → cuối cùng ffmpeg như cũ. Dừng lượt sớm khi 429/403/503 chiếm ≥ ¼; canh treo 45 s không có byte mới. Ưu tiên `System32\curl.exe`: curl 8.19 của Git treo khi `--parallel` + `--retry` gặp 429. Live / SAMPLE-AES / master → không dùng đường nhanh. Cờ `--no-fast` để tắt. Bench (server 2 MB/s mỗi kết nối, 8 kết nối): HLS .ts 1,3×, fMP4 2,6×, AES-128 5,1×, MP4 148 MB 7× (trùng từng byte).
+
+**Dò video ẩn (sniff.js, extension 1.2.0)**: chạy trong JS world của trang (MAIN, document_start, mọi frame), **đăng ký động** bằng `chrome.scripting.registerContentScripts` (id `visubly-sniff`) để người dùng tắt được (công tắc cuối popup, `storage.local.sniffEnabled`, mặc định bật; tắt = huỷ đăng ký, áp dụng khi tải lại trang). Chỉ đọc: bọc fetch/XHR để nhận playlist theo nội dung (`#EXTM3U`, `<MPD`) khi URL/kiểu bị giấu, bắt DRM (EME) và MSE; gửi qua `postMessage` → content.js → background (`sniffed`/`drm`/`mse`). Background còn gán request của service worker (tabId -1) cho tab theo origin, xoá danh sách khi tải lại trang (`onBeforeRequest` main_frame) và có `diag` cho nút "Chẩn đoán".
 
 **Content script extension**: chỉ chèn nút nổi sau `load` + 1.5 s + idle, gắn vào `<html>` (không vào `<body>`) — tránh làm sập trang Next.js/React đang hydrate.
 

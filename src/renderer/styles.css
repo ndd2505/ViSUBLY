@@ -1792,6 +1792,17 @@ img {
   border-radius: 8px;
 }
 
+/* Text choices next to a long hint: keep labels on one line, let the hint wrap instead. */
+.segmented.is-nowrap {
+  flex: none;
+}
+
+.segmented.is-nowrap .seg-btn {
+  height: 36px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
 .seg-btn:hover:not(.is-on) {
   background: var(--hover);
 }

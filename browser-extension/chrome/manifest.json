@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "ViSUBLY Grabber",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "Tự động phát hiện video (HLS, DASH, MP4) trên trang và gửi sang ViSUBLY để tải.",
-  "minimum_chrome_version": "110",
+  "minimum_chrome_version": "111",
   "permissions": [
     "webRequest",
     "storage",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -35,7 +36,7 @@
         "content.js"
       ],
       "run_at": "document_idle",
-      "all_frames": false
+      "all_frames": true
     }
   ],
   "icons": {

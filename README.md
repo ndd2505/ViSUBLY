@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.2.1-D7FF61?labelColor=1A1620">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.2.2-D7FF61?labelColor=1A1620">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-1A1620">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-1A1620">
   <img alt="Chrome extension" src="https://img.shields.io/badge/Chrome-MV3%20extension-1A1620">
@@ -55,6 +55,9 @@
 - Detects **HLS (`.m3u8`)**, **DASH (`.mpd`)** and **MP4** streams while you browse.
 - **One card per video.** Master and variant playlists are merged, and each card offers quality chips (`1080p ~1.1 GB`, `720p ~648 MB`, …).
 - **Hides previews.** Autoplaying thumbnails and short ads are folded into a collapsed section. The threshold is set in **Cài đặt** (Settings): Off / 30 s / 1 min / 2 min / 5 min.
+- Marks the video that is **playing now** (▶ Đang phát / ⏸ Đang dừng). Reloading the page clears the list, and videos from the previous page move to **Đã thấy trước đó** (Seen earlier).
+- **Finds hidden playlists**: ones fetched by a service worker, renamed ones (`.txt`, `.png`…), and players inside iframes. If a site misbehaves, turn off **Dò video ẩn** (Hidden video detection) at the bottom of the popup.
+- **"Không thấy video? Chẩn đoán"** (No video? Diagnose) explains why a page shows nothing (DRM, players that stream over WebSocket/P2P, unknown formats) and copies a short report without cookies or full links.
 - A floating **"Tải bằng ViSUBLY"** ("Download with ViSUBLY") button appears on the video you are watching.
 - The extension sends the page's Referer, Origin, User‑Agent and Cookie along with the link, so protected CDNs keep working.
 - The app's **"Tải video này?"** ("Download this video?") dialog opens with the quality preselected. You can rename the file, pick a folder, then choose **Tải ngay** (Download now) or **Thêm vào hàng đợi** (Add to queue).
@@ -66,6 +69,7 @@
 
 - Accepts a pasted URL, a full cURL command, or a link sent by the extension.
 - Runs **1–3 downloads in parallel**. Each row shows progress, speed and ETA, with filters for downloading, queued, done and failed items.
+- **Fast, IDM-style downloading.** Each video uses several connections at once: HLS segments (TS, fMP4, AES-128) are fetched in parallel and joined locally, and large MP4 files are split into byte ranges. On a test server capped at 2 MB/s per connection, AES-128 HLS downloaded 5× faster and a 148 MB MP4 7× faster than in 1.2.1. When a site limits connections (HTTP 429/403), ViSUBLY backs off automatically. **Số kết nối mỗi video** (Connections per video) in Settings: Tự động / Ít / Nhiều (Auto / Few / Many).
 - Failures get a readable reason and a fix, for example: *"Link expired, reopen the page in Chrome and grab it again"*. The raw log is one click away.
 - Windows notification when a download finishes. Finished items stay in the list until you clear them.
 - The bundled engine and ffmpeg handle everything, and HLS output is muxed to MP4.

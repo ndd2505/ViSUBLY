@@ -39,12 +39,15 @@ jobs:
 
       - name: Tests
         run: |
+          # pwsh only checks the LAST command's exit code by default: make any failing test stop the job.
+          $PSNativeCommandUseErrorActionPreference = $true
           npm run check
           node scripts/test-capture-bridge.js
           node scripts/test-extension-streams.mjs
           node scripts/test-remote-pairing.js
           node scripts/test-video-enhance.js
           node scripts/test-upscale-presets.js
+          python engine/downloader/test_fastdl.py
 
       - name: Build installer and portable app
         shell: pwsh

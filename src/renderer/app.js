@@ -880,6 +880,8 @@ function renderSettings() {
   const mode = s.theme || state.theme.mode;
   const info = state.info;
   const parallel = Number(s.maxParallelDownloads) || state.download.parallelItems || 2;
+  // Connections per video: 8 = automatic (the engine backs off when a site limits connections).
+  const conns = Number(s.segmentWorkers) || 8;
   const notify = s.notifyOnComplete !== false;
   const dir = currentDownloadDir();
   return `
@@ -907,6 +909,14 @@ function renderSettings() {
               <span class="setting-label" id="parallelLabel">Tải cùng lúc</span>
               <div class="segmented is-compact" role="group" aria-labelledby="parallelLabel">
                 ${[1, 2, 3].map((value) => segButton("set-parallel", String(value), String(value), parallel === value)).join("")}
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-text"><span class="setting-label" id="connLabel">Số kết nối mỗi video</span><span class="setting-hint">Tự động: tự giảm khi trang giới hạn kết nối. Chọn Ít nếu trang hay báo lỗi.</span></div>
+              <div class="segmented is-nowrap" role="group" aria-labelledby="connLabel">
+                ${segButton("set-connections", "8", "Tự động", conns !== 4 && conns !== 16)}
+                ${segButton("set-connections", "4", "Ít", conns === 4)}
+                ${segButton("set-connections", "16", "Nhiều", conns === 16)}
               </div>
             </div>
             <div class="setting-row">
@@ -1884,6 +1894,7 @@ document.addEventListener("click", async (event) => {
   // Settings
   if (action === "set-theme") return setThemeMode(actionEl.dataset.value);
   if (action === "set-parallel") return updateSettings({ maxParallelDownloads: Number(actionEl.dataset.value) });
+  if (action === "set-connections") return updateSettings({ segmentWorkers: Number(actionEl.dataset.value) });
   if (action === "set-short-videos") return updateSettings({ ignoreShortVideosSec: Number(actionEl.dataset.value) });
   if (action === "toggle-notify") return updateSettings({ notifyOnComplete: !(state.settings?.notifyOnComplete !== false) });
   if (action === "new-pairing-code") return ensurePairingCode(true);

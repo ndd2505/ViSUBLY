@@ -32,9 +32,29 @@
       <summary>Video ngắn / xem trước (<span id="shortCount">0</span>)</summary>
       <ul id="shortList" class="list compact"></ul>
     </details>
+    <details id="prevBox" class="short-box" hidden>
+      <summary>Đã thấy trước đó (<span id="prevCount">0</span>)</summary>
+      <ul id="prevList" class="list compact"></ul>
+    </details>
+    <button id="diagBtn" class="link diag-btn" type="button">Không thấy video? Chẩn đoán</button>
+    <section id="diagBox" class="diag" hidden>
+      <div class="diag-title">Chẩn đoán trang này</div>
+      <ul id="diagReasons" class="diag-list"></ul>
+      <ul id="diagUnknown" class="diag-list unknown" hidden></ul>
+      <div class="row">
+        <button id="diagCopy" type="button">Sao chép báo cáo</button>
+        <span id="diagCopied" class="hint" hidden>Đã sao chép</span>
+      </div>
+      <p class="hint">Báo cáo chỉ có tên miền và loại tệp, không có cookie hay đường dẫn đầy đủ.</p>
+    </section>
   </main>
 
   <footer>
+    <label class="switch" title="Đọc nội dung các tệp mà trang tải về để nhận ra danh sách phát bị đổi tên và báo khi trang dùng DRM. Tắt đi nếu một trang chạy lỗi khi bật tiện ích.">
+      <input type="checkbox" id="sniffToggle" checked>
+      <span>Dò video ẩn</span>
+    </label>
+    <span id="sniffHint" class="hint" hidden>Tải lại trang để áp dụng</span>
     <button id="forget" class="link" hidden>Hủy ghép nối</button>
   </footer>
   <script src="popup.js" type="module"></script>

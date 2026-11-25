@@ -2,6 +2,7 @@ import { probe, pair, sendCapture, setToken, probeStream } from './app-client.js
 import {
   MIN_MP4_BYTES, NOISE_EXT, classifyUrl, classifyContentType, upsertStream, markPlaybackStart,
   buildGroups, isShortGroup, needsProbe, rankGroups, pickBestGroup, describeGroups,
+  isSegmentLike, noteSegment, findPlayingGroup,
 } from './lib/streams.js';
 
 const OWN_PORTS = new Set(['47653', '47654', '47655', '47656']);
@@ -40,6 +41,7 @@ function readTab(tabs, tabId) {
     streams: Array.isArray(t.streams) ? t.streams : [],
     probes: t.probes && typeof t.probes === 'object' ? t.probes : {},
     playback: t.playback || { playing: false },
+    navId: Number(t.navId) || 1, // page session: bumped when the site changes URL without reloading
   };
 }
 function tabState(tabs, tabId) {
@@ -47,11 +49,12 @@ function tabState(tabs, tabId) {
   tabs[tabId] = t;
   return t;
 }
-const normalCount = (t) => buildGroups(t.streams, t.probes).filter((g) => !isShortGroup(g)).length;
+// Groups of the current page session (older ones only show under "Đã thấy trước đó").
+const currentGroups = (groups, t) => { const c = groups.filter((g) => (g.navId || 1) >= t.navId); return c.length ? c : groups; };
+const normalCount = (t) => buildGroups(t.streams, t.probes).filter((g) => !isShortGroup(g) && (g.navId || 1) >= t.navId).length;
 
 // ---------- detection ----------
 function isOwn(d) {
-  if (d.tabId < 0) return true;
   if ((d.initiator || '').startsWith('chrome-extension://')) return true;
   try {
     const p = new URL(d.url);
@@ -63,6 +66,30 @@ function isOwn(d) {
 function getHeader(list, name) {
   const h = (list || []).find((x) => x.name.toLowerCase() === name);
   return h ? h.value : undefined;
+}
+
+// Requests made by a page's service worker carry tabId -1. Attribute them to the tab showing that
+// origin (the active one if several), instead of dropping them: some players fetch media that way.
+let activeTabId = -1;
+chrome.tabs.onActivated?.addListener?.((info) => { activeTabId = info.tabId; });
+const originOf = (u) => { try { return new URL(u).origin; } catch { return ''; } };
+function tabFor(d) {
+  if (d.tabId >= 0) return d.tabId;
+  const origin = /^https?:/i.test(d.initiator || '') ? d.initiator : '';
+  if (!origin) return -1;
+  const matches = [...lastUrl.entries()].filter(([, u]) => originOf(u) === origin).map(([id]) => id);
+  if (!matches.length) return -1;
+  noteDiag(matches.includes(activeTabId) ? activeTabId : matches[matches.length - 1], (g) => { g.workerRequests += 1; });
+  return matches.includes(activeTabId) ? activeTabId : matches[matches.length - 1];
+}
+
+// ---------- diagnostics (popup "Không thấy video? Chẩn đoán"), kept in memory only ----------
+const diag = new Map(); // tabId -> counters
+function noteDiag(tabId, fn) {
+  if (tabId < 0) return;
+  let g = diag.get(tabId);
+  if (!g) { g = { workerRequests: 0, mediaRequests: 0, segments: 0, sniffed: 0, unknown: [], mse: '', drm: '', frames: 0 }; diag.set(tabId, g); }
+  fn(g);
 }
 
 const reqHeaders = new Map(); // requestId -> {headers, t}
@@ -88,7 +115,7 @@ async function addStream(tabId, entry) {
     const t = tabState(tabs, tabId);
     upsertStream(t.streams, entry, {
       pageUrl: (tab && (tab.url || tab.pendingUrl)) || '', pageTitle: (tab && tab.title) || '',
-      playing: !!t.playback.playing,
+      playing: !!t.playback.playing, navId: t.navId,
     });
     return normalCount(t);
   });
@@ -96,8 +123,11 @@ async function addStream(tabId, entry) {
   notifyPopup(tabId);
 }
 
-chrome.webRequest.onBeforeSendHeaders.addListener((d) => {
-  if (isOwn(d)) return;
+chrome.webRequest.onBeforeSendHeaders.addListener((raw) => {
+  if (isOwn(raw)) return;
+  const tabId = tabFor(raw);
+  if (tabId < 0) return;
+  const d = { ...raw, tabId };
   const range = getHeader(d.requestHeaders, 'range');
   if (range && !/^bytes=0-/i.test(range.trim())) return; // byte-range follow-up
   const h = {
@@ -112,16 +142,66 @@ chrome.webRequest.onBeforeSendHeaders.addListener((d) => {
   reqHeaders.set(d.requestId, { headers: h, t: Date.now() });
 }, { urls: ['<all_urls>'], types: REQ_TYPES }, ['requestHeaders', 'extraHeaders']);
 
-chrome.webRequest.onHeadersReceived.addListener((d) => {
-  const saved = reqHeaders.get(d.requestId);
-  reqHeaders.delete(d.requestId);
-  if (isOwn(d)) return;
+// A reload or a new page load (main_frame request) starts a fresh list, even for the same URL:
+// otherwise the previous load's videos pile up next to the new ones.
+chrome.webRequest.onBeforeRequest.addListener((d) => {
+  if (d.tabId < 0 || d.frameId !== 0) return;
+  pendingSegments.delete(d.tabId);
+  diag.delete(d.tabId);
+  withState((tabs) => { delete tabs[d.tabId]; }).then(() => { updateBadge(d.tabId, 0); notifyPopup(d.tabId); });
+}, { urls: ['<all_urls>'], types: ['main_frame'] });
+
+// Segment requests show which playlist is being played. They are frequent, so they are batched
+// (last segment URL per folder) and written at most every few seconds.
+const pendingSegments = new Map(); // tabId -> Map(folder -> url)
+let segmentFlushTimer = 0;
+function queueSegment(tabId, url) {
+  let byDir = pendingSegments.get(tabId);
+  if (!byDir) { byDir = new Map(); pendingSegments.set(tabId, byDir); }
+  byDir.set(url.slice(0, url.lastIndexOf('/') + 1), url);
+  if (!segmentFlushTimer) segmentFlushTimer = setTimeout(flushSegments, 2500);
+}
+function flushSegments() {
+  segmentFlushTimer = 0;
+  const batch = [...pendingSegments.entries()];
+  pendingSegments.clear();
+  for (const [tabId, byDir] of batch) {
+    withState((tabs) => {
+      if (!tabs[tabId]) return false;
+      const t = tabState(tabs, tabId);
+      let hit = false;
+      for (const url of byDir.values()) hit = Boolean(noteSegment(t.streams, url)) || hit;
+      return hit;
+    }).then((hit) => { if (hit) notifyPopup(tabId); });
+  }
+}
+
+chrome.webRequest.onHeadersReceived.addListener((raw) => {
+  const saved = reqHeaders.get(raw.requestId);
+  reqHeaders.delete(raw.requestId);
+  if (isOwn(raw)) return;
+  const tabId = tabFor(raw);
+  if (tabId < 0) return;
+  const d = { ...raw, tabId };
   if (d.statusCode && d.statusCode >= 400) return;
   let pathname = '';
   try { pathname = new URL(d.url).pathname; } catch { return; }
+  const contentType = getHeader(d.responseHeaders, 'content-type');
+  if (isSegmentLike(pathname, contentType)) { noteDiag(tabId, (g) => { g.segments += 1; }); queueSegment(d.tabId, d.url); return; }
   if (NOISE_EXT.test(pathname)) return;
-  const type = classifyContentType(getHeader(d.responseHeaders, 'content-type')) || classifyUrl(d.url);
-  if (!type) return;
+  const type = classifyContentType(contentType) || classifyUrl(d.url);
+  if (!type) {
+    // Media-looking responses we could not classify: listed (host + type only) in the diagnostics.
+    const ct = String(contentType || '').toLowerCase().split(';')[0];
+    if (/^(video|audio)\/|octet-stream|mpegurl|dash/.test(ct) || d.type === 'media') {
+      noteDiag(tabId, (g) => {
+        const item = `${originOf(d.url).replace(/^https?:\/\//, '')} · ${ct || 'không rõ loại'} · ${(pathname.match(/\.[a-z0-9]{1,5}$/i) || ['không đuôi'])[0]}`;
+        if (!g.unknown.includes(item)) g.unknown = [...g.unknown, item].slice(-12);
+      });
+    }
+    return;
+  }
+  noteDiag(tabId, (g) => { g.mediaRequests += 1; });
   let size = parseInt(getHeader(d.responseHeaders, 'content-length') || '0', 10) || 0;
   const cr = getHeader(d.responseHeaders, 'content-range');
   if (cr) { const m = /\/(\d+)$/.exec(cr); size = m ? parseInt(m[1], 10) : 0; }
@@ -135,15 +215,24 @@ const stripHash = (u) => (u || '').split('#')[0];
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (!info.url) return;
   const u = stripHash(info.url);
-  if (info.status === 'loading' && u !== lastUrl.get(tabId)) {
-    lastUrl.set(tabId, u);
+  const before = lastUrl.get(tabId);
+  lastUrl.set(tabId, u);
+  if (info.status === 'loading' && u !== before) {
     withState((tabs) => { delete tabs[tabId]; }).then(() => updateBadge(tabId, 0));
-  } else {
-    lastUrl.set(tabId, u);
+  } else if (before && u !== before) {
+    // Same document, new URL (single-page site switched video): keep the list, but what was seen
+    // before now belongs to the previous page ("Đã thấy trước đó" in the popup).
+    withState((tabs) => {
+      if (!tabs[tabId]) return;
+      const t = tabState(tabs, tabId);
+      t.navId += 1;
+      t.playback = { playing: false };
+    }).then(() => notifyPopup(tabId));
   }
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   lastUrl.delete(tabId);
+  diag.delete(tabId);
   withState((tabs) => { delete tabs[tabId]; });
 });
 
@@ -240,6 +329,67 @@ function ensureProbes(tabId, t, groups, limit) {
   }
 }
 
+// ---------- "Dò video ẩn" switch: sniff.js (page world) is registered at runtime ----------
+// On by default. Turning it off unregisters the script, so pages that misbehave with it load
+// without any of our code in their JS world (takes effect on the next page load).
+const SNIFF_ID = 'visubly-sniff';
+const SNIFF_KEY = 'sniffEnabled';
+let sniffChain = Promise.resolve();
+
+async function sniffEnabled() {
+  try { return (await chrome.storage.local.get(SNIFF_KEY))[SNIFF_KEY] !== false; } catch { return true; }
+}
+
+async function applySniff() {
+  const api = chrome.scripting;
+  if (!api || !api.registerContentScripts) return;
+  const want = await sniffEnabled();
+  try {
+    const have = (await api.getRegisteredContentScripts({ ids: [SNIFF_ID] })).length > 0;
+    if (want && !have) {
+      await api.registerContentScripts([{
+        id: SNIFF_ID, js: ['sniff.js'], matches: ['<all_urls>'], runAt: 'document_start',
+        allFrames: true, world: 'MAIN', persistAcrossSessions: true,
+      }]);
+    } else if (!want && have) {
+      await api.unregisterContentScripts({ ids: [SNIFF_ID] });
+    }
+  } catch { /* a page that can't take scripts must not break the rest */ }
+}
+const syncSniff = () => (sniffChain = sniffChain.then(applySniff, applySniff));
+syncSniff();
+
+// ---------- diagnosis: why no video shows (popup button) ----------
+async function diagnose(tabId) {
+  const tabs = await load();
+  const t = readTab(tabs, tabId);
+  const g = diag.get(tabId) || { workerRequests: 0, mediaRequests: 0, segments: 0, sniffed: 0, unknown: [], mse: '', drm: '' };
+  const groups = buildGroups(t.streams, t.probes);
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch { /* ignore */ }
+  const reasons = [];
+  const v = g.video;
+  const sniffOn = await sniffEnabled();
+  if (g.drm) reasons.push(`Trang dùng DRM (${g.drm}): video được mã hoá bản quyền, ViSUBLY không tải được.`);
+  if (!v) reasons.push('Chưa thấy thẻ video nào đang phát. Hãy bấm phát video rồi mở lại phần này. Nếu video nằm trong một khung (iframe) bị chặn, tiện ích có thể không nhìn thấy nó.');
+  else if (v.inFrame) reasons.push('Video nằm trong một khung (iframe) của trang khác. Tiện ích vẫn theo dõi khung đó.');
+  if (v && v.srcKind === 'blob' && !groups.length && !g.segments) reasons.push('Trình phát dựng video từ dữ liệu tải về theo cách riêng, có thể qua WebSocket hoặc P2P, nên không lộ đường dẫn tải được.');
+  if (g.segments && !groups.length) reasons.push(`Thấy ${g.segments} đoạn video được tải nhưng không thấy danh sách phát. Trang có thể giấu danh sách phát; hãy tải lại trang rồi phát lại để tiện ích bắt từ đầu.`);
+  if (g.unknown.length) reasons.push('Có tệp giống video nhưng ở định dạng lạ. Xem danh sách bên dưới.');
+  if (!sniffOn && !groups.length) reasons.push('"Dò video ẩn" đang tắt nên tiện ích không nhận ra danh sách phát bị đổi tên và không báo được DRM. Bật lại ở cuối popup rồi tải lại trang nếu cần.');
+  if (!reasons.length && groups.length) reasons.push('Tiện ích đã thấy video trên trang này.');
+  if (!reasons.length) reasons.push('Không thấy yêu cầu tải video nào. Hãy tải lại trang và phát lại video.');
+  const report = [
+    `ViSUBLY Grabber ${chrome.runtime.getManifest ? chrome.runtime.getManifest().version : ''}`,
+    `Trang: ${originOf((tab && tab.url) || '')}`,
+    `Video trên trang: ${v ? `${v.playing ? 'đang phát' : 'đang dừng'}, nguồn ${v.srcKind || 'không rõ'}${v.inFrame ? ', trong iframe' : ''}` : 'chưa thấy'}`,
+    `MSE: ${g.mse || 'không'} · DRM: ${g.drm || 'không'} · Dò video ẩn: ${sniffOn ? 'bật' : 'tắt'}`,
+    `Danh sách phát: ${groups.length} (nhận qua nội dung: ${g.sniffed}) · Đoạn video: ${g.segments} · Yêu cầu từ service worker: ${g.workerRequests}`,
+    ...g.unknown.map((u) => `Định dạng lạ: ${u}`),
+  ].join('\n');
+  return { ok: true, reasons, unknown: g.unknown, report };
+}
+
 // ---------- messaging ----------
 async function getState(tabId) {
   const tabs = await load();
@@ -250,13 +400,17 @@ async function getState(tabId) {
   let tab = null;
   try { tab = await chrome.tabs.get(tabId); } catch { /* ignore */ }
   const pageTitle = (tab && tab.title) || (t.streams[0] && t.streams[0].pageTitle) || '';
-  const view = describeGroups(groups, { pageTitle, probing: probingKeys(tabId) });
+  const current = groups.filter((g) => (g.navId || 1) >= t.navId);
+  const playing = findPlayingGroup(current, t.playback);
+  const playState = t.playback.playing ? 'playing' : 'paused';
+  const view = describeGroups(groups, { pageTitle, probing: probingKeys(tabId), playingId: playing ? playing.id : '', playState, navId: t.navId });
   let note = '';
   if (view.groups.length + view.short.length) {
     if (!st.running || !st.paired) note = 'Mở và ghép nối ViSUBLY để xem chất lượng và dung lượng.';
     else if (appNote === 'unsupported') note = 'Cập nhật ViSUBLY để xem chất lượng và dung lượng.';
   }
-  return { ...view, running: st.running, paired: st.paired, note };
+  const d = diag.get(tabId);
+  return { ...view, running: st.running, paired: st.paired, note, drm: d ? d.drm : '', sniff: await sniffEnabled() };
 }
 
 async function sendGroup(tabId, opts = {}) {
@@ -272,7 +426,7 @@ async function sendGroup(tabId, opts = {}) {
   } else {
     // Floating pill: read the front-runner first so a preview or a rendition is not sent by mistake.
     for (let i = 0; i < PILL_PROBE_ROUNDS; i++) {
-      g = pickBestGroup(groups, t.playback);
+      g = pickBestGroup(currentGroups(groups, t), t.playback);
       const prev = g && t.probes[g.key];
       if (!g || !needsProbe(g) || (prev && !prev.ok && Date.now() - prev.at < PROBE_RETRY_MS)) break;
       const r = await queueProbe(tabId, g.root);
@@ -281,7 +435,7 @@ async function sendGroup(tabId, opts = {}) {
       groups = buildGroups(t.streams, t.probes);
       if (!groups.length) return { ok: false, error: 'Chưa thấy video nào trên trang này' };
     }
-    g = pickBestGroup(groups, t.playback);
+    g = pickBestGroup(currentGroups(groups, t), t.playback);
   }
   const s = g.root;
   const pageUrl = (tab && tab.url) || s.pageUrl;
@@ -315,8 +469,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             src: typeof msg.src === 'string' ? msg.src.slice(0, 2048) : '',
           };
         });
+        noteDiag(senderTab, (g) => { g.video = { playing: !!msg.playing, srcKind: String(msg.srcKind || ''), inFrame: (sender.frameId || 0) > 0 }; });
         return { ok: true };
       }
+      // From sniff.js (page world) via content.js: a playlist recognised by its content, DRM, MSE.
+      case 'sniffed': {
+        if (senderTab == null || !['hls', 'dash'].includes(msg.kind) || !/^https?:/i.test(String(msg.url || ''))) return { ok: false };
+        noteDiag(senderTab, (g) => { g.sniffed += 1; });
+        await addStream(senderTab, { url: String(msg.url).slice(0, 4096), type: msg.kind, headers: {} });
+        return { ok: true };
+      }
+      case 'drm':
+        if (senderTab != null) { noteDiag(senderTab, (g) => { g.drm = String(msg.keySystem || 'DRM').slice(0, 80); }); notifyPopup(senderTab); }
+        return { ok: true };
+      case 'mse':
+        if (senderTab != null) noteDiag(senderTab, (g) => { g.mse = String(msg.mime || 'MSE').slice(0, 120); });
+        return { ok: true };
+      case 'diag':
+        return diagnose(msg.tabId);
+      case 'setSniff':
+        await chrome.storage.local.set({ [SNIFF_KEY]: !!msg.enabled });
+        await syncSniff();
+        return { ok: true, sniff: await sniffEnabled() };
       case 'pair': return pair(String(msg.code || '').trim());
       case 'unpair': await setToken(''); return { ok: true };
       default: return { ok: false, error: 'unknown message' };

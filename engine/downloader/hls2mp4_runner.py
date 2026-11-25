@@ -19,6 +19,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+import fastdl
 import hls2mp4 as core
 
 
@@ -543,45 +544,49 @@ def run_local_segment_fallback_events(
     started = time.time()
     try:
         segment_paths = [temp_dir / f"segment_{index:06d}.ts" for index in range(len(segments))]
+        header_lines = list(item["headers"])
 
-        def download_segment(index: int, segment: dict[str, Any]) -> int:
-            data = core.fetch_bytes_with_retry(
-                str(segment["url"]),
-                list(item["headers"]),
-                label=f"segment {index + 1}/{len(segments)}",
+        if fastdl.find_curl():
+            # Visubly: one curl --parallel (connections reused) instead of a curl process per segment.
+            jobs = [(str(segment["url"]), segment_paths[index], None) for index, segment in enumerate(segments)]
+            fastdl.download_all(
+                jobs, header_lines, workers, work_dir=temp_dir,
+                fetch_one=strict_fetch(header_lines),
+                on_progress=segment_progress(emitter, item, started),
+            on_retry=retry_notice(emitter, item),
             )
-            segment_paths[index].write_bytes(core.strip_segment_wrapper(data))
-            return index
-
-        completed_segments = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {
-                executor.submit(download_segment, index, segment): index
-                for index, segment in enumerate(segments)
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                try:
-                    future.result()
-                except Exception as exc:
-                    failed_index = future_map[future]
-                    for pending in future_map:
-                        pending.cancel()
-                    raise RuntimeError(f"segment {failed_index + 1}/{len(segments)} failed: {exc}") from exc
-                completed_segments += 1
-                elapsed = time.time() - started
-                percent = completed_segments / len(segments) * 100
-                eta = elapsed / completed_segments * (len(segments) - completed_segments)
-                emitter.emit(
-                    "progress",
-                    phase="download_segments",
-                    item_id=item["id"],
-                    percent=round(percent, 2),
-                    elapsed=seconds_or_none(elapsed),
-                    eta=seconds_or_none(eta),
-                    completed_segments=completed_segments,
-                    total_segments=len(segments),
-                    speed=f"{completed_segments}/{len(segments)} segments",
+            for path in segment_paths:
+                data = path.read_bytes()
+                unwrapped = core.strip_segment_wrapper(data)
+                if unwrapped != data:
+                    path.write_bytes(unwrapped)
+        else:
+            def download_segment(index: int, segment: dict[str, Any]) -> int:
+                data = core.fetch_bytes_with_retry(
+                    str(segment["url"]),
+                    header_lines,
+                    label=f"segment {index + 1}/{len(segments)}",
                 )
+                segment_paths[index].write_bytes(core.strip_segment_wrapper(data))
+                return index
+
+            completed_segments = 0
+            report = segment_progress(emitter, item, started)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {
+                    executor.submit(download_segment, index, segment): index
+                    for index, segment in enumerate(segments)
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        failed_index = future_map[future]
+                        for pending in future_map:
+                            pending.cancel()
+                        raise RuntimeError(f"segment {failed_index + 1}/{len(segments)} failed: {exc}") from exc
+                    completed_segments += 1
+                    report(completed_segments, len(segments), 0.0)
 
         emitter.emit("phase", phase="combine_segments", status="started", item_id=item["id"])
         with combined_ts.open("wb") as combined:
@@ -626,6 +631,148 @@ def run_local_segment_fallback_events(
             temp_root.rmdir()
 
 
+def strict_fetch(header_lines: list[str]):
+    """Last-resort fetch for the parallel paths: urllib raises on HTTP 4xx/5xx (the curl call in
+    core.fetch_bytes has no --fail and would save an error page as if it were the segment)."""
+
+    def fetch(url: str, rng: str | None) -> bytes:
+        lines = list(header_lines) + ([f"Range: bytes={rng}"] if rng else [])
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                return core.fetch_bytes_with_urllib(url, lines)
+            except Exception as exc:  # reported below
+                last = exc
+                time.sleep(1.0 * (attempt + 1))
+        raise RuntimeError(f"download failed: {last}")
+
+    return fetch
+
+
+def retry_notice(emitter: EventEmitter, item: dict[str, Any]):
+    def notice(failed: int, total: int, connections: int) -> None:
+        emitter.emit(
+            "warning",
+            phase="download_segments",
+            item_id=item["id"],
+            message=f"{failed}/{total} parts failed (server may limit connections); retrying with {connections} connection(s).",
+        )
+
+    return notice
+
+
+def segment_progress(emitter: EventEmitter, item: dict[str, Any], started: float, *, by_bytes: bool = False):
+    """Progress callback for parallel downloads: percent, ETA and the real speed (MB/s)."""
+    state = {"last": 0.0, "rate": 0.0}
+
+    def report(done: int, total: int, rate: float) -> None:
+        now = time.time()
+        if rate > 0:
+            state["rate"] = rate if not state["rate"] else state["rate"] * 0.6 + rate * 0.4
+        if now - state["last"] < 0.4 and done < total:
+            return
+        state["last"] = now
+        elapsed = now - started
+        percent = done / total * 100 if total else 0.0
+        eta = elapsed / done * (total - done) if done else None
+        emitter.emit(
+            "progress",
+            phase="download_segments",
+            item_id=item["id"],
+            percent=round(percent, 2),
+            elapsed=seconds_or_none(elapsed),
+            eta=seconds_or_none(eta),
+            completed_segments=done,
+            total_segments=total,
+            # Until a rate is known: "x/y đoạn" for segments, nothing for byte ranges.
+            speed=fastdl.human_speed(state["rate"]) or (None if by_bytes else f"{done}/{total} đoạn"),
+        )
+
+    return report
+
+
+def run_local_playlist_events(item: dict[str, Any], ffmpeg: str, duration: float | None, emitter: EventEmitter) -> int:
+    """HLS that ffmpeg would fetch one segment at a time (fMP4 init maps, AES-128, discontinuities):
+    download everything in parallel, rewrite the playlist to local files, let ffmpeg remux from disk.
+    Raises fastdl.FastPathUnsupported for live / DRM / master playlists (caller falls back)."""
+    if not fastdl.find_curl():
+        raise fastdl.FastPathUnsupported("curl.exe not found")
+    output = Path(str(item["output"]))
+    header_lines = list(item["headers"])
+    playlist_url = str(item["selected_url"])
+    text = core.fetch_text(playlist_url, header_lines)
+    temp_root = output.parent / ".extracting_video_tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="hlsfast_", dir=str(temp_root)))
+    try:
+        local, jobs = fastdl.localize_playlist(playlist_url, text, temp_dir)
+        workers = core.normalize_workers(int(item["workers"]))
+        emitter.emit("phase", phase="download_segments", status="started", item_id=item["id"], total_segments=len(jobs), workers=workers)
+        started = time.time()
+        fastdl.download_all(
+            jobs, header_lines, workers, work_dir=temp_dir,
+            fetch_one=strict_fetch(header_lines),
+            on_progress=segment_progress(emitter, item, started),
+            on_retry=retry_notice(emitter, item),
+        )
+        emitter.emit("phase", phase="download_segments", status="completed", item_id=item["id"])
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-progress", "pipe:1", "-nostats",
+            "-y" if item["overwrite"] else "-n",
+            "-allowed_extensions", "ALL", "-allowed_segment_extensions", "ALL", "-extension_picky", "0",
+            "-protocol_whitelist", "file,crypto",
+            "-i", str(local), "-c", "copy", "-bsf:a", "aac_adtstoasc", str(output),
+        ]
+        return run_ffmpeg_with_retry_events(command, duration, emitter, phase="mux_ts_to_mp4", item_id=str(item["id"]))
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            temp_root.rmdir()
+
+
+MIN_PARALLEL_FILE = 16 * 1024 * 1024
+
+
+def run_direct_parallel_events(item: dict[str, Any], emitter: EventEmitter) -> int:
+    """Direct file (MP4) with HTTP Range support: several connections at once, no remux.
+    Raises fastdl.FastPathUnsupported when the server has no ranges or the file is small."""
+    if not fastdl.find_curl():
+        raise fastdl.FastPathUnsupported("curl.exe not found")
+    output = Path(str(item["output"]))
+    if output.exists() and not item["overwrite"]:
+        raise fastdl.FastPathUnsupported("output exists")
+    header_lines = list(item["headers"])
+    url = str(item["selected_url"])
+    size, ranges = fastdl.probe_ranges(url, header_lines)
+    if not ranges or size < MIN_PARALLEL_FILE:
+        raise fastdl.FastPathUnsupported("no range support" if not ranges else "small file")
+    temp_root = output.parent / ".extracting_video_tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="mp4fast_", dir=str(temp_root)))
+    try:
+        parts = min(16, max(2, core.normalize_workers(int(item["workers"]))))
+        emitter.emit("phase", phase="download_segments", status="started", item_id=item["id"], total_segments=parts, workers=parts)
+        started = time.time()
+        report = segment_progress(emitter, item, started, by_bytes=True)
+        total_bytes = size
+
+        def by_bytes(done: int, total: int, rate: float) -> None:
+            got = 0
+            for path in temp_dir.glob("part*.bin"):
+                with contextlib.suppress(OSError):
+                    got += path.stat().st_size
+            report(min(got, total_bytes), total_bytes, rate)
+
+        fastdl.download_ranges(url, header_lines, size, output, parts, work_dir=temp_dir, on_progress=by_bytes,
+                               fetch_one=strict_fetch(header_lines), on_retry=retry_notice(emitter, item))
+        emitter.emit("progress", phase="mux_ts_to_mp4", item_id=item["id"], percent=100.0, elapsed=seconds_or_none(time.time() - started), eta=0.0)
+        return 0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            temp_root.rmdir()
+
+
 def run_download(args: argparse.Namespace, emitter: EventEmitter) -> int:
     item, segments, use_local_fallback, duration, ffmpeg = prepare_item(args, emitter, include_preflight=True)
     output = Path(str(item["output"]))
@@ -634,9 +781,30 @@ def run_download(args: argparse.Namespace, emitter: EventEmitter) -> int:
         ffmpeg = core.find_ffmpeg(args.ffmpeg)
     emitter.emit("prepared", item=public_item(item))
 
+    result = None
+    existed_before = output.exists()
     if use_local_fallback:
         result = run_local_segment_fallback_events(segments, item, ffmpeg, duration, emitter)
-    else:
+    elif not getattr(args, "no_fast", False) and str(item.get("link_type") or "") in ("m3u8", "mp4"):
+        # Visubly: parallel paths first; anything they can't handle goes to ffmpeg as before.
+        try:
+            if item["link_type"] == "m3u8":
+                result = run_local_playlist_events(item, ffmpeg, duration, emitter)
+            else:
+                result = run_direct_parallel_events(item, emitter)
+            if result != 0:
+                emitter.emit("warning", phase="download_segments", item_id=item["id"], message="Parallel download failed; retrying with ffmpeg.")
+                result = None
+        except fastdl.FastPathUnsupported as exc:
+            emitter.emit("log", phase="preflight", item_id=item["id"], message=f"Parallel download not used: {exc}.")
+        except Exception as exc:  # network trouble etc.: the old path still gets its chance
+            emitter.emit("warning", phase="download_segments", item_id=item["id"], message=f"Parallel download failed ({exc}); retrying with ffmpeg.")
+            result = None
+        if result is None and output.exists() and not existed_before:
+            with contextlib.suppress(OSError):
+                output.unlink()
+
+    if result is None:
         command = build_direct_ffmpeg_command(item, ffmpeg, output)
         result = run_ffmpeg_with_retry_events(
             command,
@@ -678,6 +846,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output file if it exists.")
     parser.add_argument("--workers", type=int, default=core.DEFAULT_WORKERS, help=f"Parallel segment workers. Default: {core.DEFAULT_WORKERS}.")
     parser.add_argument("--no-preflight", action="store_true", help="Skip playlist inspection and duration probing.")
+    parser.add_argument("--no-fast", action="store_true", help="Do not use the parallel download paths (ffmpeg only).")
     parser.add_argument("--event-log-file", help="Append JSON events to this file in addition to stdout.")
 
 

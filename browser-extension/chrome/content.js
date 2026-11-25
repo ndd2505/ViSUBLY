@@ -122,10 +122,11 @@
     const playing = !!(v && !v.paused && !v.ended);
     const duration = v && Number.isFinite(v.duration) ? Math.round(v.duration * 10) / 10 : 0;
     const src = v && /^https?:/i.test(v.currentSrc || '') ? v.currentSrc : '';
-    const sig = `${playing}|${duration}|${src}`;
+    const srcKind = !v ? 'none' : src ? 'http' : /^blob:/i.test(v.currentSrc || '') ? 'blob' : (v.currentSrc ? 'other' : 'none');
+    const sig = `${playing}|${duration}|${src}|${srcKind}`;
     if (sig === lastPlayback) return;
     lastPlayback = sig;
-    try { chrome.runtime.sendMessage({ type: 'playback', playing, duration, src }).catch(() => {}); } catch { /* extension reloaded */ }
+    try { chrome.runtime.sendMessage({ type: 'playback', playing, duration, src, srcKind }).catch(() => {}); } catch { /* extension reloaded */ }
   }
   let playbackTimer = 0;
   function schedulePlayback() {
@@ -160,6 +161,18 @@
     if (host) { host.remove(); host = root = pill = toast = null; }
   }
   addEventListener('pagehide', teardown);
+
+  // Relay from sniff.js (page world): playlists recognised by content, DRM, MediaSource.
+  addEventListener('message', (e) => {
+    const d = e.data;
+    if (e.source !== window || !d || d.__visubly !== 'sniff') return;
+    const msg = d.type === 'sniffed' ? { type: 'sniffed', url: String(d.url || ''), kind: d.kind }
+      : d.type === 'drm' ? { type: 'drm', keySystem: String(d.keySystem || '') }
+        : d.type === 'mse' ? { type: 'mse', mime: String(d.mime || '') } : null;
+    if (!msg) return;
+    try { chrome.runtime.sendMessage(msg).catch(() => {}); } catch { /* extension reloaded */ }
+  });
+  try { window.postMessage({ __visubly: 'ready' }, '*'); } catch { /* ignore */ }
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.type === 'count') { count = msg.count || 0; if (!count) teardown(); else scheduleUpdate(); }

@@ -62,7 +62,7 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
   checkFiles: (paths) => ipcRenderer.invoke("file:exists", paths),
   openInSystemPlayer: (filePath) => ipcRenderer.invoke("media:openInSystemPlayer", filePath),
   toFileUrl: (filePath) => ipcRenderer.invoke("media:toFileUrl", filePath),
-  scanVideoFolder: (folderPath) => ipcRenderer.invoke("media:scanVideoFolder", folderPath),
+  scanVideoFolder: (folderPath, options) => ipcRenderer.invoke("media:scanVideoFolder", folderPath, options),
   findMatchingSubtitle: (videoPath) => ipcRenderer.invoke("media:findMatchingSubtitle", videoPath),
   airplay: {
     start: () => ipcRenderer.invoke("airplay:start"),
@@ -81,7 +81,10 @@ contextBridge.exposeInMainWorld("visublyDesktop", {
   app: {
     getInfo: () => ipcRenderer.invoke("app:getInfo"),
     diskSpace: () => ipcRenderer.invoke("app:diskSpace"),
-    openExtensionFolder: () => ipcRenderer.invoke("app:openExtensionFolder")
+    openExtensionFolder: () => ipcRenderer.invoke("app:openExtensionFolder"),
+    // Files opened from Windows: pull the ones queued before boot, then listen for more.
+    takeOpenFiles: () => ipcRenderer.invoke("app:takeOpenFiles"),
+    onOpenFiles: subscribe("app:open-files")
   },
   capture: captureApi
 });

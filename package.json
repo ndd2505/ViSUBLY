@@ -96,7 +96,22 @@
     "mac": {
       "target": "dmg",
       "category": "public.app-category.video"
-    }
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "mp4",
+          "m4v",
+          "mkv",
+          "webm",
+          "mov"
+        ],
+        "name": "ViSUBLY.Video",
+        "description": "Video",
+        "role": "Viewer",
+        "icon": "icon"
+      }
+    ]
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",

@@ -23,6 +23,7 @@ Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) �
 - Bắt link từ Chrome giống IDM: extension phát hiện luồng → gửi sang app qua cổng localhost có ghép nối mã 6 số → hộp thoại "Tải video này?".
 - Gom luồng theo video, đọc độ phân giải + thời lượng + dung lượng ước tính, ẩn video ngắn (mặc định < 2 phút, chỉnh trong Cài đặt).
 - Trình phát: phát file/thư mục, phụ đề SRT/VTT (tự nhận UTF-8/UTF-16/Windows-1258), theater/toàn màn hình với thanh điều khiển nổi tự ẩn, phím tắt.
+- Mở video trực tiếp từ Windows (Open with / app mặc định): bộ cài đăng ký `.mp4 .m4v .mkv .webm .mov`; app nhận đường dẫn lúc khởi động và khi đang chạy (single-instance), tự lấy các video cùng thư mục (không quét thư mục con) để bấm trước/sau; chọn nhiều file → thành playlist; mở `.srt/.vtt` → nạp vào video đang phát. Nút "Mở bằng trình phát khác" dùng hộp thoại Open with của Windows (tránh mở lại chính ViSUBLY).
 - Remote iPhone (AirPlay-style, PWA + WebSocket) — có sẵn từ trước.
 - Giao diện mới: dark mode mặc định + light mode (chọn Tối/Sáng/Theo Windows), logo mới "Vi Screen".
 - Bộ cài NSIS chuẩn (chọn thư mục, shortcut, gỡ cài đặt, tiếng Việt/Anh) + bản portable.
@@ -60,7 +61,9 @@ scripts/                    build-downloader.ps1, check-app.js, test-capture-bri
 - Settings: `downloadDir`, `maxParallelDownloads` (1–3, mặc định 2), `segmentWorkers` (8), `notifyOnComplete`, `captureBridgeEnabled`, `captureBridgePort` (47653), `ignoreShortVideosSec` (0/30/60/120/300, mặc định 120), `theme` (`dark`|`light`|`system`).
 
 ### IPC (main.js)
-`airplay:*`, `app:bootInfoSync|getInfo|diskSpace|openExtensionFolder`, `capture:confirm|createPairingCode|dismiss|info|prepareManual|revokeAll`, `dialog:selectVideo|selectVideoFolder|selectSubtitle`, `download:getState|prepare|enqueue|start|cancel|retry|remove|clearCompleted|openOutput|revealOutput|openDir`, `file:exists|readText|readSubtitleText`, `media:toFileUrl|scanVideoFolder|findMatchingSubtitle|openInSystemPlayer`, `settings:get|update|selectDownloadDir`, `window:*`. Sự kiện đẩy xuống renderer: `download:state`, `download:event`, `capture:incoming`, `settings:changed`, `airplay:*`.
+`airplay:*`, `app:bootInfoSync|getInfo|diskSpace|openExtensionFolder|takeOpenFiles`, `capture:confirm|createPairingCode|dismiss|info|prepareManual|revokeAll`, `dialog:selectVideo|selectVideoFolder|selectSubtitle`, `download:getState|prepare|enqueue|start|cancel|retry|remove|clearCompleted|openOutput|revealOutput|openDir`, `file:exists|readText|readSubtitleText`, `media:toFileUrl|scanVideoFolder|findMatchingSubtitle|openInSystemPlayer`, `settings:get|update|selectDownloadDir`, `window:*`. Sự kiện đẩy xuống renderer: `download:state`, `download:event`, `capture:incoming`, `settings:changed`, `app:open-files`, `airplay:*`. `media:scanVideoFolder(path, {recursive})` — mặc định đệ quy (Thư viện); `recursive:false` khi mở file từ Windows.
+
+**Mở file từ Windows**: `main.js` lấy đường dẫn từ `process.argv` / sự kiện `second-instance` (gom các lần mở cách nhau < 350 ms thành một lô), renderer kéo hàng chờ bằng `app:takeOpenFiles` khi khởi động rồi nghe `app:open-files`. Kiểm thử E2E: chạy `dist\win-unpacked\Visubly Studio.exe --remote-debugging-port=<p> "<file>"` với `VISUBLY_RUNTIME_DIR` riêng rồi đọc `state` qua CDP.
 
 ### Cổng nhận link (capture-bridge)
 - Chỉ bind `127.0.0.1`; từ chối Origin không phải `chrome-extension://` và Host lạ; body ≤ 64 KB.

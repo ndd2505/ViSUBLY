@@ -3089,6 +3089,78 @@ async function openFolderVideo(index, fallbackPath = "") {
   return setScreen("player");
 }
 
+// ---------- Files opened from Windows (default app / "Open with") ----------
+function pathDirName(pathValue) {
+  const value = String(pathValue || "");
+  const index = Math.max(value.lastIndexOf("\\"), value.lastIndexOf("/"));
+  if (index < 0) return "";
+  const dir = value.slice(0, index);
+  return /^[A-Za-z]:$/.test(dir) ? `${dir}\\` : dir; // "E:" -> "E:\"
+}
+
+let openFilesChain = Promise.resolve();
+
+function initOpenFilesBridge() {
+  if (typeof desktop.app?.onOpenFiles === "function") {
+    desktop.app.onOpenFiles((payload) => enqueueOpenFiles(payload?.paths));
+  }
+  // Files passed on the command line before the UI existed.
+  if (typeof desktop.app?.takeOpenFiles === "function") {
+    desktop.app.takeOpenFiles().then(enqueueOpenFiles).catch(() => {});
+  }
+}
+
+function enqueueOpenFiles(paths) {
+  if (!Array.isArray(paths) || !paths.length) return;
+  // Serialize so a burst of launches can't interleave half-loaded videos.
+  openFilesChain = openFilesChain.then(() => handleOpenFiles(paths)).catch(() => {});
+}
+
+async function handleOpenFiles(paths) {
+  const videos = paths.filter(isVideoPath);
+  const subtitles = paths.filter(isSubtitlePath);
+  if (!videos.length && !subtitles.length) return;
+  dismissIntro();
+  if (videos.length) await openVideosFromSystem(videos);
+  if (!subtitles.length) return;
+  if (state.player.videoPath) {
+    await loadSubtitlePath(subtitles[0]);
+  } else {
+    state.player.subtitleNotice = "Hãy mở video trước, rồi mở file phụ đề để nạp vào video đó.";
+  }
+  if (state.screen === "player") render();
+  else setScreen("player");
+}
+
+async function openVideosFromSystem(videos) {
+  const first = videos[0];
+  let scan = null;
+  if (videos.length > 1) {
+    // Several files selected in Explorer: they become the playlist (sorted like the library).
+    scan = {
+      path: pathDirName(first),
+      name: `${videos.length} video đã chọn`,
+      videos: videos.map((p) => ({ path: p, name: pathBaseName(p), folder: "" }))
+    };
+  } else {
+    try {
+      // Only this folder (not subfolders) so prev/next work without walking a whole drive.
+      scan = await desktop.scanVideoFolder(pathDirName(first), { recursive: false });
+    } catch {
+      scan = null;
+    }
+  }
+  if (scan && Array.isArray(scan.videos) && scan.videos.length) {
+    applyFolderScan(scan);
+    const index = videos.length > 1 ? 0 : state.folder.videos.findIndex((video) => sameLocalPath(video.path, first));
+    if (index >= 0) return openFolderVideo(index, first);
+  }
+  const token = await loadVideoPath(first, { folderContext: null });
+  if (token !== state.player.sourceToken) return;
+  state.player.playing = true;
+  return state.screen === "player" ? render() : setScreen("player");
+}
+
 function stepFolderVideo(delta) {
   const index = currentFolderVideoIndex();
   if (index < 0) return;
@@ -3976,6 +4048,7 @@ async function bootstrap() {
   initSettingsBridge();
   initAirPlayPairingBridge();
   render();
+  initOpenFilesBridge();
   if (state.intro) introTimer = window.setTimeout(dismissIntro, introDurationMs);
   await refreshSettings();
   refreshAppInfo();

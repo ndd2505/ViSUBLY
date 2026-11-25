@@ -115,12 +115,66 @@ for (const [name, dir] of Object.entries(runtimePaths)) {
   }
 }
 
+// --- Files opened from Windows ("Open with", default app, drag onto the exe) ---
+// Registered for these via build.fileAssociations; subtitles can be opened onto the current video.
+const openableFileExtensions = new Set([".mp4", ".m4v", ".mkv", ".webm", ".mov", ".srt", ".vtt"]);
+let pendingOpenFiles = [];
+let openFilesRendererReady = false;
+let openFilesFlushTimer = null;
+
+function extractOpenPaths(argv = [], cwd = process.cwd()) {
+  const paths = [];
+  // argv[0] is the exe; in dev argv[1] is the app dir ("."), which fails the isFile check below.
+  for (const raw of argv.slice(1)) {
+    const arg = String(raw || "").trim().replace(/^"(.*)"$/, "$1");
+    if (!arg || arg.startsWith("-")) continue;
+    if (!openableFileExtensions.has(path.extname(arg).toLowerCase())) continue;
+    const resolved = path.resolve(cwd || process.cwd(), arg);
+    try {
+      if (fs.statSync(resolved).isFile()) paths.push(resolved);
+    } catch {
+      // Not a file we can open.
+    }
+  }
+  return paths;
+}
+
+// Explorer starts one process per selected file, so batch paths that arrive close together.
+function queueOpenFiles(paths) {
+  if (!paths || !paths.length) return;
+  for (const p of paths) if (!pendingOpenFiles.includes(p)) pendingOpenFiles.push(p);
+  if (!openFilesRendererReady) return; // The renderer pulls them with app:takeOpenFiles on boot.
+  clearTimeout(openFilesFlushTimer);
+  openFilesFlushTimer = setTimeout(() => {
+    const batch = pendingOpenFiles;
+    pendingOpenFiles = [];
+    if (!sendToRenderer("app:open-files", { paths: batch })) pendingOpenFiles = batch;
+  }, 350);
+}
+
+ipcMain.handle("app:takeOpenFiles", () => {
+  openFilesRendererReady = true;
+  const batch = pendingOpenFiles;
+  pendingOpenFiles = [];
+  return batch;
+});
+
 // Must run after app.setPath("userData") because the lock lives in the user data dir.
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => focusMainWindow());
+  app.on("second-instance", (_event, commandLine, workingDirectory) => {
+    focusMainWindow();
+    queueOpenFiles(extractOpenPaths(commandLine, workingDirectory));
+  });
+  // macOS delivers files through open-file (also before ready); kept for the future Mac build.
+  app.on("open-file", (event, filePath) => {
+    event.preventDefault();
+    queueOpenFiles(extractOpenPaths(["", filePath]));
+    if (app.isReady()) focusMainWindow();
+  });
+  queueOpenFiles(extractOpenPaths(process.argv, process.cwd()));
   const legacy = migrateLegacyQueue();
   settings = loadSettings(legacy);
   applySettingsToQueue();
@@ -172,6 +226,8 @@ function createWindow() {
     }
   });
 
+  // A fresh renderer pulls pending files again (app:takeOpenFiles) once its handlers exist.
+  openFilesRendererReady = false;
   mainWindow.loadFile(path.join(__dirname, "../renderer/index.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
 }
@@ -435,6 +491,22 @@ ipcMain.handle("file:exists", async (_event, paths = []) => {
 ipcMain.handle("media:openInSystemPlayer", async (_event, filePath) => {
   if (!filePath || typeof filePath !== "string") return { ok: false, error: "No file to open." };
   if (!fs.existsSync(filePath)) return { ok: false, error: `File not found: ${filePath}` };
+  if (process.platform === "win32") {
+    // ViSUBLY may itself be the default app for this type, so shell.openPath would just
+    // reopen it. Show Windows' "How do you want to open this file?" picker instead.
+    try {
+      const child = spawn("rundll32.exe", ["shell32.dll,OpenAs_RunDLL", filePath], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: false
+      });
+      child.on("error", () => {});
+      child.unref();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+  }
   const error = await shell.openPath(filePath);
   return error ? { ok: false, error } : { ok: true };
 });
@@ -485,8 +557,8 @@ ipcMain.handle("media:toFileUrl", (_event, filePath) => {
   return pathToFileURL(filePath).toString();
 });
 
-ipcMain.handle("media:scanVideoFolder", async (_event, folderPath) => {
-  const result = await scanVideoFolder(folderPath);
+ipcMain.handle("media:scanVideoFolder", async (_event, folderPath, options = {}) => {
+  const result = await scanVideoFolder(folderPath, options);
   airplayServer.setFolder(result);
   return result;
 });
@@ -594,7 +666,9 @@ ipcMain.handle("media:findMatchingSubtitle", async (_event, videoPath) => {
   return findMatchingSubtitleFile(videoPath);
 });
 
-async function scanVideoFolder(folderPath) {
+// recursive:false = only this folder (used when a single file is opened from Windows,
+// e.g. from E:\ root, where a recursive scan could walk the whole drive).
+async function scanVideoFolder(folderPath, { recursive = true } = {}) {
   const rootPath = String(folderPath || "");
   if (!rootPath) throw new Error("Choose a folder first.");
 
@@ -627,7 +701,7 @@ async function scanVideoFolder(folderPath) {
       if (entry.isSymbolicLink()) continue;
 
       if (entry.isDirectory()) {
-        folders.push(fullPath);
+        if (recursive) folders.push(fullPath);
         continue;
       }
 

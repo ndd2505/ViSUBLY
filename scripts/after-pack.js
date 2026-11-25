@@ -37,7 +37,17 @@ module.exports = async function afterPack(context) {
     iconPath
   ];
 
+  // app-builder's rcedit first unpacks winCodeSign with 7za. electron-builder normally passes the
+  // bundled 7za via SZA_PATH; when we call app-builder ourselves we must do the same, otherwise a
+  // clean machine (GitHub Actions) fails with `exec: "7za": executable file not found in %PATH%`.
+  let env = process.env;
+  try {
+    env = { ...process.env, SZA_PATH: require("7zip-bin").path7za };
+  } catch {
+    // 7zip-bin ships with electron-builder; fall back to PATH if it is somehow missing.
+  }
   execFileSync(appBuilderPath, ["rcedit", "--args", JSON.stringify(resourceArgs)], {
-    stdio: "inherit"
+    stdio: "inherit",
+    env
   });
 };

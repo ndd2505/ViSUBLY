@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.1-D7FF61?labelColor=1A1620">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.0.2-D7FF61?labelColor=1A1620">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-1A1620">
   <img alt="Electron" src="https://img.shields.io/badge/Electron-31-1A1620">
   <img alt="Chrome extension" src="https://img.shields.io/badge/Chrome-MV3%20extension-1A1620">

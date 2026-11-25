@@ -1,7 +1,7 @@
 {
   "name": "visubly-desktop",
   "productName": "Visubly Studio",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Desktop UI shell for Visubly video download and Vietnamese subtitle workflows.",
   "main": "src/main/main.js",
   "private": true,

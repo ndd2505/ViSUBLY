@@ -10,5 +10,7 @@ Electron desktop app (Windows first, Mac/iPhone later) for grabbing videos (HLS/
 - After app code changes, rebuild the Windows package: `npm.cmd run package:win`.
 - Never kill processes you did not start. Never commit `ViSUBLY_Expo_Source/` or the root `download-queue.json`.
 - PowerShell 5.1: commit with `git commit -F <message-file>`; stage explicit paths only.
+- Never rewrite UTF-8 files with PowerShell 5.1 `Get-Content`/`Set-Content` (reads as ANSI, adds a BOM and garbles Vietnamese text). Use the Edit tool or Node `fs`.
+- Don't delete or move pushed git tags; if a release tag's build fails, fix it and release the next patch version.
 - `D:\Projects\Extracting Video` is read-only source; the engine copy lives in `engine/downloader/`.
 - Keep the renderer's `<video>` element alive across re-renders (see HANDOFF §3).

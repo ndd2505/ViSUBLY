@@ -24,7 +24,7 @@ Tài liệu này dành cho phiên làm việc tiếp theo (người hoặc AI) �
 - Gom luồng theo video, đọc độ phân giải + thời lượng + dung lượng ước tính, ẩn video ngắn (mặc định < 2 phút, chỉnh trong Cài đặt).
 - Trình phát: phát file/thư mục, phụ đề SRT/VTT (tự nhận UTF-8/UTF-16/Windows-1258), theater/toàn màn hình với thanh điều khiển nổi tự ẩn, phím tắt.
 - Mở video trực tiếp từ Windows (Open with / app mặc định): bộ cài đăng ký `.mp4 .m4v .mkv .webm .mov`; app nhận đường dẫn lúc khởi động và khi đang chạy (single-instance), tự lấy các video cùng thư mục (không quét thư mục con) để bấm trước/sau; chọn nhiều file → thành playlist; mở `.srt/.vtt` → nạp vào video đang phát. Nút "Mở bằng trình phát khác" dùng hộp thoại Open with của Windows (tránh mở lại chính ViSUBLY).
-- Remote iPhone (AirPlay-style, PWA + WebSocket) — có sẵn từ trước.
+- Remote iPhone (web/PWA qua Safari, cổng 3588): **ghép nối một lần** — quét QR (link một lần, đổi thành mã thiết bị rồi xoá token khỏi URL) hoặc bấm "Kết nối" trên điện thoại → PC hiện "Cho phép / Từ chối". Mỗi thiết bị có token 64 hex lưu cookie HttpOnly + localStorage trên máy điện thoại, PC lưu sha256 trong `user-data\remote-devices.json`; sống qua khởi động lại. Cài đặt → Remote iPhone: danh sách thiết bị, gỡ từng cái / tất cả, "Tự bật khi mở ViSUBLY" (`remoteAutoStart`, chỉ bật nếu đã có thiết bị). WebSocket `/ws` giờ bắt buộc token. Luồng PIN cũ (app Expo/Swift) vẫn chạy và cũng nhận token lâu dài.
 - Giao diện mới: dark mode mặc định + light mode (chọn Tối/Sáng/Theo Windows), logo mới "Vi Screen".
 - Bộ cài NSIS chuẩn (chọn thư mục, shortcut, gỡ cài đặt, tiếng Việt/Anh) + bản portable.
 
@@ -65,6 +65,16 @@ scripts/                    build-downloader.ps1, check-app.js, test-capture-bri
 
 **Mở file từ Windows**: `main.js` lấy đường dẫn từ `process.argv` / sự kiện `second-instance` (gom các lần mở cách nhau < 350 ms thành một lô), renderer kéo hàng chờ bằng `app:takeOpenFiles` khi khởi động rồi nghe `app:open-files`. Kiểm thử E2E: chạy `dist\win-unpacked\Visubly Studio.exe --remote-debugging-port=<p> "<file>"` với `VISUBLY_RUNTIME_DIR` riêng rồi đọc `state` qua CDP.
 
+### Remote iPhone (airplay-server.js)
+- `GET /` — có cookie/token thiết bị hợp lệ → trang Remote; `?token=<qrToken>` → cấp thiết bị mới, set cookie, redirect `/`; còn lại → trang "Kết nối với ViSUBLY".
+- `POST /api/request-pairing {deviceName}` → `{requestId}` (5 lần/phút/IP, tối đa 3 đang chờ, hết hạn 2 phút); `GET /api/pairing-status?requestId=` → `pending|approved(+token, cookie)|denied|expired`; `POST /api/verify-pairing {pin}` (app cũ); `POST /api/session {token}` (khôi phục cookie từ localStorage); `/icon.png`, `/apple-touch-icon.png`.
+- Xác thực: token thiết bị (query/path/cookie) hoặc `mediaToken` (chỉ dùng trong URL segment HLS, đổi mỗi lần start). `qrToken` chỉ đổi lấy thiết bị ở `/`.
+- IPC: `airplay:respondPairing|listDevices|revokeDevice|revokeAllDevices`; sự kiện `airplay:pairing-requested {requestId, deviceName, pin}`, `pairing-resolved`, `pairing-success`, `devices-changed`. Cổng đổi được bằng `VISUBLY_REMOTE_PORT` (test).
+- Lưu ý: regex trong trang Remote nằm trong template string của server → phải viết `\\s`, `\\d`, `\\.`.
+
+### README media
+Ảnh/GIF trong `docs/media/` được chụp từ **bản đóng gói với dữ liệu demo** (không dùng dữ liệu thật): `node scripts/readme-media/make-demo.js` (tạo clip "Wild Coast" + HLS 3 chất lượng bằng ffmpeg đi kèm) rồi `node scripts/readme-media/capture.js` (chạy `dist\win-unpacked` với runtime riêng ở `D:\ViSUBLY Demo`, điều khiển qua CDP, quay screencast → GIF, giả lập iPhone bằng Chrome headless; tự xoá thư mục demo). Cần build trước. Cửa sổ app sẽ hiện trên màn hình trong ~1–2 phút.
+
 ### Cổng nhận link (capture-bridge)
 - Chỉ bind `127.0.0.1`; từ chối Origin không phải `chrome-extension://` và Host lạ; body ≤ 64 KB.
 - `POST /v1/pair {code}` → token (mã 6 số dùng 1 lần, hạn 5 phút, giới hạn sai 5 lần/phút).
@@ -79,6 +89,7 @@ npm.cmd run start                 # chạy dev
 npm.cmd run check                 # kiểm tra nhanh renderer/main
 node scripts/test-capture-bridge.js
 node scripts/test-extension-streams.mjs
+node scripts/test-remote-pairing.js      # ghép nối iPhone (cổng 3599, thư mục tạm)
 npm.cmd run package:win           # = build:engine (PyInstaller, cần Python ≥3.10 → .venv-build) + electron-builder
 ```
 Kết quả: `dist\Visubly Studio Setup 1.0.0.exe` (~100 MB), `dist\Visubly Studio 1.0.0 Portable.exe`, `dist\win-unpacked\`.
@@ -110,7 +121,7 @@ Lưu ý: Chrome 158 trên máy **không cho nạp extension qua dòng lệnh** �
 4. **Bảo mật cookie** — truyền qua `--item-file` thay vì dòng lệnh; mã hoá header trong queue (DPAPI / `safeStorage`).
 5. **Ký số code + tự cập nhật** (electron-updater; `latest.yml` đã được tạo khi build).
 6. **Phát hành extension** lên Chrome Web Store (hiện là Load unpacked); popup theo dark mode.
-7. **Bản Mac** (`npm run package:mac`, cần `.icns`) và **app iPhone** (`ViSUBLY_iOS_Source/`, `ViSUBLY_Expo_Source/` chưa được track).
+7. **Bản Mac** (`npm run package:mac`, cần `.icns`) và **app iPhone** (`ViSUBLY_iOS_Source/`, `ViSUBLY_Expo_Source/` chưa được track; app Expo đang dùng ở `D:\Projects\ViSUBLY-Expo` vẫn đi luồng PIN — nên chuyển sang luồng chờ "Cho phép" qua `/api/pairing-status`). Người dùng hiện chủ yếu dùng **bản web** trên Safari.
 8. Kèm **ffprobe** để có thời lượng MP4 / tiến độ % chính xác hơn.
 9. Dọn repo: quyết định `ViSUBLY_Expo_Source/` và `download-queue.json` ở gốc (track hay thêm vào `.gitignore`).
 
